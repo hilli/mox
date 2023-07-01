@@ -27,4 +27,6 @@ EXPOSE 143/tcp
 # Prometheus metrics.
 EXPOSE 8010/tcp
 
-CMD ["/bin/mox", "serve"]
+RUN adduser --uid 1001 -D -g 'mox' mox
+CMD ["serve"]
+ENTRYPOINT [ "/bin/mox"]
