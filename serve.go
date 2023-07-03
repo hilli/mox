@@ -80,7 +80,7 @@ func monitorDNSBL(log *mlog.Log) {
 		time.Sleep(sleep)
 		sleep = 3 * time.Hour
 
-		ips, err := mox.IPs(mox.Context)
+		ips, err := mox.IPs(mox.Context, false)
 		if err != nil {
 			log.Errorx("listing ips for dnsbl monitor", err)
 			continue
@@ -147,18 +147,27 @@ requested, other TLS certificates are requested on demand.
 	mlog.SetConfig(mox.Conf.Log)
 
 	checkACMEHosts := os.Getuid() != 0
-	mox.MustLoadConfig(checkACMEHosts)
 
 	log := mlog.New("serve")
 
 	if os.Getuid() == 0 {
+		mox.MustLoadConfig(true, checkACMEHosts)
+
 		// No need to potentially start and keep multiple processes. As root, we just need
 		// to start the child process.
 		runtime.GOMAXPROCS(1)
 
-		log.Print("starting as root, initializing network listeners", mlog.Field("version", moxvar.Version), mlog.Field("pid", os.Getpid()))
+		moxconf, err := filepath.Abs(mox.ConfigStaticPath)
+		log.Check(err, "finding absolute mox.conf path")
+		domainsconf, err := filepath.Abs(mox.ConfigDynamicPath)
+		log.Check(err, "finding absolute domains.conf path")
+
+		log.Print("starting as root, initializing network listeners", mlog.Field("version", moxvar.Version), mlog.Field("pid", os.Getpid()), mlog.Field("moxconf", moxconf), mlog.Field("domainsconf", domainsconf))
 		if os.Getenv("MOX_SOCKETS") != "" {
 			log.Fatal("refusing to start as root with $MOX_SOCKETS set")
+		}
+		if os.Getenv("MOX_FILES") != "" {
+			log.Fatal("refusing to start as root with $MOX_FILES set")
 		}
 
 		if !mox.Conf.Static.NoFixPermissions {
@@ -178,7 +187,8 @@ requested, other TLS certificates are requested on demand.
 		}
 	} else {
 		log.Print("starting as unprivileged user", mlog.Field("user", mox.Conf.Static.User), mlog.Field("uid", mox.Conf.Static.UID), mlog.Field("gid", mox.Conf.Static.GID), mlog.Field("pid", os.Getpid()))
-		mox.RestorePassedSockets()
+		mox.RestorePassedFiles()
+		mox.MustLoadConfig(true, checkACMEHosts)
 	}
 
 	syscall.Umask(syscall.Umask(007) | 007)
@@ -265,7 +275,7 @@ requested, other TLS certificates are requested on demand.
 
 			var cl string
 			for _, c := range changelog.Changes {
-				cl += "----\n\n" + strings.TrimSpace(c.Text)
+				cl += "----\n\n" + strings.TrimSpace(c.Text) + "\n\n"
 			}
 			cl += "----"
 
@@ -292,7 +302,7 @@ requested, other TLS certificates are requested on demand.
 				}
 			}()
 			m := &store.Message{Received: time.Now(), Flags: store.Flags{Flagged: true}}
-			n, err := fmt.Fprintf(f, "Date: %s\r\nSubject: mox %s available\r\n\r\nHi!\r\n\r\nVersion %s of mox is available, this is install is at %s.\r\n\r\nChanges:\r\n\r\n%s\r\n\r\nPlease report any issues at https://github.com/mjl-/mox, thanks!\r\n\r\nCheers,\r\nmox\r\n", time.Now().Format(message.RFC5322Z), latest, latest, current, strings.ReplaceAll(cl, "\n", "\r\n"))
+			n, err := fmt.Fprintf(f, "Date: %s\r\nSubject: mox %s available\r\n\r\nHi!\r\n\r\nVersion %s of mox is available, this install is at %s.\r\n\r\nChanges:\r\n\r\n%s\r\n\r\nRemember to make a backup with \"mox backup\" before upgrading.\r\nPlease report any issues at https://github.com/mjl-/mox, thanks!\r\n\r\nCheers,\r\nmox\r\n", time.Now().Format(message.RFC5322Z), latest, latest, current, strings.ReplaceAll(cl, "\n", "\r\n"))
 			if err != nil {
 				log.Infox("writing temporary message file for changelog delivery", err)
 				return next
@@ -584,7 +594,7 @@ func start(mtastsdbRefresher, skipForkExec bool) error {
 			mox.ForkExecUnprivileged()
 			panic("cannot happen")
 		} else {
-			mox.CleanupPassedSockets()
+			mox.CleanupPassedFiles()
 		}
 	}
 

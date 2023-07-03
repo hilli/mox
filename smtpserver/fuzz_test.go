@@ -1,7 +1,6 @@
 package smtpserver
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -30,9 +29,9 @@ func FuzzServer(f *testing.F) {
 	f.Add("NOOP")
 	f.Add("QUIT")
 
-	mox.Context = context.Background()
-	mox.ConfigStaticPath = "../testdata/smtp/mox.conf"
-	mox.MustLoadConfig(false)
+	mox.Context = ctxbg
+	mox.ConfigStaticPath = "../testdata/smtpserverfuzz/mox.conf"
+	mox.MustLoadConfig(true, false)
 	dataDir := mox.ConfigDirPath(mox.Conf.Static.DataDir)
 	os.RemoveAll(dataDir)
 	acc, err := store.OpenAccount("mjl")
@@ -73,6 +72,7 @@ func FuzzServer(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, s string) {
 		run := func(cmds []string) {
+			limitersInit() // Reset rate limiters.
 			serverConn, clientConn := net.Pipe()
 			defer serverConn.Close()
 			defer clientConn.Close()
@@ -100,7 +100,7 @@ func FuzzServer(f *testing.F) {
 			const submission = false
 			err := serverConn.SetDeadline(time.Now().Add(time.Second))
 			flog(err, "set server deadline")
-			serve("test", cid, dns.Domain{ASCII: "mox.example"}, nil, serverConn, resolver, submission, false, 100<<10, false, false, nil)
+			serve("test", cid, dns.Domain{ASCII: "mox.example"}, nil, serverConn, resolver, submission, false, 100<<10, false, false, nil, 0)
 			cid++
 		}
 

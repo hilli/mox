@@ -12,12 +12,13 @@ import (
 )
 
 var (
-	listWildcards = "%*"
-	char          = charRange('\x01', '\x7f')
-	ctl           = charRange('\x01', '\x19')
-	atomChar      = charRemove(char, "(){ "+listWildcards+ctl)
-	respSpecials  = atomChar + "]"
-	astringChar   = atomChar + respSpecials
+	listWildcards  = "%*"
+	char           = charRange('\x01', '\x7f')
+	ctl            = charRange('\x01', '\x19')
+	quotedSpecials = `"\`
+	respSpecials   = "]"
+	atomChar       = charRemove(char, "(){ "+ctl+listWildcards+quotedSpecials+respSpecials)
+	astringChar    = atomChar + respSpecials
 )
 
 func charRange(first, last rune) string {
@@ -122,7 +123,7 @@ func (p *parser) take(s string) bool {
 
 func (p *parser) xtake(s string) {
 	if !p.take(s) {
-		p.xerrorf("expected %q", s)
+		p.xerrorf("expected %s", s)
 	}
 }
 
@@ -201,9 +202,10 @@ func (p *parser) xspace() {
 func (p *parser) digits() string {
 	var n int
 	for _, c := range p.upper[p.o:] {
-		if c >= '0' && c <= '9' {
-			n++
+		if c < '0' || c > '9' {
+			break
 		}
+		n++
 	}
 	if n == 0 {
 		return ""
@@ -376,8 +378,18 @@ func (p *parser) remainder() string {
 	return p.orig[p.o:]
 }
 
+// ../rfc/9051:6565
 func (p *parser) xflag() string {
-	return p.xtakelist(`\`, "$") + p.xatom()
+	w, _ := p.takelist(`\`, "$")
+	s := w + p.xatom()
+	if s[0] == '\\' {
+		switch strings.ToLower(s) {
+		case `\answered`, `\flagged`, `\deleted`, `\seen`, `\draft`:
+		default:
+			p.xerrorf("unknown system flag %s", s)
+		}
+	}
+	return s
 }
 
 func (p *parser) xflagList() (l []string) {

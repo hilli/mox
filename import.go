@@ -1,20 +1,27 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
 
+	"golang.org/x/exp/maps"
+
+	"github.com/mjl-/mox/config"
 	"github.com/mjl-/mox/message"
 	"github.com/mjl-/mox/metrics"
 	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/store"
 )
 
@@ -42,9 +49,12 @@ dovecot-keywords file can specify additional flags, like Forwarded/Junk/NotJunk.
 The maildir files/directories are read by the mox process, so make sure it has
 access to the maildir directories/files.
 `
-
 	args := c.Parse()
-	xcmdImport(false, args, c)
+	if len(args) != 3 {
+		c.Usage()
+	}
+	mustLoadConfig()
+	ctlcmdImport(xctl(), false, args[0], args[1], args[2])
 }
 
 func cmdImportMbox(c *cmd) {
@@ -58,35 +68,78 @@ Using mbox is not recommended, maildir is a better defined format.
 The mailbox is read by the mox process, so make sure it has access to the
 maildir directories/files.
 `
-
 	args := c.Parse()
-	xcmdImport(true, args, c)
+	if len(args) != 3 {
+		c.Usage()
+	}
+	mustLoadConfig()
+	ctlcmdImport(xctl(), true, args[0], args[1], args[2])
 }
 
-func xcmdImport(mbox bool, args []string, c *cmd) {
+func cmdXImportMaildir(c *cmd) {
+	c.unlisted = true
+	c.params = "accountdir mailboxname maildir"
+	c.help = `Import a maildir into an account by directly accessing the data directory.
+
+
+See "mox help import maildir" for details.
+`
+	xcmdXImport(false, c)
+}
+
+func cmdXImportMbox(c *cmd) {
+	c.unlisted = true
+	c.params = "accountdir mailboxname mbox"
+	c.help = `Import an mbox into an account by directly accessing the data directory.
+
+See "mox help import mbox" for details.
+`
+	xcmdXImport(true, c)
+}
+
+func xcmdXImport(mbox bool, c *cmd) {
+	args := c.Parse()
 	if len(args) != 3 {
 		c.Usage()
 	}
 
-	mustLoadConfig()
+	accountdir := args[0]
+	account := filepath.Base(accountdir)
 
-	account := args[0]
-	mailbox := args[1]
-	if strings.EqualFold(mailbox, "inbox") {
+	// Set up the mox config so the account can be opened.
+	if filepath.Base(filepath.Dir(accountdir)) != "accounts" {
+		log.Fatalf("accountdir must be of the form .../accounts/<name>")
+	}
+	var err error
+	mox.Conf.Static.DataDir, err = filepath.Abs(filepath.Dir(filepath.Dir(accountdir)))
+	xcheckf(err, "making absolute datadir")
+	mox.ConfigStaticPath = "fake.conf"
+	mox.Conf.DynamicLastCheck = time.Now().Add(time.Hour) // Silence errors about config file.
+	mox.Conf.Dynamic.Accounts = map[string]config.Account{
+		account: {},
+	}
+	switchDone := store.Switchboard()
+	defer close(switchDone)
+
+	xlog := mlog.New("import")
+	cconn, sconn := net.Pipe()
+	clientctl := ctl{conn: cconn, r: bufio.NewReader(cconn), log: xlog}
+	serverctl := ctl{conn: sconn, r: bufio.NewReader(sconn), log: xlog}
+	go servectlcmd(context.Background(), &serverctl, func() {})
+
+	ctlcmdImport(&clientctl, mbox, account, args[1], args[2])
+}
+
+func ctlcmdImport(ctl *ctl, mbox bool, account, mailbox, src string) {
+	if mbox {
+		ctl.xwrite("importmbox")
+	} else {
+		ctl.xwrite("importmaildir")
+	}
+	ctl.xwrite(account)
+	if strings.EqualFold(mailbox, "Inbox") {
 		mailbox = "Inbox"
 	}
-	src := args[2]
-
-	var ctlcmd string
-	if mbox {
-		ctlcmd = "importmbox"
-	} else {
-		ctlcmd = "importmaildir"
-	}
-
-	ctl := xctl()
-	ctl.xwrite(ctlcmd)
-	ctl.xwrite(account)
 	ctl.xwrite(mailbox)
 	ctl.xwrite(src)
 	ctl.xreadok()
@@ -107,7 +160,7 @@ func xcmdImport(mbox bool, args []string, c *cmd) {
 	fmt.Fprintf(os.Stderr, "%s imported\n", count)
 }
 
-func importctl(ctl *ctl, mbox bool) {
+func importctl(ctx context.Context, ctl *ctl, mbox bool) {
 	/* protocol:
 	> "importmaildir" or "importmbox"
 	> account
@@ -177,7 +230,7 @@ func importctl(ctl *ctl, mbox bool) {
 		msgreader = store.NewMaildirReader(store.CreateMessageTemp, mdnewf, mdcurf, ctl.log)
 	}
 
-	tx, err := a.DB.Begin(true)
+	tx, err := a.DB.Begin(ctx, true)
 	ctl.xcheck(err, "begin transaction")
 	defer func() {
 		if tx != nil {
@@ -192,7 +245,6 @@ func importctl(ctl *ctl, mbox bool) {
 	// We will be delivering messages. If we fail halfway, we need to remove the created msg files.
 	var deliveredIDs []int64
 
-	// Handle errors from store.*X calls.
 	defer func() {
 		x := recover()
 		if x == nil {
@@ -225,10 +277,11 @@ func importctl(ctl *ctl, mbox bool) {
 		isSent := mailbox == "Sent"
 		const sync = false
 		const notrain = true
-		a.DeliverX(ctl.log, tx, m, mf, consumeFile, isSent, sync, notrain)
+		err := a.DeliverMessage(ctl.log, tx, m, mf, consumeFile, isSent, sync, notrain)
+		ctl.xcheck(err, "delivering message")
 		deliveredIDs = append(deliveredIDs, m.ID)
 		ctl.log.Debug("delivered message", mlog.Field("id", m.ID))
-		changes = append(changes, store.ChangeAddUID{MailboxID: m.MailboxID, UID: m.UID, Flags: m.Flags})
+		changes = append(changes, store.ChangeAddUID{MailboxID: m.MailboxID, UID: m.UID, Flags: m.Flags, Keywords: m.Keywords})
 	}
 
 	// todo: one goroutine for reading messages, one for parsing the message, one adding to database, one for junk filter training.
@@ -236,9 +289,13 @@ func importctl(ctl *ctl, mbox bool) {
 	a.WithWLock(func() {
 		// Ensure mailbox exists.
 		var mb store.Mailbox
-		mb, changes = a.MailboxEnsureX(tx, mailbox, true)
+		mb, changes, err = a.MailboxEnsure(tx, mailbox, true)
+		ctl.xcheck(err, "ensuring mailbox exists")
 
-		jf, _, err := a.OpenJunkFilter(ctl.log)
+		// We ensure keywords in messages make it to the mailbox as well.
+		mailboxKeywords := map[string]bool{}
+
+		jf, _, err := a.OpenJunkFilter(ctx, ctl.log)
 		if err != nil && !errors.Is(err, store.ErrNoJunkFilter) {
 			ctl.xcheck(err, "open junk filter")
 		}
@@ -261,6 +318,10 @@ func importctl(ctl *ctl, mbox bool) {
 				err = msgf.Close()
 				ctl.log.Check(err, "closing temporary message after failing to import")
 			}()
+
+			for _, kw := range m.Keywords {
+				mailboxKeywords[kw] = true
+			}
 
 			// Parse message and store parsed information for later fast retrieval.
 			p, err := message.EnsurePart(msgf, m.Size)
@@ -286,7 +347,7 @@ func importctl(ctl *ctl, mbox bool) {
 				if words, err := jf.ParseMessage(p); err != nil {
 					ctl.log.Infox("parsing message for updating junk filter", err, mlog.Field("parse", ""), mlog.Field("path", origPath))
 				} else {
-					err = jf.Train(!m.Junk, words)
+					err = jf.Train(ctx, !m.Junk, words)
 					ctl.xcheck(err, "training junk filter")
 					m.TrainedJunk = &m.Junk
 				}
@@ -313,6 +374,14 @@ func importctl(ctl *ctl, mbox bool) {
 			ctl.xcheck(err, "reading next message")
 
 			process(m, msgf, origPath)
+		}
+
+		// If there are any new keywords, update the mailbox.
+		var changed bool
+		mb.Keywords, changed = store.MergeKeywords(mb.Keywords, maps.Keys(mailboxKeywords))
+		if changed {
+			err := tx.Update(&mb)
+			ctl.xcheck(err, "updating keywords in mailbox")
 		}
 
 		err = tx.Commit()

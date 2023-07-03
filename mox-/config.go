@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -60,13 +61,15 @@ type Config struct {
 	Dynamic          config.Dynamic // Can only be accessed directly by tests. Use methods on Config for locked access.
 	dynamicMtime     time.Time
 	DynamicLastCheck time.Time // For use by quickstart only to skip checks.
-	// From correctly-cased full address (localpart@domain) to account and
-	// address. Domains are IDNA names in utf8.
+	// From canonical full address (localpart@domain, lower-cased when
+	// case-insensitive, stripped of catchall separator) to account and address.
+	// Domains are IDNA names in utf8.
 	accountDestinations map[string]AccountDestination
 }
 
 type AccountDestination struct {
-	Localpart   smtp.Localpart
+	Catchall    bool           // If catchall destination for its domain.
+	Localpart   smtp.Localpart // In original casing as written in config file.
 	Account     string
 	Destination config.Destination
 }
@@ -166,13 +169,19 @@ func (c *Config) Accounts() (l []string) {
 	return
 }
 
-func (c *Config) DomainLocalparts(d dns.Domain) map[smtp.Localpart]string {
+// DomainLocalparts returns a mapping of encoded localparts to account names for a
+// domain. An empty localpart is a catchall destination for a domain.
+func (c *Config) DomainLocalparts(d dns.Domain) map[string]string {
 	suffix := "@" + d.Name()
-	m := map[smtp.Localpart]string{}
+	m := map[string]string{}
 	c.withDynamicLock(func() {
 		for addr, ad := range c.accountDestinations {
 			if strings.HasSuffix(addr, suffix) {
-				m[ad.Localpart] = ad.Account
+				if ad.Catchall {
+					m[""] = ad.Account
+				} else {
+					m[ad.Localpart.String()] = ad.Account
+				}
 			}
 		}
 	})
@@ -206,6 +215,19 @@ func (c *Config) WebServer() (r map[dns.Domain]dns.Domain, l []config.WebHandler
 		l = c.Dynamic.WebHandlers
 	})
 	return r, l
+}
+
+func (c *Config) Routes(accountName string, domain dns.Domain) (accountRoutes, domainRoutes, globalRoutes []config.Route) {
+	c.withDynamicLock(func() {
+		acc := c.Dynamic.Accounts[accountName]
+		accountRoutes = acc.Routes
+
+		dom := c.Dynamic.Domains[domain.Name()]
+		domainRoutes = dom.Routes
+
+		globalRoutes = c.Dynamic.Routes
+	})
+	return
 }
 
 func (c *Config) allowACMEHosts(checkACMEHosts bool) {
@@ -313,8 +335,8 @@ func writeDynamic(ctx context.Context, log *mlog.Log, c config.Dynamic) error {
 }
 
 // MustLoadConfig loads the config, quitting on errors.
-func MustLoadConfig(checkACMEHosts bool) {
-	errs := LoadConfig(context.Background(), checkACMEHosts)
+func MustLoadConfig(doLoadTLSKeyCerts, checkACMEHosts bool) {
+	errs := LoadConfig(context.Background(), doLoadTLSKeyCerts, checkACMEHosts)
 	if len(errs) > 1 {
 		xlog.Error("loading config file: multiple errors")
 		for _, err := range errs {
@@ -328,11 +350,11 @@ func MustLoadConfig(checkACMEHosts bool) {
 
 // LoadConfig attempts to parse and load a config, returning any errors
 // encountered.
-func LoadConfig(ctx context.Context, checkACMEHosts bool) []error {
+func LoadConfig(ctx context.Context, doLoadTLSKeyCerts, checkACMEHosts bool) []error {
 	Shutdown, ShutdownCancel = context.WithCancel(context.Background())
 	Context, ContextCancel = context.WithCancel(context.Background())
 
-	c, errs := ParseConfig(ctx, ConfigStaticPath, false, false, checkACMEHosts)
+	c, errs := ParseConfig(ctx, ConfigStaticPath, false, doLoadTLSKeyCerts, checkACMEHosts)
 	if len(errs) > 0 {
 		return errs
 	}
@@ -358,12 +380,12 @@ func SetConfig(c *Config) {
 }
 
 // ParseConfig parses the static config at path p. If checkOnly is true, no changes
-// are made, such as registering ACME identities. If skipCheckTLSKeyCerts is true,
-// the TLS KeyCerts configuration is not checked. This is used during the
+// are made, such as registering ACME identities. If doLoadTLSKeyCerts is true,
+// the TLS KeyCerts configuration is loaded and checked. This is used during the
 // quickstart in the case the user is going to provide their own certificates.
 // If checkACMEHosts is true, the hosts allowed for acme are compared with the
 // explicitly configured ips we are listening on.
-func ParseConfig(ctx context.Context, p string, checkOnly, skipCheckTLSKeyCerts, checkACMEHosts bool) (c *Config, errs []error) {
+func ParseConfig(ctx context.Context, p string, checkOnly, doLoadTLSKeyCerts, checkACMEHosts bool) (c *Config, errs []error) {
 	c = &Config{
 		Static: config.Static{
 			DataDir: ".",
@@ -379,10 +401,10 @@ func ParseConfig(ctx context.Context, p string, checkOnly, skipCheckTLSKeyCerts,
 	}
 	defer f.Close()
 	if err := sconf.Parse(f, &c.Static); err != nil {
-		return nil, []error{fmt.Errorf("parsing %s: %v", p, err)}
+		return nil, []error{fmt.Errorf("parsing %s%v", p, err)}
 	}
 
-	if xerrs := PrepareStaticConfig(ctx, p, c, checkOnly, skipCheckTLSKeyCerts); len(xerrs) > 0 {
+	if xerrs := PrepareStaticConfig(ctx, p, c, checkOnly, doLoadTLSKeyCerts); len(xerrs) > 0 {
 		return nil, xerrs
 	}
 
@@ -399,12 +421,12 @@ func ParseConfig(ctx context.Context, p string, checkOnly, skipCheckTLSKeyCerts,
 // PrepareStaticConfig parses the static config file and prepares data structures
 // for starting mox. If checkOnly is set no substantial changes are made, like
 // creating an ACME registration.
-func PrepareStaticConfig(ctx context.Context, configFile string, config *Config, checkOnly, skipCheckTLSKeyCerts bool) (errs []error) {
+func PrepareStaticConfig(ctx context.Context, configFile string, conf *Config, checkOnly, doLoadTLSKeyCerts bool) (errs []error) {
 	addErrorf := func(format string, args ...any) {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	c := &config.Static
+	c := &conf.Static
 
 	// check that mailbox is in unicode NFC normalized form.
 	checkMailboxNormf := func(mailbox string, format string, args ...any) {
@@ -417,13 +439,13 @@ func PrepareStaticConfig(ctx context.Context, configFile string, config *Config,
 
 	// Post-process logging config.
 	if logLevel, ok := mlog.Levels[c.LogLevel]; ok {
-		config.Log = map[string]mlog.Level{"": logLevel}
+		conf.Log = map[string]mlog.Level{"": logLevel}
 	} else {
 		addErrorf("invalid log level %q", c.LogLevel)
 	}
 	for pkg, s := range c.PackageLogLevels {
 		if logLevel, ok := mlog.Levels[s]; ok {
-			config.Log[pkg] = logLevel
+			conf.Log[pkg] = logLevel
 		} else {
 			addErrorf("invalid package log level %q", s)
 		}
@@ -523,7 +545,7 @@ func PrepareStaticConfig(ctx context.Context, configFile string, config *Config,
 				}
 				l.TLS.Config = tlsconfig
 			} else if len(l.TLS.KeyCerts) != 0 {
-				if !skipCheckTLSKeyCerts {
+				if doLoadTLSKeyCerts {
 					if err := loadTLSKeyCerts(configFile, "listener "+name, l.TLS); err != nil {
 						addErrorf("%w", err)
 					}
@@ -626,6 +648,87 @@ func PrepareStaticConfig(ctx context.Context, configFile string, config *Config,
 		checkMailboxNormf(mb, "default mailbox")
 	}
 
+	checkTransportSMTP := func(name string, isTLS bool, t *config.TransportSMTP) {
+		var err error
+		t.DNSHost, err = dns.ParseDomain(t.Host)
+		if err != nil {
+			addErrorf("transport %s: bad host %s: %v", name, t.Host, err)
+		}
+
+		if isTLS && t.STARTTLSInsecureSkipVerify {
+			addErrorf("transport %s: cannot have STARTTLSInsecureSkipVerify with immediate TLS")
+		}
+		if isTLS && t.NoSTARTTLS {
+			addErrorf("transport %s: cannot have NoSTARTTLS with immediate TLS")
+		}
+
+		if t.Auth == nil {
+			return
+		}
+		seen := map[string]bool{}
+		for _, m := range t.Auth.Mechanisms {
+			if seen[m] {
+				addErrorf("transport %s: duplicate authentication mechanism %s", name, m)
+			}
+			seen[m] = true
+			switch m {
+			case "SCRAM-SHA-256":
+			case "SCRAM-SHA-1":
+			case "CRAM-MD5":
+			case "PLAIN":
+			default:
+				addErrorf("transport %s: unknown authentication mechanism %s", name, m)
+			}
+		}
+
+		t.Auth.EffectiveMechanisms = t.Auth.Mechanisms
+		if len(t.Auth.EffectiveMechanisms) == 0 {
+			t.Auth.EffectiveMechanisms = []string{"SCRAM-SHA-256", "SCRAM-SHA-1", "CRAM-MD5"}
+		}
+	}
+
+	checkTransportSocks := func(name string, t *config.TransportSocks) {
+		_, _, err := net.SplitHostPort(t.Address)
+		if err != nil {
+			addErrorf("transport %s: bad address %s: %v", name, t.Address, err)
+		}
+		for _, ipstr := range t.RemoteIPs {
+			ip := net.ParseIP(ipstr)
+			if ip == nil {
+				addErrorf("transport %s: bad ip %s", name, ipstr)
+			} else {
+				t.IPs = append(t.IPs, ip)
+			}
+		}
+		t.Hostname, err = dns.ParseDomain(t.RemoteHostname)
+		if err != nil {
+			addErrorf("transport %s: bad hostname %s: %v", name, t.RemoteHostname, err)
+		}
+	}
+
+	for name, t := range c.Transports {
+		n := 0
+		if t.Submissions != nil {
+			n++
+			checkTransportSMTP(name, true, t.Submissions)
+		}
+		if t.Submission != nil {
+			n++
+			checkTransportSMTP(name, false, t.Submission)
+		}
+		if t.SMTP != nil {
+			n++
+			checkTransportSMTP(name, false, t.SMTP)
+		}
+		if t.Socks != nil {
+			n++
+			checkTransportSocks(name, t.Socks)
+		}
+		if n > 1 {
+			addErrorf("transport %s: cannot have multiple methods in a transport", name)
+		}
+	}
+
 	// Load CA certificate pool.
 	if c.TLS.CA != nil {
 		if c.TLS.CA.AdditionalToSystem {
@@ -684,7 +787,7 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	// check that mailbox is in unicode NFC normalized form.
+	// Check that mailbox is in unicode NFC normalized form.
 	checkMailboxNormf := func(mailbox string, format string, args ...any) {
 		s := norm.NFC.String(mailbox)
 		if mailbox != s {
@@ -708,6 +811,41 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 			haveWebserverListener = true
 		}
 	}
+
+	checkRoutes := func(descr string, routes []config.Route) {
+		parseRouteDomains := func(l []string) []string {
+			var r []string
+			for _, e := range l {
+				if e == "." {
+					r = append(r, e)
+					continue
+				}
+				prefix := ""
+				if strings.HasPrefix(e, ".") {
+					prefix = "."
+					e = e[1:]
+				}
+				d, err := dns.ParseDomain(e)
+				if err != nil {
+					addErrorf("%s: invalid domain %s: %v", descr, e, err)
+				}
+				r = append(r, prefix+d.ASCII)
+			}
+			return r
+		}
+
+		for i := range routes {
+			routes[i].FromDomainASCII = parseRouteDomains(routes[i].FromDomain)
+			routes[i].ToDomainASCII = parseRouteDomains(routes[i].ToDomain)
+			var ok bool
+			routes[i].ResolvedTransport, ok = static.Transports[routes[i].Transport]
+			if !ok {
+				addErrorf("%s: route references undefined transport %s", descr, routes[i].Transport)
+			}
+		}
+	}
+
+	checkRoutes("global routes", c.Routes)
 
 	// Validate domains.
 	for d, domain := range c.Domains {
@@ -827,10 +965,12 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 			}
 		}
 
+		checkRoutes("routes for domain", domain.Routes)
+
 		c.Domains[d] = domain
 	}
 
-	// Post-process email addresses for fast lookups.
+	// Validate email addresses.
 	accDests = map[string]AccountDestination{}
 	for accName, acc := range c.Accounts {
 		var err error
@@ -929,10 +1069,27 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 				}
 			}
 
+			// Catchall destination for domain.
+			if strings.HasPrefix(addrName, "@") {
+				d, err := dns.ParseDomain(addrName[1:])
+				if err != nil {
+					addErrorf("parsing domain %q in account %q", addrName[1:], accName)
+					continue
+				} else if _, ok := c.Domains[d.Name()]; !ok {
+					addErrorf("unknown domain for address %q in account %q", addrName, accName)
+					continue
+				}
+				addrFull := "@" + d.Name()
+				if _, ok := accDests[addrFull]; ok {
+					addErrorf("duplicate canonicalized catchall destination address %s", addrFull)
+				}
+				accDests[addrFull] = AccountDestination{true, "", accName, dest}
+				continue
+			}
+
 			// todo deprecated: remove support for parsing destination as just a localpart instead full address.
 			var address smtp.Address
-			localpart, err := smtp.ParseLocalpart(addrName)
-			if err != nil && errors.Is(err, smtp.ErrBadLocalpart) {
+			if localpart, err := smtp.ParseLocalpart(addrName); err != nil && errors.Is(err, smtp.ErrBadLocalpart) {
 				address, err = smtp.ParseAddress(addrName)
 				if err != nil {
 					addErrorf("invalid email address %q in account %q", addrName, accName)
@@ -953,11 +1110,21 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 				}
 				replaceLocalparts[addrName] = address.Pack(true)
 			}
+
+			origLP := address.Localpart
+			dc := c.Domains[address.Domain.Name()]
+			if lp, err := CanonicalLocalpart(address.Localpart, dc); err != nil {
+				addErrorf("canonicalizing localpart %s: %v", address.Localpart, err)
+			} else if dc.LocalpartCatchallSeparator != "" && strings.Contains(string(address.Localpart), dc.LocalpartCatchallSeparator) {
+				addErrorf("localpart of address %s includes domain catchall separator %s", address, dc.LocalpartCatchallSeparator)
+			} else {
+				address.Localpart = lp
+			}
 			addrFull := address.Pack(true)
 			if _, ok := accDests[addrFull]; ok {
-				addErrorf("duplicate destination address %q", addrFull)
+				addErrorf("duplicate canonicalized destination address %s", addrFull)
 			}
-			accDests[addrFull] = AccountDestination{address.Localpart, accName, dest}
+			accDests[addrFull] = AccountDestination{false, origLP, accName, dest}
 		}
 
 		for lp, addr := range replaceLocalparts {
@@ -965,11 +1132,13 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 			if !ok {
 				addErrorf("could not find localpart %q to replace with address in destinations", lp)
 			} else {
-				log.Error("deprecated: destination with localpart-only key will be removed in the future, replace it with a full email address, by appending the default domain", mlog.Field("localpart", lp), mlog.Field("address", addr), mlog.Field("account", accName))
+				log.Error(`deprecation warning: support for account destination addresses specified as just localpart ("username") instead of full email address will be removed in the future; update domains.conf, for each Account, for each Destination, ensure each key is an email address by appending "@" and the default domain for the account`, mlog.Field("localpart", lp), mlog.Field("address", addr), mlog.Field("account", accName))
 				acc.Destinations[addr] = dest
 				delete(acc.Destinations, lp)
 			}
 		}
+
+		checkRoutes("routes for account", acc.Routes)
 	}
 
 	// Set DMARC destinations.
@@ -997,7 +1166,7 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 			DMARCReports: true,
 		}
 		checkMailboxNormf(dmarc.Mailbox, "DMARC mailbox for account %q", dmarc.Account)
-		accDests[addrFull] = AccountDestination{lp, dmarc.Account, dest}
+		accDests[addrFull] = AccountDestination{false, lp, dmarc.Account, dest}
 	}
 
 	// Set TLSRPT destinations.
@@ -1026,7 +1195,7 @@ func prepareDynamicConfig(ctx context.Context, dynamicPath string, static config
 			TLSReports: true,
 		}
 		checkMailboxNormf(tlsrpt.Mailbox, "TLSRPT mailbox for account %q", tlsrpt.Account)
-		accDests[addrFull] = AccountDestination{lp, tlsrpt.Account, dest}
+		accDests[addrFull] = AccountDestination{false, lp, tlsrpt.Account, dest}
 	}
 
 	// Check webserver configs.
@@ -1153,7 +1322,7 @@ func loadTLSKeyCerts(configFile, kind string, ctls *config.TLS) error {
 	for _, kp := range ctls.KeyCerts {
 		certPath := configDirPath(configFile, kp.CertFile)
 		keyPath := configDirPath(configFile, kp.KeyFile)
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		cert, err := loadX509KeyPairPrivileged(certPath, keyPath)
 		if err != nil {
 			return fmt.Errorf("tls config for %q: parsing x509 key pair: %v", kind, err)
 		}
@@ -1163,4 +1332,28 @@ func loadTLSKeyCerts(configFile, kind string, ctls *config.TLS) error {
 		Certificates: certs,
 	}
 	return nil
+}
+
+// load x509 key/cert files from file descriptor possibly passed in by privileged
+// process.
+func loadX509KeyPairPrivileged(certPath, keyPath string) (tls.Certificate, error) {
+	certBuf, err := readFilePrivileged(certPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("reading tls certificate: %v", err)
+	}
+	keyBuf, err := readFilePrivileged(keyPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("reading tls key: %v", err)
+	}
+	return tls.X509KeyPair(certBuf, keyBuf)
+}
+
+// like os.ReadFile, but open privileged file possibly passed in by root process.
+func readFilePrivileged(path string) ([]byte, error) {
+	f, err := OpenPrivileged(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }

@@ -371,7 +371,7 @@ func (c *conn) utf8strings() bool {
 }
 
 func (c *conn) xdbwrite(fn func(tx *bstore.Tx)) {
-	err := c.account.DB.Write(func(tx *bstore.Tx) error {
+	err := c.account.DB.Write(context.TODO(), func(tx *bstore.Tx) error {
 		fn(tx)
 		return nil
 	})
@@ -379,7 +379,7 @@ func (c *conn) xdbwrite(fn func(tx *bstore.Tx)) {
 }
 
 func (c *conn) xdbread(fn func(tx *bstore.Tx)) {
-	err := c.account.DB.Read(func(tx *bstore.Tx) error {
+	err := c.account.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 		fn(tx)
 		return nil
 	})
@@ -654,10 +654,10 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		x := recover()
 		if x == nil || x == cleanClose {
 			c.log.Info("connection closed")
-		} else if err, ok := x.(error); ok || isClosed(err) {
+		} else if err, ok := x.(error); ok && isClosed(err) {
 			c.log.Infox("connection closed", err)
 		} else {
-			c.log.Error("unhandled error", mlog.Field("err", x))
+			c.log.Error("unhandled panic", mlog.Field("err", x))
 			debug.PrintStack()
 			metrics.PanicInc("imapserver")
 		}
@@ -730,6 +730,9 @@ func (c *conn) command() {
 		if x == nil || x == cleanClose {
 			c.log.Debug("imap command done", logFields...)
 			result = "ok"
+			if x == cleanClose {
+				panic(x)
+			}
 			return
 		}
 		err, ok := x.(error)
@@ -739,6 +742,9 @@ func (c *conn) command() {
 			panic(x)
 		}
 
+		var sxerr syntaxError
+		var uerr userError
+		var serr serverError
 		if isClosed(err) {
 			c.log.Infox("imap command ioerror", err, logFields...)
 			result = "ioerror"
@@ -746,12 +752,7 @@ func (c *conn) command() {
 				debug.PrintStack()
 			}
 			panic(err)
-		}
-
-		var sxerr syntaxError
-		var uerr userError
-		var serr serverError
-		if errors.As(err, &sxerr) {
+		} else if errors.As(err, &sxerr) {
 			result = "badsyntax"
 			if c.ncmds == 0 {
 				// Other side is likely speaking something else than IMAP, send error message and
@@ -793,11 +794,10 @@ func (c *conn) command() {
 				c.bwriteresultf("%s NO %s %v", tag, cmd, err)
 			}
 		} else {
-			result = "error"
-			c.log.Infox("imap command error", err, logFields...)
-			// todo: introduce a store.Error, and check for that, don't blindly pass on errors?
-			debug.PrintStack()
-			c.bwriteresultf("%s NO %s %v", tag, cmd, err)
+			// Other type of panic, we pass it on, aborting the connection.
+			result = "panic"
+			c.log.Errorx("imap command panic", err, logFields...)
+			panic(err)
 		}
 	}()
 
@@ -1148,7 +1148,8 @@ func xcheckmailboxname(name string, allowInbox bool) string {
 // If the mailbox does not exist, panic is called with a user error.
 // Must be called with account rlock held.
 func (c *conn) xmailbox(tx *bstore.Tx, name string, missingErrCode string) store.Mailbox {
-	mb := c.account.MailboxFindX(tx, name)
+	mb, err := c.account.MailboxFind(tx, name)
+	xcheckf(err, "finding mailbox")
 	if mb == nil {
 		// missingErrCode can be empty, or e.g. TRYCREATE or ALREADYEXISTS.
 		xusercodeErrorf(missingErrCode, "%w", store.ErrUnknownMailbox)
@@ -1232,7 +1233,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 			c.bwritelinef("* %d EXISTS", len(c.uids))
 			for _, add := range adds {
 				seq := c.xsequence(add.UID)
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, add.UID, flaglist(add.Flags).pack(c))
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, add.UID, flaglist(add.Flags, add.Keywords).pack(c))
 			}
 			continue
 		}
@@ -1264,7 +1265,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 				continue
 			}
 			if !initial {
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, ch.UID, flaglist(ch.Flags).pack(c))
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, ch.UID, flaglist(ch.Flags, ch.Keywords).pack(c))
 			}
 		case store.ChangeRemoveMailbox:
 			// Only announce \NonExistent to modern clients, otherwise they may ignore the
@@ -1537,6 +1538,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
 				authResult = "badcreds"
+				c.log.Info("authentication failed", mlog.Field("username", authc))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xusercodeErrorf("", "error")
@@ -1564,6 +1566,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		acc, _, err := store.OpenEmail(addr)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
+				c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xserverErrorf("looking up address: %v", err)
@@ -1576,9 +1579,10 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		}()
 		var ipadhash, opadhash hash.Hash
 		acc.WithRLock(func() {
-			err := acc.DB.Read(func(tx *bstore.Tx) error {
+			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if err == bstore.ErrAbsent {
+					c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 					xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 				}
 				if err != nil {
@@ -1592,7 +1596,8 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			xcheckf(err, "tx read")
 		})
 		if ipadhash == nil || opadhash == nil {
-			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", addr))
+			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("username", addr))
+			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
@@ -1601,6 +1606,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		opadhash.Write(ipadhash.Sum(nil))
 		digest := fmt.Sprintf("%x", opadhash.Sum(nil))
 		if digest != t[1] {
+			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
@@ -1646,7 +1652,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		}
 		var xscram store.SCRAM
 		acc.WithRLock(func() {
-			err := acc.DB.Read(func(tx *bstore.Tx) error {
+			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if authVariant == "scram-sha-1" {
 					xscram = password.SCRAMSHA1
@@ -1674,6 +1680,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			c.readline(false) // Should be "*" for cancellation.
 			if errors.Is(err, scram.ErrInvalidProof) {
 				authResult = "badcreds"
+				c.log.Info("failed authentication attempt", mlog.Field("username", ss.Authentication), mlog.Field("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xuserErrorf("server final: %w", err)
@@ -1743,6 +1750,7 @@ func (c *conn) cmdLogin(tag, cmd string, p *parser) {
 		var code string
 		if errors.Is(err, store.ErrUnknownCredentials) {
 			code = "AUTHENTICATIONFAILED"
+			c.log.Info("failed authentication attempt", mlog.Field("username", userid), mlog.Field("remote", c.remoteIP))
 		}
 		xusercodeErrorf(code, "login failed")
 	}
@@ -1854,8 +1862,12 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 	})
 	c.applyChanges(c.comm.Get(), true)
 
-	c.bwritelinef(`* FLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent)`)
-	c.bwritelinef(`* OK [PERMANENTFLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent)] x`)
+	var flags string
+	if len(mb.Keywords) > 0 {
+		flags = " " + strings.Join(mb.Keywords, " ")
+	}
+	c.bwritelinef(`* FLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent%s)`, flags)
+	c.bwritelinef(`* OK [PERMANENTFLAGS (\Seen \Answered \Flagged \Deleted \Draft $Forwarded $Junk $NotJunk $Phishing $MDNSent \*)] x`)
 	if !c.enabled[capIMAP4rev2] {
 		c.bwritelinef(`* 0 RECENT`)
 	}
@@ -1909,14 +1921,17 @@ func (c *conn) cmdCreate(tag, cmd string, p *parser) {
 					p += "/"
 				}
 				p += elem
-				if c.account.MailboxExistsX(tx, p) {
+				exists, err := c.account.MailboxExists(tx, p)
+				xcheckf(err, "checking if mailbox exists")
+				if exists {
 					if i == len(elems)-1 {
 						// ../rfc/9051:1914
 						xuserErrorf("mailbox already exists")
 					}
 					continue
 				}
-				_, nchanges := c.account.MailboxEnsureX(tx, p, true)
+				_, nchanges, err := c.account.MailboxEnsure(tx, p, true)
+				xcheckf(err, "ensuring mailbox exists")
 				changes = append(changes, nchanges...)
 				created = append(created, p)
 			}
@@ -1997,7 +2012,7 @@ func (c *conn) cmdDelete(tag, cmd string, p *parser) {
 					remove[i].Junk = false
 					remove[i].Notjunk = false
 				}
-				err = c.account.RetrainMessages(c.log, tx, remove, true)
+				err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
 				xcheckf(err, "untraining deleted messages")
 			}
 
@@ -2045,15 +2060,18 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 			uidval, err := c.account.NextUIDValidity(tx)
 			xcheckf(err, "next uid validity")
 
-			// Inbox is very special case. Unlike other mailboxes, its children are not moved. And
-			// unlike a regular move, its messages are moved to a newly created mailbox.
-			// We do indeed create a new destination mailbox and actually move the messages.
+			// Inbox is very special. Unlike other mailboxes, its children are not moved. And
+			// unlike a regular move, its messages are moved to a newly created mailbox. We do
+			// indeed create a new destination mailbox and actually move the messages.
 			// ../rfc/9051:2101
 			if src == "Inbox" {
-				if c.account.MailboxExistsX(tx, dst) {
+				exists, err := c.account.MailboxExists(tx, dst)
+				xcheckf(err, "checking if destination mailbox exists")
+				if exists {
 					xusercodeErrorf("ALREADYEXISTS", "destination mailbox %q already exists", dst)
 				}
-				srcMB := c.account.MailboxFindX(tx, src)
+				srcMB, err := c.account.MailboxFind(tx, src)
+				xcheckf(err, "finding source mailbox")
 				if srcMB == nil {
 					xserverErrorf("inbox not found")
 				}
@@ -2066,26 +2084,36 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 					UIDValidity: uidval,
 					UIDNext:     1,
 				}
-				err := tx.Insert(&dstMB)
+				err = tx.Insert(&dstMB)
 				xcheckf(err, "create new destination mailbox")
 
-				var messages []store.Message
+				// Move existing messages, with their ID's and on-disk files intact, to the new
+				// mailbox.
+				var oldUIDs []store.UID
 				q := bstore.QueryTx[store.Message](tx)
 				q.FilterNonzero(store.Message{MailboxID: srcMB.ID})
-				q.Gather(&messages)
-				_, err = q.UpdateNonzero(store.Message{MailboxID: dstMB.ID})
+				q.SortAsc("UID")
+				err = q.ForEach(func(m store.Message) error {
+					oldUIDs = append(oldUIDs, m.UID)
+					m.MailboxID = dstMB.ID
+					m.UID = dstMB.UIDNext
+					dstMB.UIDNext++
+					if err := tx.Update(&m); err != nil {
+						return fmt.Errorf("updating message to move to new mailbox: %w", err)
+					}
+					return nil
+				})
 				xcheckf(err, "moving messages from inbox to destination mailbox")
 
-				uids := make([]store.UID, len(messages))
-				for i, m := range messages {
-					uids[i] = m.UID
-				}
+				err = tx.Update(&dstMB)
+				xcheckf(err, "updating uidnext in destination mailbox")
+
 				var dstFlags []string
 				if tx.Get(&store.Subscription{Name: dstMB.Name}) == nil {
 					dstFlags = []string{`\Subscribed`}
 				}
 				changes = []store.Change{
-					store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: uids},
+					store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: oldUIDs},
 					store.ChangeAddMailbox{Name: dstMB.Name, Flags: dstFlags},
 					// todo: in future, we could announce all messages. no one is listening now though.
 				}
@@ -2207,7 +2235,9 @@ func (c *conn) cmdSubscribe(tag, cmd string, p *parser) {
 		var changes []store.Change
 
 		c.xdbwrite(func(tx *bstore.Tx) {
-			changes = c.account.SubscriptionEnsureX(tx, name)
+			var err error
+			changes, err = c.account.SubscriptionEnsure(tx, name)
+			xcheckf(err, "ensuring subscription")
 		})
 
 		c.broadcast(changes)
@@ -2235,7 +2265,9 @@ func (c *conn) cmdUnsubscribe(tag, cmd string, p *parser) {
 			// It's OK if not currently subscribed, ../rfc/9051:2215
 			err := tx.Delete(&store.Subscription{Name: name})
 			if err == bstore.ErrAbsent {
-				if !c.account.MailboxExistsX(tx, name) {
+				exists, err := c.account.MailboxExists(tx, name)
+				xcheckf(err, "checking if mailbox exists")
+				if !exists {
 					xuserErrorf("mailbox does not exist")
 				}
 				return
@@ -2418,7 +2450,7 @@ func (c *conn) xstatusLine(tx *bstore.Tx, mb store.Mailbox, attrs []string) stri
 	return fmt.Sprintf("* STATUS %s (%s)", astring(mb.Name).pack(c), strings.Join(status, " "))
 }
 
-func xparseStoreFlags(l []string, syntax bool) (flags store.Flags) {
+func xparseStoreFlags(l []string, syntax bool) (flags store.Flags, keywords []string) {
 	fields := map[string]*bool{
 		`\answered`:  &flags.Answered,
 		`\flagged`:   &flags.Flagged,
@@ -2431,20 +2463,24 @@ func xparseStoreFlags(l []string, syntax bool) (flags store.Flags) {
 		`$phishing`:  &flags.Phishing,
 		`$mdnsent`:   &flags.MDNSent,
 	}
+	seen := map[string]bool{}
 	for _, f := range l {
-		if field, ok := fields[strings.ToLower(f)]; !ok {
-			if syntax {
-				xsyntaxErrorf("unknown flag %q", f)
-			}
-			xuserErrorf("unknown flag %q", f)
-		} else {
+		f = strings.ToLower(f)
+		if field, ok := fields[f]; ok {
 			*field = true
+		} else if seen[f] {
+			if moxvar.Pedantic {
+				xuserErrorf("duplicate keyword %s", f)
+			}
+		} else {
+			keywords = append(keywords, f)
+			seen[f] = true
 		}
 	}
 	return
 }
 
-func flaglist(fl store.Flags) listspace {
+func flaglist(fl store.Flags, keywords []string) listspace {
 	l := listspace{}
 	flag := func(v bool, s string) {
 		if v {
@@ -2461,6 +2497,9 @@ func flaglist(fl store.Flags) listspace {
 	flag(fl.Notjunk, `$NotJunk`)
 	flag(fl.Phishing, `$Phishing`)
 	flag(fl.MDNSent, `$MDNSent`)
+	for _, k := range keywords {
+		l = append(l, bare(k))
+	}
 	return l
 }
 
@@ -2476,9 +2515,10 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 	name := p.xmailbox()
 	p.xspace()
 	var storeFlags store.Flags
+	var keywords []string
 	if p.hasPrefix("(") {
 		// Error must be a syntax error, to properly abort the connection due to literal.
-		storeFlags = xparseStoreFlags(p.xflagList(), true)
+		storeFlags, keywords = xparseStoreFlags(p.xflagList(), true)
 		p.xspace()
 	}
 	var tm time.Time
@@ -2552,16 +2592,27 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mb = c.xmailbox(tx, name, "TRYCREATE")
+
+			// Ensure keywords are stored in mailbox.
+			var changed bool
+			mb.Keywords, changed = store.MergeKeywords(mb.Keywords, keywords)
+			if changed {
+				err := tx.Update(&mb)
+				xcheckf(err, "updating keywords in mailbox")
+			}
+
 			msg = store.Message{
 				MailboxID:     mb.ID,
 				MailboxOrigID: mb.ID,
 				Received:      tm,
 				Flags:         storeFlags,
+				Keywords:      keywords,
 				Size:          size,
 				MsgPrefix:     msgPrefix,
 			}
 			isSent := name == "Sent"
-			c.account.DeliverX(c.log, tx, &msg, msgFile, true, isSent, true, false)
+			err := c.account.DeliverMessage(c.log, tx, &msg, msgFile, true, isSent, true, false)
+			xcheckf(err, "delivering message")
 		})
 
 		// Fetch pending changes, possibly with new UIDs, so we can apply them before adding our own new UID.
@@ -2570,7 +2621,7 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 		}
 
 		// Broadcast the change to other connections.
-		c.broadcast([]store.Change{store.ChangeAddUID{MailboxID: mb.ID, UID: msg.UID, Flags: msg.Flags}})
+		c.broadcast([]store.Change{store.ChangeAddUID{MailboxID: mb.ID, UID: msg.UID, Flags: msg.Flags, Keywords: msg.Keywords}})
 	})
 
 	err = msgFile.Close()
@@ -2734,7 +2785,7 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 				remove[i].Junk = false
 				remove[i].Notjunk = false
 			}
-			err = c.account.RetrainMessages(c.log, tx, remove, true)
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
 			xcheckf(err, "untraining deleted messages")
 		})
 
@@ -2933,6 +2984,7 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	var mbDst store.Mailbox
 	var origUIDs, newUIDs []store.UID
 	var flags []store.Flags
+	var keywords [][]string
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
@@ -2998,6 +3050,7 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				newUIDs = append(newUIDs, m.UID)
 				newMsgIDs = append(newMsgIDs, m.ID)
 				flags = append(flags, m.Flags)
+				keywords = append(keywords, m.Keywords)
 
 				qmr := bstore.QueryTx[store.Recipient](tx)
 				qmr.FilterNonzero(store.Recipient{MessageID: origID})
@@ -3021,7 +3074,7 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				createdIDs = append(createdIDs, newMsgIDs[i])
 			}
 
-			err = c.account.RetrainMessages(c.log, tx, nmsgs, false)
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, nmsgs, false)
 			xcheckf(err, "train copied messages")
 		})
 
@@ -3029,7 +3082,7 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 		if len(newUIDs) > 0 {
 			changes := make([]store.Change, len(newUIDs))
 			for i, uid := range newUIDs {
-				changes[i] = store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, Flags: flags[i]}
+				changes[i] = store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, Flags: flags[i], Keywords: keywords[i]}
 			}
 			c.broadcast(changes)
 		}
@@ -3160,7 +3213,7 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 				xcheckf(err, "updating moved message in database")
 			}
 
-			err = c.account.RetrainMessages(c.log, tx, msgs, false)
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, msgs, false)
 			xcheckf(err, "retraining messages after move")
 
 			// Prepare broadcast changes to other connections.
@@ -3168,7 +3221,7 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 			changes = append(changes, store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: uids})
 			for _, m := range msgs {
 				newUIDs = append(newUIDs, m.UID)
-				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: m.UID, Flags: m.Flags})
+				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: m.UID, Flags: m.Flags, Keywords: m.Keywords})
 			}
 		})
 
@@ -3221,25 +3274,21 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 		xuserErrorf("mailbox open in read-only mode")
 	}
 
-	var mask, flags store.Flags
+	flags, keywords := xparseStoreFlags(flagstrs, false)
+	var mask store.Flags
 	if plus {
-		mask = xparseStoreFlags(flagstrs, false)
-		flags = store.FlagsAll
+		mask, flags = flags, store.FlagsAll
 	} else if minus {
-		mask = xparseStoreFlags(flagstrs, false)
-		flags = store.Flags{}
+		mask, flags = flags, store.Flags{}
 	} else {
 		mask = store.FlagsAll
-		flags = xparseStoreFlags(flagstrs, false)
 	}
-
-	updates := store.FlagsQuerySet(mask, flags)
 
 	var updated []store.Message
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
-			c.xmailboxID(tx, c.mailboxID) // Validate.
+			mb := c.xmailboxID(tx, c.mailboxID) // Validate.
 
 			uidargs := c.xnumSetCondition(isUID, nums)
 
@@ -3247,27 +3296,41 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 				return
 			}
 
+			// Ensure keywords are in mailbox.
+			if !minus {
+				var changed bool
+				mb.Keywords, changed = store.MergeKeywords(mb.Keywords, keywords)
+				if changed {
+					err := tx.Update(&mb)
+					xcheckf(err, "updating mailbox with keywords")
+				}
+			}
+
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
-			if len(updates) == 0 {
-				var err error
-				updated, err = q.List()
-				xcheckf(err, "listing for flags")
-			} else {
-				q.Gather(&updated)
-				_, err := q.UpdateFields(updates)
-				xcheckf(err, "updating flags")
-			}
+			err := q.ForEach(func(m store.Message) error {
+				m.Flags = m.Flags.Set(mask, flags)
+				if minus {
+					m.Keywords = store.RemoveKeywords(m.Keywords, keywords)
+				} else if plus {
+					m.Keywords, _ = store.MergeKeywords(m.Keywords, keywords)
+				} else {
+					m.Keywords = keywords
+				}
+				updated = append(updated, m)
+				return tx.Update(&m)
+			})
+			xcheckf(err, "storing flags in messages")
 
-			err := c.account.RetrainMessages(c.log, tx, updated, false)
+			err = c.account.RetrainMessages(context.TODO(), c.log, tx, updated, false)
 			xcheckf(err, "training messages")
 		})
 
 		// Broadcast changes to other connections.
 		changes := make([]store.Change, len(updated))
 		for i, m := range updated {
-			changes[i] = store.ChangeFlags{MailboxID: m.MailboxID, UID: m.UID, Mask: mask, Flags: m.Flags}
+			changes[i] = store.ChangeFlags{MailboxID: m.MailboxID, UID: m.UID, Mask: mask, Flags: m.Flags, Keywords: m.Keywords}
 		}
 		c.broadcast(changes)
 	})
@@ -3275,7 +3338,7 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 	for _, m := range updated {
 		if !silent {
 			// ../rfc/9051:6749 ../rfc/3501:4869
-			c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", c.xsequence(m.UID), m.UID, flaglist(m.Flags).pack(c))
+			c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", c.xsequence(m.UID), m.UID, flaglist(m.Flags, m.Keywords).pack(c))
 		}
 	}
 

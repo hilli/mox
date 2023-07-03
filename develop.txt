@@ -85,7 +85,7 @@ Listeners:
 https://github.com/letsencrypt/pebble is useful for testing with ACME. Start a
 pebble instance that uses the localhost TLS cert/key created by cfssl for its
 TLS serving. Pebble generates a new CA certificate for its own use each time it
-is started. Fetch it from https://localhost:14000/root, write it to a file, and
+is started. Fetch it from https://localhost:15000/roots/0, write it to a file, and
 add it to mox.conf TLS.CA.CertFiles. See below.
 
 Setup pebble, run once:
@@ -122,7 +122,7 @@ Write new CA bundle that includes pebble's temporary CA cert:
 export CURL_CA_BUNDLE=local/ca-bundle.pem # for curl
 export SSL_CERT_FILE=local/ca-bundle.pem # for go apps
 cat /etc/ssl/certs/ca-certificates.crt local/cfssl/ca.pem >local/ca-bundle.pem
-curl https://localhost:14000/root >local/pebble/ca.pem # fetch temp pebble ca, DO THIS EVERY TIME PEBBLE IS RESTARTED!
+curl https://localhost:15000/roots/0 >local/pebble/ca.pem # fetch temp pebble ca, DO THIS EVERY TIME PEBBLE IS RESTARTED!
 cat /etc/ssl/certs/ca-certificates.crt local/cfssl/ca.pem local/pebble/ca.pem >local/ca-bundle.pem # create new list that includes cfssl ca and temp pebble ca.
 rm -r local/*/data/acme/keycerts/pebble # remove existing pebble-signed certs in acme cert/key cache, they are invalid due to newly generated temp pebble ca.
 ```
@@ -167,8 +167,10 @@ testing purposes.
 - Write release notes, use instructions from updating.txt.
 - Build and run tests with previous major Go release.
 - Run all (integration) tests, including with race detector.
+- Test upgrades.
 - Run fuzzing tests for a while.
 - Deploy to test environment. Test the update instructions.
+- Test localserve.
 - Generate a config with quickstart, check if it results in a working setup.
 - Send and receive email through the major webmail providers, check headers.
 - Send and receive email with imap4/smtp clients.

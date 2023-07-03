@@ -42,7 +42,7 @@ var (
 		},
 		[]string{
 			"handler", // Name from webhandler, can be empty.
-			"proto",   // "http" or "https"
+			"proto",   // "http", "https", "ws", "wss"
 			"method",  // "(unknown)" and otherwise only common verbs
 			"code",
 		},
@@ -58,7 +58,7 @@ var (
 		},
 		[]string{
 			"handler", // Name from webhandler, can be empty.
-			"proto",   // "http" or "https"
+			"proto",   // "http", "https", "ws", "wss"
 			"method",  // "(unknown)" and otherwise only common verbs
 			"code",
 		},
@@ -69,20 +69,35 @@ var (
 
 // http.ResponseWriter that writes access log and tracks metrics at end of response.
 type loggingWriter struct {
-	W     http.ResponseWriter // Calls are forwarded.
-	Start time.Time
-	R     *http.Request
+	W                http.ResponseWriter // Calls are forwarded.
+	Start            time.Time
+	R                *http.Request
+	WebsocketRequest bool // Whether request from was websocket.
 
 	Handler string // Set by router.
 
 	// Set by handlers.
-	StatusCode int
-	Size       int64
-	WriteErr   error
+	StatusCode                   int
+	Size                         int64 // Of data served, for non-websocket responses.
+	Err                          error
+	WebsocketResponse            bool  // If this was a successful websocket connection with backend.
+	SizeFromClient, SizeToClient int64 // Websocket data.
 }
 
 func (w *loggingWriter) Header() http.Header {
 	return w.W.Header()
+}
+
+// protocol, for logging.
+func (w *loggingWriter) proto(websocket bool) string {
+	proto := "http"
+	if websocket {
+		proto = "ws"
+	}
+	if w.R.TLS != nil {
+		proto += "s"
+	}
+	return proto
 }
 
 func (w *loggingWriter) setStatusCode(statusCode int) {
@@ -92,11 +107,7 @@ func (w *loggingWriter) setStatusCode(statusCode int) {
 
 	w.StatusCode = statusCode
 	method := metricHTTPMethod(w.R.Method)
-	proto := "http"
-	if w.R.TLS != nil {
-		proto = "https"
-	}
-	metricRequest.WithLabelValues(w.Handler, proto, method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
+	metricRequest.WithLabelValues(w.Handler, w.proto(w.WebsocketRequest), method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
 }
 
 func (w *loggingWriter) Write(buf []byte) (int, error) {
@@ -108,8 +119,8 @@ func (w *loggingWriter) Write(buf []byte) (int, error) {
 	if n > 0 {
 		w.Size += int64(n)
 	}
-	if err != nil && w.WriteErr == nil {
-		w.WriteErr = err
+	if err != nil {
+		w.error(err)
 	}
 	return n, err
 }
@@ -136,13 +147,15 @@ func metricHTTPMethod(method string) string {
 	return "(other)"
 }
 
+func (w *loggingWriter) error(err error) {
+	if w.Err == nil {
+		w.Err = err
+	}
+}
+
 func (w *loggingWriter) Done() {
 	method := metricHTTPMethod(w.R.Method)
-	proto := "http"
-	if w.R.TLS != nil {
-		proto = "https"
-	}
-	metricResponse.WithLabelValues(w.Handler, proto, method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
+	metricResponse.WithLabelValues(w.Handler, w.proto(w.WebsocketResponse), method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
 
 	tlsinfo := "plain"
 	if w.R.TLS != nil {
@@ -152,21 +165,41 @@ func (w *loggingWriter) Done() {
 			tlsinfo = "(other)"
 		}
 	}
-	xlog.WithContext(w.R.Context()).Debugx("http request", w.WriteErr,
+	err := w.Err
+	if err == nil {
+		err = w.R.Context().Err()
+	}
+	fields := []mlog.Pair{
 		mlog.Field("httpaccess", ""),
 		mlog.Field("handler", w.Handler),
 		mlog.Field("method", method),
 		mlog.Field("url", w.R.URL),
 		mlog.Field("host", w.R.Host),
 		mlog.Field("duration", time.Since(w.Start)),
-		mlog.Field("size", w.Size),
 		mlog.Field("statuscode", w.StatusCode),
 		mlog.Field("proto", strings.ToLower(w.R.Proto)),
 		mlog.Field("remoteaddr", w.R.RemoteAddr),
 		mlog.Field("tlsinfo", tlsinfo),
 		mlog.Field("useragent", w.R.Header.Get("User-Agent")),
 		mlog.Field("referrr", w.R.Header.Get("Referrer")),
-	)
+	}
+	if w.WebsocketRequest {
+		fields = append(fields,
+			mlog.Field("websocketrequest", true),
+		)
+	}
+	if w.WebsocketResponse {
+		fields = append(fields,
+			mlog.Field("websocket", true),
+			mlog.Field("sizetoclient", w.SizeToClient),
+			mlog.Field("sizefromclient", w.SizeFromClient),
+		)
+	} else {
+		fields = append(fields,
+			mlog.Field("size", w.Size),
+		)
+	}
+	xlog.WithContext(w.R.Context()).Debugx("http request", err, fields...)
 }
 
 // Set some http headers that should prevent potential abuse. Better safe than sorry.
@@ -295,6 +328,16 @@ func (s *serve) ServeHTTP(xw http.ResponseWriter, r *http.Request) {
 // Listen binds to sockets for HTTP listeners, including those required for ACME to
 // generate TLS certificates. It stores the listeners so Serve can start serving them.
 func Listen() {
+	redirectToTrailingSlash := func(srv *serve, name, path string) {
+		// Helpfully redirect user to version with ending slash.
+		if path != "/" && strings.HasSuffix(path, "/") {
+			handler := safeHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, path, http.StatusSeeOther)
+			}))
+			srv.Handle(name, nil, path[:len(path)-1], handler)
+		}
+	}
+
 	for name, l := range mox.Conf.Static.Listeners {
 		portServe := map[int]*serve{}
 
@@ -325,44 +368,48 @@ func Listen() {
 
 		if l.AccountHTTP.Enabled {
 			port := config.Port(l.AccountHTTP.Port, 80)
-			srv := ensureServe(false, port, "account-http")
 			path := "/"
 			if l.AccountHTTP.Path != "" {
 				path = l.AccountHTTP.Path
 			}
+			srv := ensureServe(false, port, "account-http at "+path)
 			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(accountHandle)))
 			srv.Handle("account", nil, path, handler)
+			redirectToTrailingSlash(srv, "account", path)
 		}
 		if l.AccountHTTPS.Enabled {
 			port := config.Port(l.AccountHTTPS.Port, 443)
-			srv := ensureServe(true, port, "account-https")
 			path := "/"
 			if l.AccountHTTPS.Path != "" {
 				path = l.AccountHTTPS.Path
 			}
+			srv := ensureServe(true, port, "account-https at "+path)
 			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(accountHandle)))
 			srv.Handle("account", nil, path, handler)
+			redirectToTrailingSlash(srv, "account", path)
 		}
 
 		if l.AdminHTTP.Enabled {
 			port := config.Port(l.AdminHTTP.Port, 80)
-			srv := ensureServe(false, port, "admin-http")
 			path := "/admin/"
 			if l.AdminHTTP.Path != "" {
 				path = l.AdminHTTP.Path
 			}
+			srv := ensureServe(false, port, "admin-http at "+path)
 			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(adminHandle)))
 			srv.Handle("admin", nil, path, handler)
+			redirectToTrailingSlash(srv, "admin", path)
 		}
 		if l.AdminHTTPS.Enabled {
 			port := config.Port(l.AdminHTTPS.Port, 443)
-			srv := ensureServe(true, port, "admin-https")
 			path := "/admin/"
 			if l.AdminHTTPS.Path != "" {
 				path = l.AdminHTTPS.Path
 			}
+			srv := ensureServe(true, port, "admin-https at "+path)
 			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(adminHandle)))
 			srv.Handle("admin", nil, path, handler)
+			redirectToTrailingSlash(srv, "admin", path)
 		}
 		if l.MetricsHTTP.Enabled {
 			port := config.Port(l.MetricsHTTP.Port, 8010)
@@ -392,7 +439,7 @@ func Listen() {
 		}
 		if l.MTASTSHTTPS.Enabled {
 			port := config.Port(l.MTASTSHTTPS.Port, 443)
-			srv := ensureServe(!l.AutoconfigHTTPS.NonTLS, port, "mtasts-https")
+			srv := ensureServe(!l.MTASTSHTTPS.NonTLS, port, "mtasts-https")
 			mtastsMatch := func(dom dns.Domain) bool {
 				// todo: may want to check this against the configured domains, could in theory be just a webserver.
 				return strings.HasPrefix(dom.ASCII, "mta-sts.")
@@ -506,9 +553,11 @@ func listen1(ip string, port int, tlsConfig *tls.Config, name string, kinds []st
 	}
 
 	server := &http.Server{
-		Handler:   handler,
-		TLSConfig: tlsConfig,
-		ErrorLog:  golog.New(mlog.ErrWriter(xlog.Fields(mlog.Field("pkg", "net/http")), mlog.LevelInfo, protocol+" error"), "", 0),
+		Handler:           handler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       65 * time.Second, // Chrome closes connections after 60 seconds, firefox after 115 seconds.
+		ErrorLog:          golog.New(mlog.ErrWriter(xlog.Fields(mlog.Field("pkg", "net/http")), mlog.LevelInfo, protocol+" error"), "", 0),
 	}
 	serve := func() {
 		err := server.Serve(ln)

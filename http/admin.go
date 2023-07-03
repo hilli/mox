@@ -132,11 +132,14 @@ func checkAdminAuth(ctx context.Context, passwordfile string, w http.ResponseWri
 	}()
 
 	var err error
+	var remoteIP net.IP
 	addr, err = net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	if err != nil {
 		log.Errorx("parsing remote address", err, mlog.Field("addr", r.RemoteAddr))
+	} else if addr != nil {
+		remoteIP = addr.IP
 	}
-	if addr != nil && !mox.LimiterFailedAuth.Add(addr.IP, start, 1) {
+	if remoteIP != nil && !mox.LimiterFailedAuth.Add(remoteIP, start, 1) {
 		metrics.AuthenticationRatelimitedInc("httpadmin")
 		http.Error(w, "429 - too many auth attempts", http.StatusTooManyRequests)
 		return false
@@ -164,10 +167,12 @@ func checkAdminAuth(ctx context.Context, passwordfile string, w http.ResponseWri
 	}
 	t := strings.SplitN(string(auth), ":", 2)
 	if len(t) != 2 || len(t[1]) < 8 {
+		log.Info("failed authentication attempt", mlog.Field("username", "admin"), mlog.Field("remote", remoteIP))
 		return respondAuthFail()
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordhash), []byte(t[1])); err != nil {
 		authResult = "badcreds"
+		log.Info("failed authentication attempt", mlog.Field("username", "admin"), mlog.Field("remote", remoteIP))
 		return respondAuthFail()
 	}
 	authCache.lastSuccessHash = passwordhash
@@ -334,8 +339,15 @@ func logPanic(ctx context.Context) {
 }
 
 // return IPs we may be listening on.
-func xlistenIPs(ctx context.Context) []net.IP {
-	ips, err := mox.IPs(ctx)
+func xlistenIPs(ctx context.Context, receiveOnly bool) []net.IP {
+	ips, err := mox.IPs(ctx, receiveOnly)
+	xcheckf(ctx, err, "listing ips")
+	return ips
+}
+
+// return IPs from which we may be sending.
+func xsendingIPs(ctx context.Context) []net.IP {
+	ips, err := mox.IPs(ctx, false)
 	xcheckf(ctx, err, "listing ips")
 	return ips
 }
@@ -361,7 +373,7 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 		panic(&sherpa.Error{Code: "user:notFound", Message: "domain not found"})
 	}
 
-	listenIPs := xlistenIPs(ctx)
+	listenIPs := xlistenIPs(ctx, true)
 	isListenIP := func(ip net.IP) bool {
 		for _, lip := range listenIPs {
 			if ip.Equal(lip) {
@@ -437,7 +449,7 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 
 		// For each mox.Conf.SpecifiedSMTPListenIPs, and each address for
 		// mox.Conf.HostnameDomain, check if they resolve back to the host name.
-		var ips []net.IP
+		hostIPs := map[dns.Domain][]net.IP{}
 		ips, err := resolver.LookupIP(ctx, "ip", mox.Conf.Static.HostnameDomain.ASCII+".")
 		if err != nil {
 			addf(&r.IPRev.Errors, "Looking up IPs for hostname: %s", err)
@@ -453,32 +465,59 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 				ips = append(ips, ip)
 			}
 		}
+		hostIPs[mox.Conf.Static.HostnameDomain] = ips
+
+		iplist := func(ips []net.IP) string {
+			var ipstrs []string
+			for _, ip := range ips {
+				ipstrs = append(ipstrs, ip.String())
+			}
+			return strings.Join(ipstrs, ", ")
+		}
+
+		r.IPRev.Hostname = mox.Conf.Static.HostnameDomain
+		r.IPRev.Instructions = []string{
+			fmt.Sprintf("Ensure IPs %s have reverse address %s.", iplist(ips), mox.Conf.Static.HostnameDomain.ASCII),
+		}
+
+		// If we have a socks transport, also check its host and IP.
+		for tname, t := range mox.Conf.Static.Transports {
+			if t.Socks != nil {
+				hostIPs[t.Socks.Hostname] = append(hostIPs[t.Socks.Hostname], t.Socks.IPs...)
+				instr := fmt.Sprintf("For SOCKS transport %s, ensure IPs %s have reverse address %s.", tname, iplist(t.Socks.IPs), t.Socks.Hostname)
+				r.IPRev.Instructions = append(r.IPRev.Instructions, instr)
+			}
+		}
 
 		type result struct {
+			Host  dns.Domain
 			IP    string
 			Addrs []string
 			Err   error
 		}
 		results := make(chan result)
-		var ipstrs []string
-		for _, ip := range ips {
-			s := ip.String()
-			go func() {
-				addrs, err := resolver.LookupAddr(ctx, s)
-				results <- result{s, addrs, err}
-			}()
-			ipstrs = append(ipstrs, s)
+		n := 0
+		for host, ips := range hostIPs {
+			for _, ip := range ips {
+				n++
+				s := ip.String()
+				host := host
+				go func() {
+					addrs, err := resolver.LookupAddr(ctx, s)
+					results <- result{host, s, addrs, err}
+				}()
+			}
 		}
 		r.IPRev.IPNames = map[string][]string{}
-		for i := 0; i < len(ips); i++ {
+		for i := 0; i < n; i++ {
 			lr := <-results
-			addrs, ip, err := lr.Addrs, lr.IP, lr.Err
+			host, addrs, ip, err := lr.Host, lr.Addrs, lr.IP, lr.Err
 			if err != nil {
-				addf(&r.IPRev.Errors, "Looking up reverse name for %s: %v", ip, err)
+				addf(&r.IPRev.Errors, "Looking up reverse name for %s of %s: %v", ip, host, err)
 				continue
 			}
 			if len(addrs) != 1 {
-				addf(&r.IPRev.Errors, "Expected exactly 1 name for %s, got %d (%v)", ip, len(addrs), addrs)
+				addf(&r.IPRev.Errors, "Expected exactly 1 name for %s of %s, got %d (%v)", ip, host, len(addrs), addrs)
 			}
 			var match bool
 			for i, a := range addrs {
@@ -488,19 +527,14 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 				if err != nil {
 					addf(&r.IPRev.Errors, "Parsing reverse name %q for %s: %v", a, ip, err)
 				}
-				if ad == mox.Conf.Static.HostnameDomain {
+				if ad == host {
 					match = true
 				}
 			}
 			if !match {
-				addf(&r.IPRev.Errors, "Reverse name(s) %s for ip %s do not match hostname %s, which will cause other mail servers to reject incoming messages from this IP.", strings.Join(addrs, ","), ip, mox.Conf.Static.HostnameDomain)
+				addf(&r.IPRev.Errors, "Reverse name(s) %s for ip %s do not match hostname %s, which will cause other mail servers to reject incoming messages from this IP.", strings.Join(addrs, ","), ip, host)
 			}
 			r.IPRev.IPNames[ip] = addrs
-		}
-
-		r.IPRev.Hostname = mox.Conf.Static.HostnameDomain
-		r.IPRev.Instructions = []string{
-			fmt.Sprintf("Ensure IPs %s have reverse address %s.", strings.Join(ipstrs, ", "), mox.Conf.Static.HostnameDomain.ASCII),
 		}
 	}()
 
@@ -643,6 +677,7 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 	}()
 
 	// SPF
+	// todo: add warnings if we have Transports with submission? admin should ensure their IPs are in the SPF record. it may be an IP(net), or an include. that means we cannot easily check for it. and should we first check the transport can be used from this domain (or an account that has this domain?). also see DKIM.
 	wg.Add(1)
 	go func() {
 		defer logPanic(ctx)
@@ -662,38 +697,51 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 			spfr := spf.Record{
 				Version: "spf1",
 			}
+
+			checkSPFIP := func(ip net.IP) {
+				mechanism := "ip4"
+				if ip.To4() == nil {
+					mechanism = "ip6"
+				}
+				spfr.Directives = append(spfr.Directives, spf.Directive{Mechanism: mechanism, IP: ip})
+
+				if record == nil {
+					return
+				}
+
+				args := spf.Args{
+					RemoteIP:          ip,
+					MailFromLocalpart: "postmaster",
+					MailFromDomain:    domain,
+					HelloDomain:       dns.IPDomain{Domain: domain},
+					LocalIP:           net.ParseIP("127.0.0.1"),
+					LocalHostname:     dns.Domain{ASCII: "localhost"},
+				}
+				status, mechanism, expl, err := spf.Evaluate(ctx, record, resolver, args)
+				if err != nil {
+					addf(&r.SPF.Errors, "Evaluating IP %q against %s SPF record: %s", ip, kind, err)
+				} else if status != spf.StatusPass {
+					addf(&r.SPF.Errors, "IP %q does not pass %s SPF evaluation, status not \"pass\" but %q (mechanism %q, explanation %q)", ip, kind, status, mechanism, expl)
+				}
+			}
+
 			for _, l := range mox.Conf.Static.Listeners {
 				if !l.SMTP.Enabled || l.IPsNATed {
 					continue
 				}
 				for _, ipstr := range l.IPs {
 					ip := net.ParseIP(ipstr)
-					mechanism := "ip4"
-					if ip.To4() == nil {
-						mechanism = "ip6"
-					}
-					spfr.Directives = append(spfr.Directives, spf.Directive{Mechanism: mechanism, IP: ip})
-
-					if record == nil {
-						continue
-					}
-
-					args := spf.Args{
-						RemoteIP:          ip,
-						MailFromLocalpart: "postmaster",
-						MailFromDomain:    domain,
-						HelloDomain:       dns.IPDomain{Domain: domain},
-						LocalIP:           net.ParseIP("127.0.0.1"),
-						LocalHostname:     dns.Domain{ASCII: "localhost"},
-					}
-					status, mechanism, expl, err := spf.Evaluate(ctx, record, resolver, args)
-					if err != nil {
-						addf(&r.SPF.Errors, "Evaluating IP %q against %s SPF record: %s", ip, kind, err)
-					} else if status != spf.StatusPass {
-						addf(&r.SPF.Errors, "IP %q does not pass %s SPF evaluation, status not \"pass\" but %q (mechanism %q, explanation %q)", ip, kind, status, mechanism, expl)
+					checkSPFIP(ip)
+				}
+			}
+			for _, t := range mox.Conf.Static.Transports {
+				if t.Socks != nil {
+					for _, ip := range t.Socks.IPs {
+						checkSPFIP(ip)
 					}
 				}
 			}
+
 			spfr.Directives = append(spfr.Directives, spf.Directive{Qualifier: "-", Mechanism: "all"})
 			return txt, xrecord, spfr
 		}
@@ -717,6 +765,7 @@ func checkDomain(ctx context.Context, resolver dns.Resolver, dialer *net.Dialer,
 	}()
 
 	// DKIM
+	// todo: add warnings if we have Transports with submission? admin should ensure DKIM records exist. we cannot easily check if they actually exist though. and should we first check the transport can be used from this domain (or an account that has this domain?). also see SPF.
 	wg.Add(1)
 	go func() {
 		defer logPanic(ctx)
@@ -1126,8 +1175,8 @@ func (Admin) Domain(ctx context.Context, domain string) dns.Domain {
 	return d
 }
 
-// DomainLocalparts returns the localparts and accounts configured in domain.
-func (Admin) DomainLocalparts(ctx context.Context, domain string) (localpartAccounts map[smtp.Localpart]string) {
+// DomainLocalparts returns the encoded localparts and accounts configured in domain.
+func (Admin) DomainLocalparts(ctx context.Context, domain string) (localpartAccounts map[string]string) {
 	d, err := dns.ParseDomain(domain)
 	xcheckf(ctx, err, "parsing domain")
 	_, ok := mox.Conf.Domain(d)
@@ -1387,7 +1436,7 @@ func dnsblsStatus(ctx context.Context, resolver dns.Resolver) map[string]map[str
 	}
 
 	r := map[string]map[string]string{}
-	for _, ip := range xlistenIPs(ctx) {
+	for _, ip := range xsendingIPs(ctx) {
 		if ip.IsLoopback() || ip.IsPrivate() {
 			continue
 		}
@@ -1481,6 +1530,12 @@ func (Admin) SetPassword(ctx context.Context, accountName, password string) {
 	xcheckf(ctx, err, "setting password")
 }
 
+// SetAccountLimits set new limits on outgoing messages for an account.
+func (Admin) SetAccountLimits(ctx context.Context, accountName string, maxOutgoingMessagesPerDay, maxFirstTimeRecipientsPerDay int) {
+	err := mox.AccountLimitsSave(ctx, accountName, maxOutgoingMessagesPerDay, maxFirstTimeRecipientsPerDay)
+	xcheckf(ctx, err, "saving account limits")
+}
+
 // ClientConfigDomain returns configurations for email clients, IMAP and
 // Submission (SMTP) for the domain.
 func (Admin) ClientConfigDomain(ctx context.Context, domain string) mox.ClientConfig {
@@ -1494,21 +1549,22 @@ func (Admin) ClientConfigDomain(ctx context.Context, domain string) mox.ClientCo
 
 // QueueList returns the messages currently in the outgoing queue.
 func (Admin) QueueList(ctx context.Context) []queue.Msg {
-	l, err := queue.List()
+	l, err := queue.List(ctx)
 	xcheckf(ctx, err, "listing messages in queue")
 	return l
 }
 
 // QueueSize returns the number of messages currently in the outgoing queue.
 func (Admin) QueueSize(ctx context.Context) int {
-	n, err := queue.Count()
+	n, err := queue.Count(ctx)
 	xcheckf(ctx, err, "listing messages in queue")
 	return n
 }
 
-// QueueKick initiates delivery of a message from the queue.
-func (Admin) QueueKick(ctx context.Context, id int64) {
-	n, err := queue.Kick(id, "", "")
+// QueueKick initiates delivery of a message from the queue and sets the transport
+// to use for delivery.
+func (Admin) QueueKick(ctx context.Context, id int64, transport string) {
+	n, err := queue.Kick(ctx, id, "", "", &transport)
 	if err == nil && n == 0 {
 		err = errors.New("message not found")
 	}
@@ -1517,7 +1573,7 @@ func (Admin) QueueKick(ctx context.Context, id int64) {
 
 // QueueDrop removes a message from the queue.
 func (Admin) QueueDrop(ctx context.Context, id int64) {
-	n, err := queue.Drop(id, "", "")
+	n, err := queue.Drop(ctx, id, "", "")
 	if err == nil && n == 0 {
 		err = errors.New("message not found")
 	}
@@ -1620,4 +1676,9 @@ func (Admin) WebserverConfigSave(ctx context.Context, oldConf, newConf Webserver
 	savedConf = webserverConfig()
 	savedConf.WebDomainRedirects = nil
 	return savedConf
+}
+
+// Transports returns the configured transports, for sending email.
+func (Admin) Transports(ctx context.Context) map[string]config.Transport {
+	return mox.Conf.Static.Transports
 }

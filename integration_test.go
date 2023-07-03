@@ -5,33 +5,29 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-
-	"github.com/mjl-/bstore"
-
+	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/imapclient"
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
+	"github.com/mjl-/mox/sasl"
 	"github.com/mjl-/mox/smtpclient"
 	"github.com/mjl-/mox/store"
 )
 
-func tcheck(t *testing.T, err error, msg string) {
-	t.Helper()
+var ctxbg = context.Background()
+
+func tcheck(t *testing.T, err error, errmsg string) {
 	if err != nil {
-		t.Fatalf("%s: %s", msg, err)
+		t.Fatalf("%s: %s", errmsg, err)
 	}
 }
 
@@ -39,6 +35,7 @@ func tcheck(t *testing.T, err error, msg string) {
 // We check if we receive the message.
 func TestDeliver(t *testing.T) {
 	mlog.Logfmt = true
+	log := mlog.New("test")
 
 	// Remove state.
 	os.RemoveAll("testdata/integration/data")
@@ -50,8 +47,7 @@ func TestDeliver(t *testing.T) {
 
 	// Load mox config.
 	mox.ConfigStaticPath = "testdata/integration/config/mox.conf"
-	filepath.Join(filepath.Dir(mox.ConfigStaticPath), "domains.conf")
-	if errs := mox.LoadConfig(context.Background(), false); len(errs) > 0 {
+	if errs := mox.LoadConfig(ctxbg, true, false); len(errs) > 0 {
 		t.Fatalf("loading mox config: %v", errs)
 	}
 
@@ -76,63 +72,71 @@ func TestDeliver(t *testing.T) {
 	err := start(mtastsdbRefresher, skipForkExec)
 	tcheck(t, err, "starting mox")
 
-	// todo: we should probably hook store.Comm to get updates.
-	latestMsgID := func(username string) int64 {
-		// We open the account index database created by mox for the test user. And we keep looking for the email we sent.
-		dbpath := fmt.Sprintf("testdata/integration/data/accounts/%s/index.db", username)
-		db, err := bstore.Open(dbpath, &bstore.Options{Timeout: 3 * time.Second}, store.Message{}, store.Recipient{}, store.Mailbox{}, store.Password{})
-		if err != nil && errors.Is(err, bolt.ErrTimeout) {
-			log.Printf("db open timeout (normal delay for new sender with account and db file kept open)")
-			return 0
-		}
-		tcheck(t, err, "open test account database")
-		defer db.Close()
-
-		q := bstore.QueryDB[store.Mailbox](db)
-		q.FilterNonzero(store.Mailbox{Name: "Inbox"})
-		inbox, err := q.Get()
-		if err != nil {
-			log.Printf("inbox for finding latest message id: %v", err)
-			return 0
-		}
-
-		qm := bstore.QueryDB[store.Message](db)
-		qm.FilterNonzero(store.Message{MailboxID: inbox.ID})
-		qm.SortDesc("ID")
-		qm.Limit(1)
-		m, err := qm.Get()
-		if err != nil {
-			log.Printf("finding latest message id: %v", err)
-			return 0
-		}
-		return m.ID
+	// Single update from IMAP IDLE.
+	type idleResponse struct {
+		untagged imapclient.Untagged
+		err      error
 	}
 
-	waitForMsg := func(prevMsgID int64, username string) int64 {
+	testDeliver := func(checkTime bool, imapaddr, imapuser, imappass string, fn func()) {
 		t.Helper()
 
-		for i := 0; i < 10; i++ {
-			msgID := latestMsgID(username)
-			if msgID > prevMsgID {
-				return msgID
+		// Make IMAP connection, we'll wait for a delivery notification with IDLE.
+		imapconn, err := net.Dial("tcp", imapaddr)
+		tcheck(t, err, "dial imap server")
+		defer imapconn.Close()
+		client, err := imapclient.New(imapconn, false)
+		tcheck(t, err, "new imapclient")
+		_, _, err = client.Login(imapuser, imappass)
+		tcheck(t, err, "imap client login")
+		_, _, err = client.Select("inbox")
+		tcheck(t, err, "imap select inbox")
+
+		err = client.Commandf("", "idle")
+		tcheck(t, err, "imap idle command")
+
+		_, _, _, err = client.ReadContinuation()
+		tcheck(t, err, "read imap continuation")
+
+		idle := make(chan idleResponse)
+		go func() {
+			for {
+				untagged, err := client.ReadUntagged()
+				idle <- idleResponse{untagged, err}
+				if err != nil {
+					return
+				}
 			}
-			time.Sleep(500 * time.Millisecond)
+		}()
+		defer func() {
+			err := client.Writelinef("done")
+			tcheck(t, err, "aborting idle")
+		}()
+
+		t0 := time.Now()
+		fn()
+
+		// Wait for notification of delivery.
+		select {
+		case resp := <-idle:
+			tcheck(t, resp.err, "idle notification")
+			_, ok := resp.untagged.(imapclient.UntaggedExists)
+			if !ok {
+				t.Fatalf("got idle %#v, expected untagged exists", resp.untagged)
+			}
+			if d := time.Since(t0); checkTime && d < 1*time.Second {
+				t.Fatalf("delivery took %v, but should have taken at least 1 second, the first-time sender delay", d)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout after 5s waiting for IMAP IDLE notification of new message, should take about 1 second")
 		}
-		t.Fatalf("timeout waiting for message")
-		return 0 // not reached
 	}
 
-	deliver := func(username, desthost, mailfrom, password, rcptto string) {
-		t.Helper()
-
-		prevMsgID := latestMsgID(username)
-
-		conn, err := net.Dial("tcp", desthost+":587")
+	submit := func(smtphost, smtpport, mailfrom, password, rcptto string) {
+		conn, err := net.Dial("tcp", net.JoinHostPort(smtphost, smtpport))
 		tcheck(t, err, "dial submission")
 		defer conn.Close()
 
-		// todo: this is "aware" (hopefully) of the config smtpclient/client.go sets up... tricky
-		mox.Conf.Static.HostnameDomain.ASCII = desthost
 		msg := fmt.Sprintf(`From: <%s>
 To: <%s>
 Subject: test message
@@ -140,18 +144,37 @@ Subject: test message
 This is the message.
 `, mailfrom, rcptto)
 		msg = strings.ReplaceAll(msg, "\n", "\r\n")
-		auth := bytes.Join([][]byte{nil, []byte(mailfrom), []byte(password)}, []byte{0})
-		authLine := fmt.Sprintf("AUTH PLAIN %s", base64.StdEncoding.EncodeToString(auth))
-		c, err := smtpclient.New(mox.Context, mlog.New("test"), conn, smtpclient.TLSOpportunistic, desthost, authLine)
+		auth := []sasl.Client{sasl.NewClientPlain(mailfrom, password)}
+		c, err := smtpclient.New(mox.Context, log, conn, smtpclient.TLSOpportunistic, mox.Conf.Static.HostnameDomain, dns.Domain{ASCII: smtphost}, auth)
 		tcheck(t, err, "smtp hello")
 		err = c.Deliver(mox.Context, mailfrom, rcptto, int64(len(msg)), strings.NewReader(msg), false, false)
 		tcheck(t, err, "deliver with smtp")
 		err = c.Close()
 		tcheck(t, err, "close smtpclient")
-
-		waitForMsg(prevMsgID, username)
 	}
 
-	deliver("moxtest1", "moxmail1.mox1.example", "moxtest1@mox1.example", "pass1234", "root@postfix.example")
-	deliver("moxtest3", "moxmail2.mox2.example", "moxtest2@mox2.example", "pass1234", "moxtest3@mox3.example")
+	testDeliver(true, "moxmail1.mox1.example:143", "moxtest1@mox1.example", "pass1234", func() {
+		submit("moxmail1.mox1.example", "587", "moxtest1@mox1.example", "pass1234", "root@postfix.example")
+	})
+	testDeliver(true, "moxmail1.mox1.example:143", "moxtest3@mox3.example", "pass1234", func() {
+		submit("moxmail2.mox2.example", "587", "moxtest2@mox2.example", "pass1234", "moxtest3@mox3.example")
+	})
+
+	testDeliver(false, "localserve.mox1.example:1143", "mox@localhost", "moxmoxmox", func() {
+		submit("localserve.mox1.example", "1587", "mox@localhost", "moxmoxmox", "any@any.example")
+	})
+
+	testDeliver(false, "localserve.mox1.example:1143", "mox@localhost", "moxmoxmox", func() {
+		cmd := exec.Command("go", "run", ".", "sendmail", "mox@localhost")
+		const msg = `Subject: test
+
+a message.
+`
+		cmd.Stdin = strings.NewReader(msg)
+		var out strings.Builder
+		cmd.Stdout = &out
+		err := cmd.Run()
+		log.Print("sendmail", mlog.Field("output", out.String()))
+		tcheck(t, err, "sendmail")
+	})
 }

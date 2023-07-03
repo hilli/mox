@@ -100,10 +100,10 @@ func limitersInit() {
 
 var (
 	// Delays for bad/suspicious behaviour. Zero during tests.
-	badClientDelay                    = time.Second      // Before reads and after 1-byte writes for probably spammers.
-	authFailDelay                     = time.Second      // Response to authentication failure.
-	reputationlessSenderDeliveryDelay = 15 * time.Second // Before accepting message from first-time sender.
-	unknownRecipientsDelay            = 5 * time.Second  // Response when all recipients are unknown.
+	badClientDelay              = time.Second      // Before reads and after 1-byte writes for probably spammers.
+	authFailDelay               = time.Second      // Response to authentication failure.
+	unknownRecipientsDelay      = 5 * time.Second  // Response when all recipients are unknown.
+	firstTimeSenderDelayDefault = 15 * time.Second // Before accepting message from first-time sender.
 )
 
 type codes struct {
@@ -166,6 +166,13 @@ var (
 
 var jitterRand = mox.NewRand()
 
+func durationDefault(delay *time.Duration, def time.Duration) time.Duration {
+	if delay == nil {
+		return def
+	}
+	return *delay
+}
+
 // Listen initializes network listeners for incoming SMTP connection.
 // The listeners are stored for a later call to Serve.
 func Listen() {
@@ -187,7 +194,8 @@ func Listen() {
 			}
 			port := config.Port(listener.SMTP.Port, 25)
 			for _, ip := range listener.IPs {
-				listen1("smtp", name, ip, port, hostname, tlsConfig, false, false, maxMsgSize, false, listener.SMTP.RequireSTARTTLS, listener.SMTP.DNSBLZones)
+				firstTimeSenderDelay := durationDefault(listener.SMTP.FirstTimeSenderDelay, firstTimeSenderDelayDefault)
+				listen1("smtp", name, ip, port, hostname, tlsConfig, false, false, maxMsgSize, false, listener.SMTP.RequireSTARTTLS, listener.SMTP.DNSBLZones, firstTimeSenderDelay)
 			}
 		}
 		if listener.Submission.Enabled {
@@ -197,7 +205,7 @@ func Listen() {
 			}
 			port := config.Port(listener.Submission.Port, 587)
 			for _, ip := range listener.IPs {
-				listen1("submission", name, ip, port, hostname, tlsConfig, true, false, maxMsgSize, !listener.Submission.NoRequireSTARTTLS, !listener.Submission.NoRequireSTARTTLS, nil)
+				listen1("submission", name, ip, port, hostname, tlsConfig, true, false, maxMsgSize, !listener.Submission.NoRequireSTARTTLS, !listener.Submission.NoRequireSTARTTLS, nil, 0)
 			}
 		}
 
@@ -208,7 +216,7 @@ func Listen() {
 			}
 			port := config.Port(listener.Submissions.Port, 465)
 			for _, ip := range listener.IPs {
-				listen1("submissions", name, ip, port, hostname, tlsConfig, true, true, maxMsgSize, true, true, nil)
+				listen1("submissions", name, ip, port, hostname, tlsConfig, true, true, maxMsgSize, true, true, nil, 0)
 			}
 		}
 	}
@@ -216,7 +224,7 @@ func Listen() {
 
 var servers []func()
 
-func listen1(protocol, name, ip string, port int, hostname dns.Domain, tlsConfig *tls.Config, submission, xtls bool, maxMessageSize int64, requireTLSForAuth, requireTLSForDelivery bool, dnsBLs []dns.Domain) {
+func listen1(protocol, name, ip string, port int, hostname dns.Domain, tlsConfig *tls.Config, submission, xtls bool, maxMessageSize int64, requireTLSForAuth, requireTLSForDelivery bool, dnsBLs []dns.Domain, firstTimeSenderDelay time.Duration) {
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	if os.Getuid() == 0 {
 		xlog.Print("listening for smtp", mlog.Field("listener", name), mlog.Field("address", addr), mlog.Field("protocol", protocol))
@@ -238,7 +246,7 @@ func listen1(protocol, name, ip string, port int, hostname dns.Domain, tlsConfig
 				continue
 			}
 			resolver := dns.StrictResolver{} // By leaving Pkg empty, it'll be set by each package that uses the resolver, e.g. spf/dkim/dmarc.
-			go serve(name, mox.Cid(), hostname, tlsConfig, conn, resolver, submission, xtls, maxMessageSize, requireTLSForAuth, requireTLSForDelivery, dnsBLs)
+			go serve(name, mox.Cid(), hostname, tlsConfig, conn, resolver, submission, xtls, maxMessageSize, requireTLSForAuth, requireTLSForDelivery, dnsBLs, firstTimeSenderDelay)
 		}
 	}
 
@@ -283,6 +291,7 @@ type conn struct {
 	cmdStart              time.Time // Start of current command.
 	ncmds                 int       // Number of commands processed. Used to abort connection when first incoming command is unknown/invalid.
 	dnsBLs                []dns.Domain
+	firstTimeSenderDelay  time.Duration
 
 	// If non-zero, taken into account during Read and Write. Set while processing DATA
 	// command, we don't want the entire delivery to take too long.
@@ -509,7 +518,7 @@ func (c *conn) writelinef(format string, args ...any) {
 
 var cleanClose struct{} // Sentinel value for panic/recover indicating clean close of connection.
 
-func serve(listenerName string, cid int64, hostname dns.Domain, tlsConfig *tls.Config, nc net.Conn, resolver dns.Resolver, submission, tls bool, maxMessageSize int64, requireTLSForAuth, requireTLSForDelivery bool, dnsBLs []dns.Domain) {
+func serve(listenerName string, cid int64, hostname dns.Domain, tlsConfig *tls.Config, nc net.Conn, resolver dns.Resolver, submission, tls bool, maxMessageSize int64, requireTLSForAuth, requireTLSForDelivery bool, dnsBLs []dns.Domain, firstTimeSenderDelay time.Duration) {
 	var localIP, remoteIP net.IP
 	if a, ok := nc.LocalAddr().(*net.TCPAddr); ok {
 		localIP = a.IP
@@ -540,6 +549,7 @@ func serve(listenerName string, cid int64, hostname dns.Domain, tlsConfig *tls.C
 		requireTLSForAuth:     requireTLSForAuth,
 		requireTLSForDelivery: requireTLSForDelivery,
 		dnsBLs:                dnsBLs,
+		firstTimeSenderDelay:  firstTimeSenderDelay,
 	}
 	c.log = xlog.MoreFields(func() []mlog.Pair {
 		now := time.Now()
@@ -577,7 +587,7 @@ func serve(listenerName string, cid int64, hostname dns.Domain, tlsConfig *tls.C
 		} else if err, ok := x.(error); ok && isClosed(err) {
 			c.log.Infox("connection closed", err)
 		} else {
-			c.log.Error("unhandled error", mlog.Field("err", x))
+			c.log.Error("unhandled panic", mlog.Field("err", x))
 			debug.PrintStack()
 			metrics.PanicInc("smtpserver")
 		}
@@ -679,7 +689,7 @@ func command(c *conn) {
 		} else {
 			// Other type of panic, we pass it on, aborting the connection.
 			c.log.Errorx("command panic", err)
-			panic(x)
+			panic(err)
 		}
 	}()
 
@@ -799,7 +809,7 @@ func (c *conn) cmdHello(p *parser, ehlo bool) {
 	if c.submission {
 		// ../rfc/4954:123
 		if c.tls || !c.requireTLSForAuth {
-			c.bwritelinef("250-AUTH PLAIN SCRAM-SHA-256 SCRAM-SHA-1 CRAM-MD5")
+			c.bwritelinef("250-AUTH SCRAM-SHA-256 SCRAM-SHA-1 CRAM-MD5 PLAIN")
 		} else {
 			c.bwritelinef("250-AUTH ")
 		}
@@ -985,6 +995,7 @@ func (c *conn) cmdAuth(p *parser) {
 		if err != nil && errors.Is(err, store.ErrUnknownCredentials) {
 			// ../rfc/4954:274
 			authResult = "badcreds"
+			c.log.Info("failed authentication attempt", mlog.Field("username", authc), mlog.Field("remote", c.remoteIP))
 			xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad user/pass")
 		}
 		xcheckf(err, "verifying credentials")
@@ -1016,6 +1027,7 @@ func (c *conn) cmdAuth(p *parser) {
 		acc, _, err := store.OpenEmail(addr)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
+				c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 				xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad user/pass")
 			}
 		}
@@ -1028,9 +1040,10 @@ func (c *conn) cmdAuth(p *parser) {
 		}()
 		var ipadhash, opadhash hash.Hash
 		acc.WithRLock(func() {
-			err := acc.DB.Read(func(tx *bstore.Tx) error {
+			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if err == bstore.ErrAbsent {
+					c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 					xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad user/pass")
 				}
 				if err != nil {
@@ -1044,7 +1057,8 @@ func (c *conn) cmdAuth(p *parser) {
 			xcheckf(err, "tx read")
 		})
 		if ipadhash == nil || opadhash == nil {
-			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", addr))
+			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("username", addr))
+			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 			xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad user/pass")
 		}
 
@@ -1053,6 +1067,7 @@ func (c *conn) cmdAuth(p *parser) {
 		opadhash.Write(ipadhash.Sum(nil))
 		digest := fmt.Sprintf("%x", opadhash.Sum(nil))
 		if digest != t[1] {
+			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
 			xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad user/pass")
 		}
 
@@ -1088,6 +1103,7 @@ func (c *conn) cmdAuth(p *parser) {
 			// todo: we could continue scram with a generated salt, deterministically generated
 			// from the username. that way we don't have to store anything but attackers cannot
 			// learn if an account exists. same for absent scram saltedpassword below.
+			c.log.Info("failed authentication attempt", mlog.Field("username", ss.Authentication), mlog.Field("remote", c.remoteIP))
 			xsmtpUserErrorf(smtp.C454TempAuthFail, smtp.SeSys3Other0, "scram not possible")
 		}
 		defer func() {
@@ -1101,7 +1117,7 @@ func (c *conn) cmdAuth(p *parser) {
 		}
 		var xscram store.SCRAM
 		acc.WithRLock(func() {
-			err := acc.DB.Read(func(tx *bstore.Tx) error {
+			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if authVariant == "scram-sha-1" {
 					xscram = password.SCRAMSHA1
@@ -1110,6 +1126,7 @@ func (c *conn) cmdAuth(p *parser) {
 				}
 				if err == bstore.ErrAbsent || err == nil && (len(xscram.Salt) == 0 || xscram.Iterations == 0 || len(xscram.SaltedPassword) == 0) {
 					c.log.Info("scram auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", ss.Authentication))
+					c.log.Info("failed authentication attempt", mlog.Field("username", ss.Authentication), mlog.Field("remote", c.remoteIP))
 					xsmtpUserErrorf(smtp.C454TempAuthFail, smtp.SeSys3Other0, "scram not possible")
 				}
 				xcheckf(err, "fetching credentials")
@@ -1129,6 +1146,7 @@ func (c *conn) cmdAuth(p *parser) {
 			c.readline() // Should be "*" for cancellation.
 			if errors.Is(err, scram.ErrInvalidProof) {
 				authResult = "badcreds"
+				c.log.Info("failed authentication attempt", mlog.Field("username", ss.Authentication), mlog.Field("remote", c.remoteIP))
 				xsmtpUserErrorf(smtp.C535AuthBadCreds, smtp.SePol7AuthBadCreds8, "bad credentials")
 			}
 			xcheckf(err, "server final")
@@ -1625,7 +1643,7 @@ func messageHeaderCommentDomain(domain dns.Domain, smtputf8 bool) string {
 	return s
 }
 
-// submit is used for incoming mail from authenticated users.
+// submit is used for mail from authenticated users that we will try to deliver.
 func (c *conn) submit(ctx context.Context, recvHdrFor func(string) string, msgWriter *message.Writer, pdataFile **os.File) {
 	dataFile := *pdataFile
 
@@ -1669,22 +1687,86 @@ func (c *conn) submit(ctx context.Context, recvHdrFor func(string) string, msgWr
 		msgPrefix = append(msgPrefix, "Date: "+time.Now().Format(message.RFC5322Z)+"\r\n"...)
 	}
 
+	// Limit damage to the internet and our reputation in case of account compromise by
+	// limiting the max number of messages sent in a 24 hour window, both total number
+	// of messages and number of first-time recipients.
+	err = c.account.DB.Read(ctx, func(tx *bstore.Tx) error {
+		conf, _ := c.account.Conf()
+		msgmax := conf.MaxOutgoingMessagesPerDay
+		if msgmax == 0 {
+			// For human senders, 1000 recipients in a day is quite a lot.
+			msgmax = 1000
+		}
+		rcptmax := conf.MaxFirstTimeRecipientsPerDay
+		if rcptmax == 0 {
+			// Human senders may address a new human-sized list of people once in a while. In
+			// case of a compromise, a spammer will probably try to send to many new addresses.
+			rcptmax = 200
+		}
+
+		rcpts := map[string]time.Time{}
+		n := 0
+		err := bstore.QueryTx[store.Outgoing](tx).FilterGreater("Submitted", time.Now().Add(-24*time.Hour)).ForEach(func(o store.Outgoing) error {
+			n++
+			if rcpts[o.Recipient].IsZero() || o.Submitted.Before(rcpts[o.Recipient]) {
+				rcpts[o.Recipient] = o.Submitted
+			}
+			return nil
+		})
+		xcheckf(err, "querying message recipients in past 24h")
+		if n+len(c.recipients) > msgmax {
+			metricSubmission.WithLabelValues("messagelimiterror").Inc()
+			xsmtpUserErrorf(smtp.C451LocalErr, smtp.SePol7DeliveryUnauth1, "max number of messages (%d) over past 24h reached, try increasing per-account setting MaxOutgoingMessagesPerDay", msgmax)
+		}
+
+		// Only check if max first-time recipients is reached if there are enough messages
+		// to trigger the limit.
+		if n+len(c.recipients) < rcptmax {
+			return nil
+		}
+
+		isFirstTime := func(rcpt string, before time.Time) bool {
+			exists, err := bstore.QueryTx[store.Outgoing](tx).FilterNonzero(store.Outgoing{Recipient: rcpt}).FilterLess("Submitted", before).Exists()
+			xcheckf(err, "checking in database whether recipient is first-time")
+			return !exists
+		}
+
+		firsttime := 0
+		now := time.Now()
+		for _, rcptAcc := range c.recipients {
+			r := rcptAcc.rcptTo
+			if isFirstTime(r.XString(true), now) {
+				firsttime++
+			}
+		}
+		for r, t := range rcpts {
+			if isFirstTime(r, t) {
+				firsttime++
+			}
+		}
+		if firsttime > rcptmax {
+			metricSubmission.WithLabelValues("recipientlimiterror").Inc()
+			xsmtpUserErrorf(smtp.C451LocalErr, smtp.SePol7DeliveryUnauth1, "max number of new/first-time recipients (%d) over past 24h reached, try increasing per-account setting MaxFirstTimeRecipientsPerDay", rcptmax)
+		}
+		return nil
+	})
+	xcheckf(err, "read-only transaction")
+
 	// todo future: in a pedantic mode, we can parse the headers, and return an error if rcpt is only in To or Cc header, and not in the non-empty Bcc header. indicates a client that doesn't blind those bcc's.
 
 	// Add DKIM signatures.
-	domain := c.mailFrom.IPDomain.Domain
-	confDom, ok := mox.Conf.Domain(domain)
+	confDom, ok := mox.Conf.Domain(msgFrom.Domain)
 	if !ok {
-		c.log.Error("domain disappeared", mlog.Field("domain", domain))
+		c.log.Error("domain disappeared", mlog.Field("domain", msgFrom.Domain))
 		xsmtpServerErrorf(codes{smtp.C451LocalErr, smtp.SeSys3Other0}, "internal error")
 	}
 
 	dkimConfig := confDom.DKIM
 	if len(dkimConfig.Sign) > 0 {
-		if canonical, err := mox.CanonicalLocalpart(c.mailFrom.Localpart, confDom); err != nil {
-			c.log.Errorx("determining canonical localpart for dkim signing", err, mlog.Field("localpart", c.mailFrom.Localpart))
-		} else if dkimHeaders, err := dkim.Sign(ctx, canonical, domain, dkimConfig, c.smtputf8, dataFile); err != nil {
-			c.log.Errorx("dkim sign for domain", err, mlog.Field("domain", domain))
+		if canonical, err := mox.CanonicalLocalpart(msgFrom.Localpart, confDom); err != nil {
+			c.log.Errorx("determining canonical localpart for dkim signing", err, mlog.Field("localpart", msgFrom.Localpart))
+		} else if dkimHeaders, err := dkim.Sign(ctx, canonical, msgFrom.Domain, dkimConfig, c.smtputf8, store.FileMsgReader(msgPrefix, dataFile)); err != nil {
+			c.log.Errorx("dkim sign for domain", err, mlog.Field("domain", msgFrom.Domain))
 			metricServerErrors.WithLabelValues("dkimsign").Inc()
 		} else {
 			msgPrefix = append(msgPrefix, []byte(dkimHeaders)...)
@@ -1763,6 +1845,9 @@ func (c *conn) submit(ctx context.Context, recvHdrFor func(string) string, msgWr
 				}
 				metricSubmission.WithLabelValues("ok").Inc()
 				c.log.Info("submitted message delivered", mlog.Field("mailfrom", *c.mailFrom), mlog.Field("rcptto", rcptAcc.rcptTo), mlog.Field("smtputf8", c.smtputf8), mlog.Field("msgsize", msgSize))
+
+				err := c.account.DB.Insert(ctx, &store.Outgoing{Recipient: rcptAcc.rcptTo.XString(true)})
+				xcheckf(err, "adding outgoing message")
 			}
 		})
 
@@ -1785,7 +1870,7 @@ func (c *conn) submit(ctx context.Context, recvHdrFor func(string) string, msgWr
 			}
 
 			msgSize := int64(len(xmsgPrefix)) + msgWriter.Size
-			if err := queue.Add(c.log, c.account.Name, *c.mailFrom, rcptAcc.rcptTo, msgWriter.Has8bit, c.smtputf8, msgSize, xmsgPrefix, dataFile, nil, i == len(c.recipients)-1); err != nil {
+			if _, err := queue.Add(ctx, c.log, c.account.Name, *c.mailFrom, rcptAcc.rcptTo, msgWriter.Has8bit, c.smtputf8, msgSize, xmsgPrefix, dataFile, nil, i == len(c.recipients)-1); err != nil {
 				// Aborting the transaction is not great. But continuing and generating DSNs will
 				// probably result in errors as well...
 				metricSubmission.WithLabelValues("queueerror").Inc()
@@ -1794,6 +1879,9 @@ func (c *conn) submit(ctx context.Context, recvHdrFor func(string) string, msgWr
 			}
 			metricSubmission.WithLabelValues("ok").Inc()
 			c.log.Info("message queued for delivery", mlog.Field("mailfrom", *c.mailFrom), mlog.Field("rcptto", rcptAcc.rcptTo), mlog.Field("smtputf8", c.smtputf8), mlog.Field("msgsize", msgSize))
+
+			err := c.account.DB.Insert(ctx, &store.Outgoing{Recipient: rcptAcc.rcptTo.XString(true)})
+			xcheckf(err, "adding outgoing message")
 		}
 	}
 	err = dataFile.Close()
@@ -2197,7 +2285,7 @@ func (c *conn) deliver(ctx context.Context, recvHdrFor func(string) string, msgW
 		// account. They may fill up the mailbox, either with messages that have to be
 		// purged, or by filling the disk. We check both cases for IP's and networks.
 		var rateError bool // Whether returned error represents a rate error.
-		err = acc.DB.Read(func(tx *bstore.Tx) (retErr error) {
+		err = acc.DB.Read(ctx, func(tx *bstore.Tx) (retErr error) {
 			now := time.Now()
 			defer func() {
 				log.Debugx("checking message and size delivery rates", retErr, mlog.Field("duration", time.Since(now)))
@@ -2376,9 +2464,9 @@ func (c *conn) deliver(ctx context.Context, recvHdrFor func(string) string, msgW
 		// If not dmarc or tls report (Seen set above), and this is a first-time sender,
 		// wait before actually delivering. If this turns out to be a spammer, we've kept
 		// one of their connections busy.
-		if !m.Flags.Seen && a.reason == reasonNoBadSignals && reputationlessSenderDeliveryDelay > 0 {
-			log.Debug("delaying before delivering from sender without reputation", mlog.Field("delay", reputationlessSenderDeliveryDelay))
-			mox.Sleep(mox.Context, reputationlessSenderDeliveryDelay)
+		if !m.Flags.Seen && a.reason == reasonNoBadSignals && c.firstTimeSenderDelay > 0 {
+			log.Debug("delaying before delivering from sender without reputation", mlog.Field("delay", c.firstTimeSenderDelay))
+			mox.Sleep(mox.Context, c.firstTimeSenderDelay)
 		}
 
 		// Gather the message-id before we deliver and the file may be consumed.
@@ -2505,7 +2593,7 @@ func (c *conn) deliver(ctx context.Context, recvHdrFor func(string) string, msgW
 
 		if Localserve {
 			c.log.Error("not queueing dsn for incoming delivery due to localserve")
-		} else if err := queueDSN(c, *c.mailFrom, dsnMsg); err != nil {
+		} else if err := queueDSN(context.TODO(), c, *c.mailFrom, dsnMsg); err != nil {
 			metricServerErrors.WithLabelValues("queuedsn").Inc()
 			c.log.Errorx("queuing DSN for incoming delivery, no DSN sent", err)
 		}

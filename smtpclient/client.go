@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,10 +17,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/metrics"
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/moxio"
+	"github.com/mjl-/mox/sasl"
 	"github.com/mjl-/mox/smtp"
 )
 
@@ -55,8 +58,11 @@ var (
 type TLSMode string
 
 const (
-	// TLS with validated certificate is required: matching name, not expired, trusted by CA.
-	TLSStrict TLSMode = "strict"
+	// TLS with STARTTLS for MX SMTP servers, with validated certificate is required: matching name, not expired, trusted by CA.
+	TLSStrictStartTLS TLSMode = "strictstarttls"
+
+	// TLS immediately ("implicit TLS"), with validated certificate is required: matching name, not expired, trusted by CA.
+	TLSStrictImmediate TLSMode = "strictimmediate"
 
 	// Use TLS if remote claims to support it, but do not validate the certificate
 	// (not trusted by CA, different host name or expired certificate is accepted).
@@ -89,13 +95,14 @@ type Client struct {
 	botched  bool // If set, protocol is out of sync and no further commands can be sent.
 	needRset bool // If set, a new delivery requires an RSET command.
 
-	extEcodes     bool // Remote server supports sending extended error codes.
-	extStartTLS   bool // Remote server supports STARTTLS.
-	ext8bitmime   bool
-	extSize       bool  // Remote server supports SIZE parameter.
-	maxSize       int64 // Max size of email message.
-	extPipelining bool  // Remote server supports command pipelining.
-	extSMTPUTF8   bool  // Remote server supports SMTPUTF8 extension.
+	extEcodes         bool // Remote server supports sending extended error codes.
+	extStartTLS       bool // Remote server supports STARTTLS.
+	ext8bitmime       bool
+	extSize           bool     // Remote server supports SIZE parameter.
+	maxSize           int64    // Max size of email message.
+	extPipelining     bool     // Remote server supports command pipelining.
+	extSMTPUTF8       bool     // Remote server supports SMTPUTF8 extension.
+	extAuthMechanisms []string // Supported authentication mechanisms.
 }
 
 // Error represents a failure to deliver a message.
@@ -146,11 +153,11 @@ func (e Error) Error() string {
 // New initializes an SMTP session on the given connection, returning a client that
 // can be used to deliver messages.
 //
-// New reads the server greeting, identifies itself with a HELO or EHLO command,
-// initializes TLS if remote supports it and optionally authenticates. If
-// successful, a client is returned on which eventually Close must be called.
-// Otherwise an error is returned and the caller is responsible for closing the
-// connection.
+// New optionally starts TLS (for submission), reads the server greeting,
+// identifies itself with a HELO or EHLO command, initializes TLS with STARTTLS if
+// remote supports it and optionally authenticates. If successful, a client is
+// returned on which eventually Close must be called. Otherwise an error is
+// returned and the caller is responsible for closing the connection.
 //
 // Connecting to the correct host is outside the scope of the client. The queue
 // managing outgoing messages decides which host to deliver to, taking multiple MX
@@ -159,18 +166,17 @@ func (e Error) Error() string {
 //
 // tlsMode indicates if TLS is required, optional or should not be used. A
 // certificate is only validated (trusted, match remoteHostname and not expired)
-// for tls mode "required". By default, SMTP does not verify TLS for interopability
-// reasons, but MTA-STS or DANE can require it. If opportunistic TLS is used, and a
-// TLS error is encountered, the caller may want to try again (on a new connection)
-// without TLS.
+// for the strict tls modes. By default, SMTP does not verify TLS for
+// interopability reasons, but MTA-STS or DANE can require it. If opportunistic TLS
+// is used, and a TLS error is encountered, the caller may want to try again (on a
+// new connection) without TLS.
 //
-// If auth is non-empty, it is executed as a command after SMTP greeting/EHLO
-// initialization, before starting delivery. For authenticating to a submission
-// service with AUTH PLAIN, only meant for testing.
-func New(ctx context.Context, log *mlog.Log, conn net.Conn, tlsMode TLSMode, remoteHostname, auth string) (*Client, error) {
+// If auth is non-empty, authentication will be done with the first algorithm
+// supported by the server. If none of the algorithms are supported, an error is
+// returned.
+func New(ctx context.Context, log *mlog.Log, conn net.Conn, tlsMode TLSMode, ourHostname, remoteHostname dns.Domain, auth []sasl.Client) (*Client, error) {
 	c := &Client{
 		origConn: conn,
-		conn:     conn,
 		lastlog:  time.Now(),
 		cmds:     []string{"(none)"},
 	}
@@ -182,6 +188,24 @@ func New(ctx context.Context, log *mlog.Log, conn net.Conn, tlsMode TLSMode, rem
 		c.lastlog = now
 		return l
 	})
+
+	if tlsMode == TLSStrictImmediate {
+		tlsconfig := tls.Config{
+			ServerName: remoteHostname.ASCII,
+			RootCAs:    mox.Conf.Static.TLS.CertPool,
+			MinVersion: tls.VersionTLS12, // ../rfc/8996:31 ../rfc/8997:66
+		}
+		tlsconn := tls.Client(conn, &tlsconfig)
+		if err := tlsconn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		c.conn = tlsconn
+		tlsversion, ciphersuite := mox.TLSInfo(tlsconn)
+		c.log.Debug("tls client handshake done", mlog.Field("tls", tlsversion), mlog.Field("ciphersuite", ciphersuite), mlog.Field("servername", remoteHostname))
+	} else {
+		c.conn = conn
+	}
+
 	// We don't wrap reads in a timeoutReader for fear of an optional TLS wrapper doing
 	// reads without the client asking for it. Such reads could result in a timeout
 	// error.
@@ -192,7 +216,7 @@ func New(ctx context.Context, log *mlog.Log, conn net.Conn, tlsMode TLSMode, rem
 	c.tw = moxio.NewTraceWriter(c.log, "LC: ", timeoutWriter{c.conn, 30 * time.Second, c.log})
 	c.w = bufio.NewWriter(c.tw)
 
-	if err := c.hello(ctx, tlsMode, remoteHostname, auth); err != nil {
+	if err := c.hello(ctx, tlsMode, ourHostname, remoteHostname, auth); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -201,16 +225,26 @@ func New(ctx context.Context, log *mlog.Log, conn net.Conn, tlsMode TLSMode, rem
 // xbotchf generates a temporary error and marks the client as botched. e.g. for
 // i/o errors or invalid protocol messages.
 func (c *Client) xbotchf(code int, secode string, lastLine, format string, args ...any) {
-	c.botched = true
-	c.xerrorf(false, code, secode, lastLine, format, args...)
+	panic(c.botchf(code, secode, lastLine, format, args...))
 }
 
-func (c *Client) xerrorf(permanent bool, code int, secode, lastLine, format string, args ...any) {
+// botchf generates a temporary error and marks the client as botched. e.g. for
+// i/o errors or invalid protocol messages.
+func (c *Client) botchf(code int, secode string, lastLine, format string, args ...any) error {
+	c.botched = true
+	return c.errorf(false, code, secode, lastLine, format, args...)
+}
+
+func (c *Client) errorf(permanent bool, code int, secode, lastLine, format string, args ...any) error {
 	var cmd string
 	if len(c.cmds) > 0 {
 		cmd = c.cmds[0]
 	}
-	panic(Error{permanent, code, secode, cmd, lastLine, fmt.Errorf(format, args...)})
+	return Error{permanent, code, secode, cmd, lastLine, fmt.Errorf(format, args...)}
+}
+
+func (c *Client) xerrorf(permanent bool, code int, secode, lastLine, format string, args ...any) {
+	panic(c.errorf(permanent, code, secode, lastLine, format, args...))
 }
 
 // timeoutWriter passes each Write on to conn after setting a write deadline on conn based on
@@ -231,7 +265,7 @@ func (w timeoutWriter) Write(buf []byte) (int, error) {
 
 var bufs = moxio.NewBufpool(8, 2*1024)
 
-func (c *Client) xreadline() string {
+func (c *Client) readline() (string, error) {
 	// todo: could have per-operation timeouts. and rfc suggests higher minimum timeouts. ../rfc/5321:3610
 	if err := c.conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		c.log.Errorx("setting read deadline", err)
@@ -239,9 +273,9 @@ func (c *Client) xreadline() string {
 
 	line, err := bufs.Readline(c.r)
 	if err != nil {
-		c.xbotchf(0, "", "", "%s: %w", strings.Join(c.cmds, ","), err)
+		return line, c.botchf(0, "", "", "%s: %w", strings.Join(c.cmds, ","), err)
 	}
-	return line
+	return line, nil
 }
 
 func (c *Client) xtrace(level mlog.Level) func() {
@@ -285,49 +319,79 @@ func (c *Client) xflush() {
 
 // read response, possibly multiline, with supporting extended codes based on configuration in client.
 func (c *Client) xread() (code int, secode, lastLine string, texts []string) {
-	return c.xreadecode(c.extEcodes)
+	var err error
+	code, secode, lastLine, texts, err = c.read()
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
+func (c *Client) read() (code int, secode, lastLine string, texts []string, rerr error) {
+	return c.readecode(c.extEcodes)
 }
 
 // read response, possibly multiline.
 // if ecodes, extended codes are parsed.
-func (c *Client) xreadecode(ecodes bool) (code int, secode, lastLine string, texts []string) {
+func (c *Client) readecode(ecodes bool) (code int, secode, lastLine string, texts []string, rerr error) {
 	for {
-		co, sec, text, line, last := c.xread1(ecodes)
+		co, sec, text, line, last, err := c.read1(ecodes)
+		if err != nil {
+			rerr = err
+			return
+		}
 		texts = append(texts, text)
 		if code != 0 && co != code {
 			// ../rfc/5321:2771
-			c.xbotchf(0, "", line, "%w: multiline response with different codes, previous %d, last %d", ErrProtocol, code, co)
+			err := c.botchf(0, "", line, "%w: multiline response with different codes, previous %d, last %d", ErrProtocol, code, co)
+			return 0, "", "", nil, err
 		}
 		code = co
 		if last {
-			cmd := ""
-			if len(c.cmds) > 0 {
-				cmd = c.cmds[0]
-				// We only keep the last, so we're not creating new slices all the time.
-				if len(c.cmds) > 1 {
-					c.cmds = c.cmds[1:]
+			if code != smtp.C334ContinueAuth {
+				cmd := ""
+				if len(c.cmds) > 0 {
+					cmd = c.cmds[0]
+					// We only keep the last, so we're not creating new slices all the time.
+					if len(c.cmds) > 1 {
+						c.cmds = c.cmds[1:]
+					}
 				}
+				metricCommands.WithLabelValues(cmd, fmt.Sprintf("%d", co), sec).Observe(float64(time.Since(c.cmdStart)) / float64(time.Second))
+				c.log.Debug("smtpclient command result", mlog.Field("cmd", cmd), mlog.Field("code", co), mlog.Field("secode", sec), mlog.Field("duration", time.Since(c.cmdStart)))
 			}
-			metricCommands.WithLabelValues(cmd, fmt.Sprintf("%d", co), sec).Observe(float64(time.Since(c.cmdStart)) / float64(time.Second))
-			c.log.Debug("smtpclient command result", mlog.Field("cmd", cmd), mlog.Field("code", co), mlog.Field("secode", sec), mlog.Field("duration", time.Since(c.cmdStart)))
-			return co, sec, line, texts
+			return co, sec, line, texts, nil
 		}
 	}
 }
 
+func (c *Client) xreadecode(ecodes bool) (code int, secode, lastLine string, texts []string) {
+	var err error
+	code, secode, lastLine, texts, err = c.readecode(ecodes)
+	if err != nil {
+		panic(err)
+	}
+	return
+}
+
 // read single response line.
 // if ecodes, extended codes are parsed.
-func (c *Client) xread1(ecodes bool) (code int, secode, text, line string, last bool) {
-	line = c.xreadline()
+func (c *Client) read1(ecodes bool) (code int, secode, text, line string, last bool, rerr error) {
+	line, rerr = c.readline()
+	if rerr != nil {
+		return
+	}
 	i := 0
 	for ; i < len(line) && line[i] >= '0' && line[i] <= '9'; i++ {
 	}
 	if i != 3 {
-		c.xbotchf(0, "", line, "%w: expected response code: %s", ErrProtocol, line)
+		rerr = c.botchf(0, "", line, "%w: expected response code: %s", ErrProtocol, line)
+		return
 	}
 	v, err := strconv.ParseInt(line[:i], 10, 32)
 	if err != nil {
-		c.xbotchf(0, "", line, "%w: bad response code (%s): %s", ErrProtocol, err, line)
+		rerr = c.botchf(0, "", line, "%w: bad response code (%s): %s", ErrProtocol, err, line)
+		return
 	}
 	code = int(v)
 	major := code / 100
@@ -339,14 +403,15 @@ func (c *Client) xread1(ecodes bool) (code int, secode, text, line string, last 
 		// Allow missing space. ../rfc/5321:2570 ../rfc/5321:2612
 		last = true
 	} else {
-		c.xbotchf(0, "", line, "%w: expected space or dash after response code: %s", ErrProtocol, line)
+		rerr = c.botchf(0, "", line, "%w: expected space or dash after response code: %s", ErrProtocol, line)
+		return
 	}
 
 	if ecodes {
 		secode, s = parseEcode(major, s)
 	}
 
-	return code, secode, s, line, last
+	return code, secode, s, line, last, nil
 }
 
 func parseEcode(major int, s string) (secode string, remain string) {
@@ -398,7 +463,7 @@ func (c *Client) recover(rerr *error) {
 	*rerr = cerr
 }
 
-func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, auth string) (rerr error) {
+func (c *Client) hello(ctx context.Context, tlsMode TLSMode, ourHostname, remoteHostname dns.Domain, auth []sasl.Client) (rerr error) {
 	defer c.recover(&rerr)
 
 	// perform EHLO handshake, falling back to HELO if server does not appear to
@@ -409,7 +474,7 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 		c.cmds[0] = "ehlo"
 		c.cmdStart = time.Now()
 		// Syntax: ../rfc/5321:1827
-		c.xwritelinef("EHLO %s", mox.Conf.Static.HostnameDomain.ASCII)
+		c.xwritelinef("EHLO %s", ourHostname.ASCII)
 		code, _, lastLine, remains := c.xreadecode(false)
 		switch code {
 		// ../rfc/5321:997
@@ -421,7 +486,7 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 			// ../rfc/5321:996
 			c.cmds[0] = "helo"
 			c.cmdStart = time.Now()
-			c.xwritelinef("HELO %s", mox.Conf.Static.HostnameDomain.ASCII)
+			c.xwritelinef("HELO %s", ourHostname.ASCII)
 			code, _, lastLine, _ = c.xreadecode(false)
 			if code != smtp.C250Completed {
 				c.xerrorf(code/100 == 5, code, "", lastLine, "%w: expected 250 to HELO, got %d", ErrStatus, code)
@@ -452,6 +517,8 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 					if v, err := strconv.ParseInt(s[len("SIZE "):], 10, 64); err == nil {
 						c.maxSize = v
 					}
+				} else if strings.HasPrefix(s, "AUTH ") {
+					c.extAuthMechanisms = strings.Split(s[len("AUTH "):], " ")
 				}
 			}
 		}
@@ -468,9 +535,9 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 	// Write EHLO, falling back to HELO if server doesn't appear to support it.
 	hello(true)
 
-	// Attempt TLS if remote understands STARTTLS or if caller requires it.
-	if c.extStartTLS && tlsMode != TLSSkip || tlsMode == TLSStrict {
-		c.log.Debug("starting tls client")
+	// Attempt TLS if remote understands STARTTLS and we aren't doing immediate TLS or if caller requires it.
+	if c.extStartTLS && (tlsMode != TLSSkip && tlsMode != TLSStrictImmediate) || tlsMode == TLSStrictStartTLS {
+		c.log.Debug("starting tls client", mlog.Field("tlsmode", tlsMode), mlog.Field("servername", remoteHostname))
 		c.cmds[0] = "starttls"
 		c.cmdStart = time.Now()
 		c.xwritelinef("STARTTLS")
@@ -492,13 +559,13 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 			}
 		}
 
-		// For TLSStrict, the Go TLS library performs the checks needed for MTA-STS.
+		// For TLSStrictStartTLS, the Go TLS library performs the checks needed for MTA-STS.
 		// ../rfc/8461:646
 		// todo: possibly accept older TLS versions for TLSOpportunistic?
 		tlsConfig := &tls.Config{
-			ServerName:         remoteHostname,
+			ServerName:         remoteHostname.ASCII,
 			RootCAs:            mox.Conf.Static.TLS.CertPool,
-			InsecureSkipVerify: tlsMode != TLSStrict,
+			InsecureSkipVerify: tlsMode != TLSStrictStartTLS,
 			MinVersion:         tls.VersionTLS12, // ../rfc/8996:31 ../rfc/8997:66
 		}
 		nconn := tls.Client(conn, tlsConfig)
@@ -517,25 +584,103 @@ func (c *Client) hello(ctx context.Context, tlsMode TLSMode, remoteHostname, aut
 		c.w = bufio.NewWriter(c.tw)
 
 		tlsversion, ciphersuite := mox.TLSInfo(nconn)
-		c.log.Debug("tls client handshake done", mlog.Field("tls", tlsversion), mlog.Field("ciphersuite", ciphersuite))
+		c.log.Debug("starttls client handshake done", mlog.Field("tls", tlsversion), mlog.Field("ciphersuite", ciphersuite), mlog.Field("servername", remoteHostname), mlog.Field("insecureskipverify", tlsConfig.InsecureSkipVerify))
 
 		hello(false)
 	}
 
-	if auth != "" {
-		// No metrics, only used for tests.
-		c.cmds[0] = "auth"
-		c.cmdStart = time.Now()
-		defer c.xtrace(mlog.LevelTraceauth)()
-		c.xwriteline(auth)
-		c.xtrace(mlog.LevelTrace) // Restore.
-		code, secode, lastLine, _ := c.xread()
-		if code != smtp.C235AuthSuccess {
-			c.xerrorf(code/100 == 5, code, secode, lastLine, "%w: auth: got %d, expected 2xx", ErrStatus, code)
+	if len(auth) > 0 {
+		return c.auth(auth)
+	}
+	return
+}
+
+// ../rfc/4954:139
+func (c *Client) auth(auth []sasl.Client) (rerr error) {
+	defer c.recover(&rerr)
+
+	c.cmds[0] = "auth"
+	c.cmdStart = time.Now()
+
+	var a sasl.Client
+	var name string
+	var cleartextCreds bool
+	for _, x := range auth {
+		name, cleartextCreds = x.Info()
+		for _, s := range c.extAuthMechanisms {
+			if s == name {
+				a = x
+				break
+			}
 		}
 	}
+	if a == nil {
+		c.xerrorf(true, 0, "", "", "no matching authentication mechanisms, server supports %s", strings.Join(c.extAuthMechanisms, ", "))
+	}
 
-	return
+	abort := func() (int, string, string) {
+		// Abort authentication. ../rfc/4954:193
+		c.xwriteline("*")
+
+		// Server must respond with 501. // ../rfc/4954:195
+		code, secode, lastline, _ := c.xread()
+		if code != smtp.C501BadParamSyntax {
+			c.botched = true
+		}
+		return code, secode, lastline
+	}
+
+	toserver, last, err := a.Next(nil)
+	if err != nil {
+		c.xerrorf(false, 0, "", "", "initial step in auth mechanism %s: %w", name, err)
+	}
+	if cleartextCreds {
+		defer c.xtrace(mlog.LevelTraceauth)()
+	}
+	if toserver == nil {
+		c.xwriteline("AUTH " + name)
+	} else if len(toserver) == 0 {
+		c.xwriteline("AUTH " + name + " =") // ../rfc/4954:214
+	} else {
+		c.xwriteline("AUTH " + name + " " + base64.StdEncoding.EncodeToString(toserver))
+	}
+	for {
+		if cleartextCreds && last {
+			c.xtrace(mlog.LevelTrace) // Restore.
+		}
+
+		code, secode, lastLine, texts := c.xreadecode(last)
+		if code == smtp.C235AuthSuccess {
+			if !last {
+				c.xerrorf(false, code, secode, lastLine, "server completed authentication earlier than client expected")
+			}
+			return nil
+		} else if code == smtp.C334ContinueAuth {
+			if last {
+				c.xerrorf(false, code, secode, lastLine, "server requested unexpected continuation of authentication")
+			}
+			if len(texts) != 1 {
+				abort()
+				c.xerrorf(false, code, secode, lastLine, "server responded with multiline contination")
+			}
+			fromserver, err := base64.StdEncoding.DecodeString(texts[0])
+			if err != nil {
+				abort()
+				c.xerrorf(false, code, secode, lastLine, "malformed base64 data in authentication continuation response")
+			}
+			toserver, last, err = a.Next(fromserver)
+			if err != nil {
+				// For failing SCRAM, the client stops due to message about invalid proof. The
+				// server still sends an authentication result (it probably should send 501
+				// instead).
+				xcode, xsecode, lastline := abort()
+				c.xerrorf(false, xcode, xsecode, lastline, "client aborted authentication: %w", err)
+			}
+			c.xwriteline(base64.StdEncoding.EncodeToString(toserver))
+		} else {
+			c.xerrorf(code/100 == 5, code, secode, lastLine, "unexpected response during authentication, expected 334 continue or 235 auth success")
+		}
+	}
 }
 
 // Supports8BITMIME returns whether the SMTP server supports the 8BITMIME
@@ -633,15 +778,27 @@ func (c *Client) Deliver(ctx context.Context, mailFrom string, rcptTo string, ms
 		c.xbwriteline("DATA")
 		c.xflush()
 
+		// We read the response to RCPT TO and DATA without panic on read error. Servers
+		// may be aborting the connection after a failed MAIL FROM, e.g. outlook when it
+		// has blocklisted your IP. We don't want the read for the response to RCPT TO to
+		// cause a read error as it would result in an unhelpful error message and a
+		// temporary instead of permanent error code.
+
 		mfcode, mfsecode, mflastline, _ := c.xread()
-		rtcode, rtsecode, rtlastline, _ := c.xread()
-		datacode, datasecode, datalastline, _ := c.xread()
+		rtcode, rtsecode, rtlastline, _, rterr := c.read()
+		datacode, datasecode, datalastline, _, dataerr := c.read()
 
 		if mfcode != smtp.C250Completed {
 			c.xerrorf(mfcode/100 == 5, mfcode, mfsecode, mflastline, "%w: got %d, expected 2xx", ErrStatus, mfcode)
 		}
+		if rterr != nil {
+			panic(rterr)
+		}
 		if rtcode != smtp.C250Completed {
 			c.xerrorf(rtcode/100 == 5, rtcode, rtsecode, rtlastline, "%w: got %d, expected 2xx", ErrStatus, rtcode)
+		}
+		if dataerr != nil {
+			panic(dataerr)
 		}
 		if datacode != smtp.C354Continue {
 			c.xerrorf(datacode/100 == 5, datacode, datasecode, datalastline, "%w: got %d, expected 354", ErrStatus, datacode)

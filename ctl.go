@@ -30,6 +30,7 @@ import (
 // ctl represents a connection to the ctl unix domain socket of a running mox instance.
 // ctl provides functions to read/write commands/responses/data streams.
 type ctl struct {
+	cmd  string // Set for server-side of commands.
 	conn net.Conn
 	r    *bufio.Reader // Set for first reader.
 	x    any           // If set, errors are handled by calling panic(x) instead of log.Fatal.
@@ -57,7 +58,7 @@ func (c *ctl) xerror(msg string) {
 	if c.x == nil {
 		log.Fatalln(msg)
 	}
-	c.log.Debugx("ctl error", fmt.Errorf("%s", msg))
+	c.log.Debugx("ctl error", fmt.Errorf("%s", msg), mlog.Field("cmd", c.cmd))
 	c.xwrite(msg)
 	panic(c.x)
 }
@@ -72,7 +73,7 @@ func (c *ctl) xcheck(err error, msg string) {
 	if c.x == nil {
 		log.Fatalf("%s: %s", msg, err)
 	}
-	c.log.Debugx(msg, err)
+	c.log.Debugx(msg, err, mlog.Field("cmd", c.cmd))
 	fmt.Fprintf(c.conn, "%s: %s\n", msg, err)
 	panic(c.x)
 }
@@ -124,7 +125,7 @@ func (c *ctl) xstreamfrom(src io.Reader) {
 // When done writing, caller must call xclose to signal the end of the stream.
 // Behaviour of "x" is copied from ctl.
 func (c *ctl) writer() *ctlwriter {
-	return &ctlwriter{conn: c.conn, x: c.x, log: c.log}
+	return &ctlwriter{cmd: c.cmd, conn: c.conn, x: c.x, log: c.log}
 }
 
 // Reader returns an io.Reader for a data stream from ctl.
@@ -133,7 +134,7 @@ func (c *ctl) reader() *ctlreader {
 	if c.r == nil {
 		c.r = bufio.NewReader(c.conn)
 	}
-	return &ctlreader{conn: c.conn, r: c.r, x: c.x, log: c.log}
+	return &ctlreader{cmd: c.cmd, conn: c.conn, r: c.r, x: c.x, log: c.log}
 }
 
 /*
@@ -154,6 +155,7 @@ Followed by a end of stream indicated by zero data bytes message:
 */
 
 type ctlwriter struct {
+	cmd  string   // Set for server-side of commands.
 	conn net.Conn // Ctl socket from which messages are read.
 	buf  []byte   // Scratch buffer, for reading response.
 	x    any      // If not nil, errors in Write and xcheckf are handled with panic(x), otherwise with a log.Fatal.
@@ -181,7 +183,7 @@ func (s *ctlwriter) xerror(msg string) {
 	if s.x == nil {
 		log.Fatalln(msg)
 	} else {
-		s.log.Debugx("error", fmt.Errorf("%s", msg))
+		s.log.Debugx("error", fmt.Errorf("%s", msg), mlog.Field("cmd", s.cmd))
 		panic(s.x)
 	}
 }
@@ -193,7 +195,7 @@ func (s *ctlwriter) xcheck(err error, msg string) {
 	if s.x == nil {
 		log.Fatalf("%s: %s", msg, err)
 	} else {
-		s.log.Debugx(msg, err)
+		s.log.Debugx(msg, err, mlog.Field("cmd", s.cmd))
 		panic(s.x)
 	}
 }
@@ -204,6 +206,7 @@ func (s *ctlwriter) xclose() {
 }
 
 type ctlreader struct {
+	cmd      string        // Set for server-side of command.
 	conn     net.Conn      // For writing "ok" after reading.
 	r        *bufio.Reader // Buffered ctl socket.
 	err      error         // If set, returned for each read. can also be io.EOF.
@@ -229,8 +232,6 @@ func (s *ctlreader) Read(buf []byte) (N int, Err error) {
 			return 0, s.err
 		}
 		s.npending = int(n)
-		_, err = fmt.Fprintln(s.conn, "ok")
-		s.xcheck(err, "writing ok after reading")
 	}
 	rn := len(buf)
 	if rn > s.npending {
@@ -239,6 +240,10 @@ func (s *ctlreader) Read(buf []byte) (N int, Err error) {
 	n, err := s.r.Read(buf[:rn])
 	s.xcheck(err, "read from ctl")
 	s.npending -= n
+	if s.npending == 0 {
+		_, err = fmt.Fprintln(s.conn, "ok")
+		s.xcheck(err, "writing ok after reading")
+	}
 	return n, err
 }
 
@@ -246,7 +251,7 @@ func (s *ctlreader) xerror(msg string) {
 	if s.x == nil {
 		log.Fatalln(msg)
 	} else {
-		s.log.Debugx("error", fmt.Errorf("%s", msg))
+		s.log.Debugx("error", fmt.Errorf("%s", msg), mlog.Field("cmd", s.cmd))
 		panic(s.x)
 	}
 }
@@ -258,7 +263,7 @@ func (s *ctlreader) xcheck(err error, msg string) {
 	if s.x == nil {
 		log.Fatalf("%s: %s", msg, err)
 	} else {
-		s.log.Debugx(msg, err)
+		s.log.Debugx(msg, err, mlog.Field("cmd", s.cmd))
 		panic(s.x)
 	}
 }
@@ -267,33 +272,31 @@ func (s *ctlreader) xcheck(err error, msg string) {
 func servectl(ctx context.Context, log *mlog.Log, conn net.Conn, shutdown func()) {
 	log.Debug("ctl connection")
 
-	var cmd string
-
 	var stop = struct{}{} // Sentinel value for panic and recover.
+	ctl := &ctl{conn: conn, x: stop, log: log}
 	defer func() {
 		x := recover()
 		if x == nil || x == stop {
 			return
 		}
-		log.Error("servectl panic", mlog.Field("err", x), mlog.Field("cmd", cmd))
+		log.Error("servectl panic", mlog.Field("err", x), mlog.Field("cmd", ctl.cmd))
 		debug.PrintStack()
 		metrics.PanicInc("ctl")
 	}()
 
 	defer conn.Close()
 
-	ctl := &ctl{conn: conn, x: stop, log: log}
 	ctl.xwrite("ctlv0")
-
 	for {
-		servectlcmd(ctx, log, ctl, &cmd, shutdown)
+		servectlcmd(ctx, ctl, shutdown)
 	}
 }
 
-func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shutdown func()) {
+func servectlcmd(ctx context.Context, ctl *ctl, shutdown func()) {
+	log := ctl.log
 	cmd := ctl.xread()
+	ctl.cmd = cmd
 	log.Info("ctl command", mlog.Field("cmd", cmd))
-	*xcmd = cmd
 	switch cmd {
 	case "stop":
 		shutdown()
@@ -386,7 +389,7 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 		< "ok"
 		< stream
 		*/
-		qmsgs, err := queue.List()
+		qmsgs, err := queue.List(ctx)
 		ctl.xcheck(err, "listing queue")
 		ctl.xwriteok()
 
@@ -404,9 +407,39 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 		}
 		xw.xclose()
 
-	case "queuekick", "queuedrop":
+	case "queuekick":
 		/* protocol:
-		> "queuekick" or "queuedrop"
+		> "queuekick"
+		> id
+		> todomain
+		> recipient
+		> transport // if empty, transport is left unchanged; in future, we may want to differtiate between "leave unchanged" and "set to empty string".
+		< count
+		< "ok" or error
+		*/
+
+		idstr := ctl.xread()
+		todomain := ctl.xread()
+		recipient := ctl.xread()
+		transport := ctl.xread()
+		id, err := strconv.ParseInt(idstr, 10, 64)
+		if err != nil {
+			ctl.xwrite("0")
+			ctl.xcheck(err, "parsing id")
+		}
+
+		var xtransport *string
+		if transport != "" {
+			xtransport = &transport
+		}
+		count, err := queue.Kick(ctx, id, todomain, recipient, xtransport)
+		ctl.xcheck(err, "kicking queue")
+		ctl.xwrite(fmt.Sprintf("%d", count))
+		ctl.xwriteok()
+
+	case "queuedrop":
+		/* protocol:
+		> "queuedrop"
 		> id
 		> todomain
 		> recipient
@@ -423,14 +456,8 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 			ctl.xcheck(err, "parsing id")
 		}
 
-		var count int
-		if cmd == "queuekick" {
-			count, err = queue.Kick(id, todomain, recipient)
-			ctl.xcheck(err, "kicking queue")
-		} else {
-			count, err = queue.Drop(id, todomain, recipient)
-			ctl.xcheck(err, "dropping messages from queue")
-		}
+		count, err := queue.Drop(ctx, id, todomain, recipient)
+		ctl.xcheck(err, "dropping messages from queue")
 		ctl.xwrite(fmt.Sprintf("%d", count))
 		ctl.xwriteok()
 
@@ -447,7 +474,7 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 		if err != nil {
 			ctl.xcheck(err, "parsing id")
 		}
-		mr, err := queue.OpenMessage(id)
+		mr, err := queue.OpenMessage(ctx, id)
 		ctl.xcheck(err, "opening message")
 		defer func() {
 			err := mr.Close()
@@ -458,7 +485,7 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 
 	case "importmaildir", "importmbox":
 		mbox := cmd == "importmbox"
-		importctl(ctl, mbox)
+		importctl(ctx, ctl, mbox)
 
 	case "domainadd":
 		/* protocol:
@@ -609,7 +636,7 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 			log.Check(err, "removing old junkfilter bloom filter file", mlog.Field("path", bloomPath))
 
 			// Open junk filter, this creates new files.
-			jf, _, err := acc.OpenJunkFilter(ctl.log)
+			jf, _, err := acc.OpenJunkFilter(ctx, ctl.log)
 			ctl.xcheck(err, "open new junk filter")
 			defer func() {
 				if jf == nil {
@@ -621,10 +648,10 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 
 			// Read through messages with junk or nonjunk flag set, and train them.
 			var total, trained int
-			q := bstore.QueryDB[store.Message](acc.DB)
+			q := bstore.QueryDB[store.Message](ctx, acc.DB)
 			err = q.ForEach(func(m store.Message) error {
 				total++
-				ok, err := acc.TrainMessage(ctl.log, jf, m)
+				ok, err := acc.TrainMessage(ctx, ctl.log, jf, m)
 				if ok {
 					trained++
 				}
@@ -640,6 +667,9 @@ func servectlcmd(ctx context.Context, log *mlog.Log, ctl *ctl, xcmd *string, shu
 		})
 
 		ctl.xwriteok()
+
+	case "backup":
+		backupctl(ctx, ctl)
 
 	default:
 		log.Info("unrecognized command", mlog.Field("cmd", cmd))

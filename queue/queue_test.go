@@ -3,9 +3,14 @@ package queue
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"reflect"
@@ -21,6 +26,8 @@ import (
 	"github.com/mjl-/mox/store"
 )
 
+var ctxbg = context.Background()
+
 func tcheck(t *testing.T, err error, msg string) {
 	if err != nil {
 		t.Helper()
@@ -31,19 +38,19 @@ func tcheck(t *testing.T, err error, msg string) {
 func setup(t *testing.T) (*store.Account, func()) {
 	// Prepare config so email can be delivered to mjl@mox.example.
 	os.RemoveAll("../testdata/queue/data")
-	mox.Context = context.Background()
+	mox.Context = ctxbg
 	mox.ConfigStaticPath = "../testdata/queue/mox.conf"
-	mox.MustLoadConfig(false)
+	mox.MustLoadConfig(true, false)
 	acc, err := store.OpenAccount("mjl")
 	tcheck(t, err, "open account")
 	err = acc.SetPassword("testtest")
 	tcheck(t, err, "set password")
 	switchDone := store.Switchboard()
-	mox.Shutdown, mox.ShutdownCancel = context.WithCancel(context.Background())
+	mox.Shutdown, mox.ShutdownCancel = context.WithCancel(ctxbg)
 	return acc, func() {
 		acc.Close()
 		mox.ShutdownCancel()
-		mox.Shutdown, mox.ShutdownCancel = context.WithCancel(context.Background())
+		mox.Shutdown, mox.ShutdownCancel = context.WithCancel(ctxbg)
 		Shutdown()
 		close(switchDone)
 	}
@@ -71,22 +78,22 @@ func TestQueue(t *testing.T) {
 	err := Init()
 	tcheck(t, err, "queue init")
 
-	msgs, err := List()
+	msgs, err := List(ctxbg)
 	tcheck(t, err, "listing messages in queue")
 	if len(msgs) != 0 {
 		t.Fatalf("got %d messages in queue, expected 0", len(msgs))
 	}
 
 	path := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "mox.example"}}}
-	err = Add(xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
 	tcheck(t, err, "add message to queue for delivery")
 
 	mf2 := prepareFile(t)
-	err = Add(xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, mf2, nil, false)
+	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, mf2, nil, false)
 	tcheck(t, err, "add message to queue for delivery")
 	os.Remove(mf2.Name())
 
-	msgs, err = List()
+	msgs, err = List(ctxbg)
 	tcheck(t, err, "listing queue")
 	if len(msgs) != 2 {
 		t.Fatalf("got msgs %v, expected 1", msgs)
@@ -95,18 +102,21 @@ func TestQueue(t *testing.T) {
 	if msg.Attempts != 0 {
 		t.Fatalf("msg attempts %d, expected 0", msg.Attempts)
 	}
-	n, err := Drop(msgs[1].ID, "", "")
+	n, err := Drop(ctxbg, msgs[1].ID, "", "")
 	tcheck(t, err, "drop")
 	if n != 1 {
 		t.Fatalf("dropped %d, expected 1", n)
 	}
+	if _, err := os.Stat(msgs[1].MessagePath()); err == nil || !os.IsNotExist(err) {
+		t.Fatalf("dropped message not removed from file system")
+	}
 
-	next := nextWork(nil)
+	next := nextWork(ctxbg, nil)
 	if next > 0 {
 		t.Fatalf("nextWork in %s, should be now", next)
 	}
 	busy := map[string]struct{}{"mox.example": {}}
-	if x := nextWork(busy); x != 24*time.Hour {
+	if x := nextWork(ctxbg, busy); x != 24*time.Hour {
 		t.Fatalf("nextWork in %s for busy domain, should be in 24 hours", x)
 	}
 	if nn := launchWork(nil, busy); nn != 0 {
@@ -115,11 +125,14 @@ func TestQueue(t *testing.T) {
 
 	// Override dial function. We'll make connecting fail for now.
 	resolver := dns.MockResolver{
-		A:  map[string][]string{"mox.example.": {"127.0.0.1"}},
+		A: map[string][]string{
+			"mox.example.":        {"127.0.0.1"},
+			"submission.example.": {"127.0.0.1"},
+		},
 		MX: map[string][]*net.MX{"mox.example.": {{Host: "mox.example", Pref: 10}}},
 	}
 	dialed := make(chan struct{}, 1)
-	dial = func(ctx context.Context, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		dialed <- struct{}{}
 		return nil, fmt.Errorf("failure from test")
 	}
@@ -133,7 +146,7 @@ func TestQueue(t *testing.T) {
 	case <-dialed:
 		i := 0
 		for {
-			m, err := bstore.QueryDB[Msg](queueDB).Get()
+			m, err := bstore.QueryDB[Msg](ctxbg, DB).Get()
 			tcheck(t, err, "get")
 			if m.Attempts == 1 {
 				break
@@ -149,11 +162,11 @@ func TestQueue(t *testing.T) {
 	}
 	<-deliveryResult // Deliver sends here.
 
-	_, err = OpenMessage(msg.ID + 1)
+	_, err = OpenMessage(ctxbg, msg.ID+1)
 	if err != bstore.ErrAbsent {
 		t.Fatalf("OpenMessage, got %v, expected ErrAbsent", err)
 	}
-	reader, err := OpenMessage(msg.ID)
+	reader, err := OpenMessage(ctxbg, msg.ID)
 	tcheck(t, err, "open message")
 	defer reader.Close()
 	msgbuf, err := io.ReadAll(reader)
@@ -162,26 +175,20 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("message mismatch, got %q, expected %q", string(msgbuf), testmsg)
 	}
 
-	n, err = Kick(msg.ID+1, "", "")
+	n, err = Kick(ctxbg, msg.ID+1, "", "", nil)
 	tcheck(t, err, "kick")
 	if n != 0 {
 		t.Fatalf("kick %d, expected 0", n)
 	}
-	n, err = Kick(msg.ID, "", "")
+	n, err = Kick(ctxbg, msg.ID, "", "", nil)
 	tcheck(t, err, "kick")
 	if n != 1 {
 		t.Fatalf("kicked %d, expected 1", n)
 	}
 
-	// Setting up a pipe. We'll start a fake smtp server on the server-side. And return the
-	// client-side to the invocation dial, for the attempted delivery from the queue.
-	// The delivery should succeed.
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
-
 	smtpdone := make(chan struct{})
-	go func() {
+
+	fakeSMTPServer := func(server net.Conn) {
 		// We do a minimal fake smtp server. We cannot import smtpserver.Serve due to cyclic dependencies.
 		fmt.Fprintf(server, "220 mox.example\r\n")
 		br := bufio.NewReader(server)
@@ -200,45 +207,142 @@ func TestQueue(t *testing.T) {
 		fmt.Fprintf(server, "221 ok\r\n")
 
 		smtpdone <- struct{}{}
-	}()
-
-	dial = func(ctx context.Context, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
-		dialed <- struct{}{}
-		return client, nil
 	}
-	launchWork(resolver, map[string]struct{}{})
 
-	timer.Reset(time.Second)
-	select {
-	case <-dialed:
-		select {
-		case <-smtpdone:
-			i := 0
-			for {
-				xmsgs, err := List()
-				tcheck(t, err, "list queue")
-				if len(xmsgs) == 0 {
-					break
-				}
-				i++
-				if i == 10 {
-					t.Fatalf("%d messages in queue, expected 0", len(xmsgs))
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		case <-timer.C:
-			t.Fatalf("no deliver within 1s")
+	fakeSubmitServer := func(server net.Conn) {
+		// We do a minimal fake smtp server. We cannot import smtpserver.Serve due to cyclic dependencies.
+		fmt.Fprintf(server, "220 mox.example\r\n")
+		br := bufio.NewReader(server)
+		br.ReadString('\n') // Should be EHLO.
+		fmt.Fprintf(server, "250-localhost\r\n")
+		fmt.Fprintf(server, "250 AUTH PLAIN\r\n")
+		br.ReadString('\n') // Should be AUTH PLAIN
+		fmt.Fprintf(server, "235 2.7.0 auth ok\r\n")
+		br.ReadString('\n') // Should be MAIL FROM.
+		fmt.Fprintf(server, "250 ok\r\n")
+		br.ReadString('\n') // Should be RCPT TO.
+		fmt.Fprintf(server, "250 ok\r\n")
+		br.ReadString('\n') // Should be DATA.
+		fmt.Fprintf(server, "354 continue\r\n")
+		reader := smtp.NewDataReader(br)
+		io.Copy(io.Discard, reader)
+		fmt.Fprintf(server, "250 ok\r\n")
+		br.ReadString('\n') // Should be QUIT.
+		fmt.Fprintf(server, "221 ok\r\n")
+
+		smtpdone <- struct{}{}
+	}
+
+	testDeliver := func(fakeServer func(conn net.Conn)) bool {
+		t.Helper()
+
+		// Setting up a pipe. We'll start a fake smtp server on the server-side. And return the
+		// client-side to the invocation dial, for the attempted delivery from the queue.
+		// The delivery should succeed.
+		server, client := net.Pipe()
+		defer server.Close()
+		defer client.Close()
+
+		var wasNetDialer bool
+		dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+			_, wasNetDialer = dialer.(*net.Dialer)
+			dialed <- struct{}{}
+			return client, nil
 		}
-	case <-timer.C:
-		t.Fatalf("no dial within 1s")
+
+		waitDeliver := func() {
+			t.Helper()
+			timer.Reset(time.Second)
+			select {
+			case <-dialed:
+				select {
+				case <-smtpdone:
+					i := 0
+					for {
+						xmsgs, err := List(ctxbg)
+						tcheck(t, err, "list queue")
+						if len(xmsgs) == 0 {
+							break
+						}
+						i++
+						if i == 10 {
+							t.Fatalf("%d messages in queue, expected 0", len(xmsgs))
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+				case <-timer.C:
+					t.Fatalf("no deliver within 1s")
+				}
+			case <-timer.C:
+				t.Fatalf("no dial within 1s")
+			}
+			<-deliveryResult // Deliver sends here.
+		}
+
+		go fakeServer(server)
+		launchWork(resolver, map[string]struct{}{})
+		waitDeliver()
+		return wasNetDialer
 	}
-	<-deliveryResult // Deliver sends here.
+
+	// Test direct delivery.
+	wasNetDialer := testDeliver(fakeSMTPServer)
+	if !wasNetDialer {
+		t.Fatalf("expected net.Dialer as dialer")
+	}
+
+	// Add a message to be delivered with submit because of its route.
+	topath := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "submit.example"}}}
+	_, err = Add(ctxbg, xlog, "mjl", path, topath, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	tcheck(t, err, "add message to queue for delivery")
+	wasNetDialer = testDeliver(fakeSubmitServer)
+	if !wasNetDialer {
+		t.Fatalf("expected net.Dialer as dialer")
+	}
+
+	// Add a message to be delivered with submit because of explicitly configured transport, that uses TLS.
+	msgID, err := Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	tcheck(t, err, "add message to queue for delivery")
+	transportSubmitTLS := "submittls"
+	n, err = Kick(ctxbg, msgID, "", "", &transportSubmitTLS)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	// Make fake cert, and make it trusted.
+	cert := fakeCert(t, "submission.example", false)
+	mox.Conf.Static.TLS.CertPool = x509.NewCertPool()
+	mox.Conf.Static.TLS.CertPool.AddCert(cert.Leaf)
+	tlsConfig := tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+	wasNetDialer = testDeliver(func(conn net.Conn) {
+		conn = tls.Server(conn, &tlsConfig)
+		fakeSubmitServer(conn)
+	})
+	if !wasNetDialer {
+		t.Fatalf("expected net.Dialer as dialer")
+	}
+
+	// Add a message to be delivered with socks.
+	msgID, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	tcheck(t, err, "add message to queue for delivery")
+	transportSocks := "socks"
+	n, err = Kick(ctxbg, msgID, "", "", &transportSocks)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	wasNetDialer = testDeliver(fakeSMTPServer)
+	if wasNetDialer {
+		t.Fatalf("expected non-net.Dialer as dialer") // SOCKS5 dialer is a private type, we cannot check for it.
+	}
 
 	// Add another message that we'll fail to deliver entirely.
-	err = Add(xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
 	tcheck(t, err, "add message to queue for delivery")
 
-	msgs, err = List()
+	msgs, err = List(ctxbg)
 	tcheck(t, err, "list queue")
 	if len(msgs) != 1 {
 		t.Fatalf("queue has %d messages, expected 1", len(msgs))
@@ -265,7 +369,7 @@ func TestQueue(t *testing.T) {
 	}()
 
 	seq := 0
-	dial = func(ctx context.Context, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		seq++
 		switch seq {
 		default:
@@ -283,7 +387,7 @@ func TestQueue(t *testing.T) {
 	for i := 1; i < 8; i++ {
 		go func() { <-deliveryResult }() // Deliver sends here.
 		deliver(resolver, msg)
-		err = queueDB.Get(&msg)
+		err = DB.Get(ctxbg, &msg)
 		tcheck(t, err, "get msg")
 		if msg.Attempts != i {
 			t.Fatalf("got attempt %d, expected %d", msg.Attempts, i)
@@ -306,7 +410,7 @@ func TestQueue(t *testing.T) {
 	// Trigger final failure.
 	go func() { <-deliveryResult }() // Deliver sends here.
 	deliver(resolver, msg)
-	err = queueDB.Get(&msg)
+	err = DB.Get(ctxbg, &msg)
 	if err != bstore.ErrAbsent {
 		t.Fatalf("attempt to fetch delivered and removed message from queue, got err %v, expected ErrAbsent", err)
 	}
@@ -332,7 +436,7 @@ func TestQueueStart(t *testing.T) {
 		MX: map[string][]*net.MX{"mox.example.": {{Host: "mox.example", Pref: 10}}},
 	}
 	dialed := make(chan struct{}, 1)
-	dial = func(ctx context.Context, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		dialed <- struct{}{}
 		return nil, fmt.Errorf("failure from test")
 	}
@@ -343,7 +447,7 @@ func TestQueueStart(t *testing.T) {
 	defer func() {
 		mox.ShutdownCancel()
 		<-done
-		mox.Shutdown, mox.ShutdownCancel = context.WithCancel(context.Background())
+		mox.Shutdown, mox.ShutdownCancel = context.WithCancel(ctxbg)
 	}()
 	err := Start(resolver, done)
 	tcheck(t, err, "queue start")
@@ -369,7 +473,7 @@ func TestQueueStart(t *testing.T) {
 	}
 
 	path := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "mox.example"}}}
-	err = Add(xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
 	tcheck(t, err, "add message to queue for delivery")
 	checkDialed(true)
 
@@ -378,7 +482,7 @@ func TestQueueStart(t *testing.T) {
 	checkDialed(false)
 
 	// Kick for real, should see another attempt.
-	n, err := Kick(0, "mox.example", "")
+	n, err := Kick(ctxbg, 0, "mox.example", "", nil)
 	tcheck(t, err, "kick queue")
 	if n != 1 {
 		t.Fatalf("kick changed %d messages, expected 1", n)
@@ -402,7 +506,7 @@ func TestWriteFile(t *testing.T) {
 }
 
 func TestGatherHosts(t *testing.T) {
-	mox.Context = context.Background()
+	mox.Context = ctxbg
 
 	// Test basic MX lookup case, but also following CNAME, detecting CNAME loops and
 	// having a CNAME limit, connecting directly to a host, and domain that does not
@@ -515,7 +619,7 @@ func TestDialHost(t *testing.T) {
 		},
 	}
 
-	dial = func(ctx context.Context, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		return nil, nil // No error, nil connection isn't used.
 	}
 
@@ -524,12 +628,44 @@ func TestDialHost(t *testing.T) {
 	}
 
 	m := Msg{DialedIPs: map[string][]net.IP{}}
-	_, ip, dualstack, err := dialHost(context.Background(), xlog, resolver, ipdomain("dualstack.example"), &m)
+	_, ip, dualstack, err := dialHost(ctxbg, xlog, resolver, nil, ipdomain("dualstack.example"), 25, &m)
 	if err != nil || ip.String() != "10.0.0.1" || !dualstack {
 		t.Fatalf("expected err nil, address 10.0.0.1, dualstack true, got %v %v %v", err, ip, dualstack)
 	}
-	_, ip, dualstack, err = dialHost(context.Background(), xlog, resolver, ipdomain("dualstack.example"), &m)
+	_, ip, dualstack, err = dialHost(ctxbg, xlog, resolver, nil, ipdomain("dualstack.example"), 25, &m)
 	if err != nil || ip.String() != "2001:db8::1" || !dualstack {
 		t.Fatalf("expected err nil, address 2001:db8::1, dualstack true, got %v %v %v", err, ip, dualstack)
 	}
+}
+
+// Just a cert that appears valid.
+func fakeCert(t *testing.T, name string, expired bool) tls.Certificate {
+	notAfter := time.Now()
+	if expired {
+		notAfter = notAfter.Add(-time.Hour)
+	} else {
+		notAfter = notAfter.Add(time.Hour)
+	}
+
+	privKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)) // Fake key, don't use this for real!
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), // Required field...
+		DNSNames:     []string{name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+	}
+	localCertBuf, err := x509.CreateCertificate(cryptorand.Reader, template, template, privKey.Public(), privKey)
+	if err != nil {
+		t.Fatalf("making certificate: %s", err)
+	}
+	cert, err := x509.ParseCertificate(localCertBuf)
+	if err != nil {
+		t.Fatalf("parsing generated certificate: %s", err)
+	}
+	c := tls.Certificate{
+		Certificate: [][]byte{localCertBuf},
+		PrivateKey:  privKey,
+		Leaf:        cert,
+	}
+	return c
 }

@@ -192,6 +192,11 @@ func (tc *testconn) xcodeArg(v any) {
 
 func (tc *testconn) xuntagged(exps ...any) {
 	tc.t.Helper()
+	tc.xuntaggedCheck(true, exps...)
+}
+
+func (tc *testconn) xuntaggedCheck(all bool, exps ...any) {
+	tc.t.Helper()
 	last := append([]imapclient.Untagged{}, tc.lastUntagged...)
 next:
 	for ei, exp := range exps {
@@ -212,7 +217,7 @@ next:
 		}
 		tc.t.Fatalf("did not find untagged response %#v %T (%d) in %v%s", exp, exp, ei, tc.lastUntagged, next)
 	}
-	if len(last) > 0 {
+	if len(last) > 0 && all {
 		tc.t.Fatalf("leftover untagged responses %v", last)
 	}
 }
@@ -311,7 +316,7 @@ func startArgs(t *testing.T, first, isTLS, allowLoginWithoutTLS bool) *testconn 
 	}
 	mox.Context = context.Background()
 	mox.ConfigStaticPath = "../testdata/imap/mox.conf"
-	mox.MustLoadConfig(false)
+	mox.MustLoadConfig(true, false)
 	acc, err := store.OpenAccount("mjl")
 	tcheck(t, err, "open account")
 	if first {
@@ -387,8 +392,12 @@ func TestLogin(t *testing.T) {
 	tc.close()
 
 	tc = start(t)
-	defer tc.close()
 	tc.transactf("ok", `login "mjl@mox.example" "testtest"`)
+	tc.close()
+
+	tc = start(t)
+	tc.transactf("ok", `login "\"\"@mox.example" "testtest"`)
+	defer tc.close()
 
 	tc.transactf("bad", "logout badarg")
 	tc.transactf("ok", "logout")
@@ -521,7 +530,7 @@ func TestScenario(t *testing.T) {
 	tc.transactf("ok", `store 1 flags.silent (\seen \answered)`)
 	tc.transactf("ok", `store 1 -flags.silent (\answered)`)
 	tc.transactf("ok", `store 1 +flags.silent (\answered)`)
-	tc.transactf("no", `store 1 flags (\badflag)`)
+	tc.transactf("bad", `store 1 flags (\badflag)`)
 	tc.transactf("ok", "noop")
 
 	tc.transactf("ok", "copy 1 Trash")

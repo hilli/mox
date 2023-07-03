@@ -20,7 +20,7 @@ low-maintenance self-hosted email.
 	mox setadminpassword
 	mox loglevels [level [pkg]]
 	mox queue list
-	mox queue kick [-id id] [-todomain domain] [-recipient address]
+	mox queue kick [-id id] [-todomain domain] [-recipient address] [-transport transport]
 	mox queue drop [-id id] [-todomain domain] [-recipient address]
 	mox queue dump id
 	mox import maildir accountname mailboxname maildir
@@ -29,6 +29,8 @@ low-maintenance self-hosted email.
 	mox export mbox dst-dir account-path [mailbox]
 	mox localserve
 	mox help [command ...]
+	mox backup dest-dir
+	mox verifydata data-dir
 	mox config test
 	mox config dnscheck domain
 	mox config dnsrecords domain
@@ -190,13 +192,19 @@ retry after 7.5 minutes, and doubling each time. Kicking messages sets their
 next scheduled attempt to now, it can cause delivery to fail earlier than
 without rescheduling.
 
-	usage: mox queue kick [-id id] [-todomain domain] [-recipient address]
+With the -transport flag, future delivery attempts are done using the specified
+transport. Transports can be configured in mox.conf, e.g. to submit to a remote
+queue over SMTP.
+
+	usage: mox queue kick [-id id] [-todomain domain] [-recipient address] [-transport transport]
 	  -id int
 	    	id of message in queue
 	  -recipient string
 	    	recipient email address
 	  -todomain string
 	    	destination domain of messages
+	  -transport string
+	    	transport to use for the next delivery
 
 # mox queue drop
 
@@ -321,6 +329,8 @@ during those commands instead of during "data".
 	usage: mox localserve
 	  -dir string
 	    	configuration storage directory (default "$userconfigdir/mox-localserve")
+	  -ip string
+	    	serve on this ip instead of default 127.0.0.1 and ::1. only used when writing configuration, at first launch.
 
 # mox help
 
@@ -330,6 +340,71 @@ If multiple commands match, they are listed along with the first line of their h
 If a single command matches, its usage and full help text is printed.
 
 	usage: mox help [command ...]
+
+# mox backup
+
+Creates a backup of the data directory.
+
+Backup creates consistent snapshots of the databases and message files and
+copies other files in the data directory. Empty directories are not copied.
+These files can then be stored elsewhere for long-term storage, or used to fall
+back to should an upgrade fail. Simply copying files in the data directory
+while mox is running can result in unusable database files.
+
+Message files never change (they are read-only, though can be removed) and are
+hardlinked so they don't consume additional space. If hardlinking fails, for
+example when the backup destination directory is on a different file system, a
+regular copy is made. Using a destination directory like "data/tmp/backup"
+increases the odds hardlinking succeeds: the default systemd service file
+specifically mounts the data directory, causing attempts to hardlink outside it
+to fail with an error about cross-device linking.
+
+All files in the data directory that aren't recognized (i.e. other than known
+database files, message files, an acme directory, the "tmp" directory, etc),
+are stored, but with a warning.
+
+A clean successful backup does not print any output by default. Use the
+-verbose flag for details, including timing.
+
+To restore a backup, first shut down mox, move away the old data directory and
+move an earlier backed up directory in its place, run "mox verifydata",
+possibly with the "-fix" option, and restart mox. After the restore, you may
+also want to run "mox bumpuidvalidity" for each account for which messages in a
+mailbox changed, to force IMAP clients to synchronize mailbox state.
+
+Before upgrading, to check if the upgrade will likely succeed, first make a
+backup, then use the new mox binary to run "mox verifydata" on the backup. This
+can change the backup files (e.g. upgrade database files, move away
+unrecognized message files), so you should make a new backup before actually
+upgrading.
+
+	usage: mox backup dest-dir
+	  -verbose
+	    	print progress
+
+# mox verifydata
+
+Verify the contents of a data directory, typically of a backup.
+
+Verifydata checks all database files to see if they are valid BoltDB/bstore
+databases. It checks that all messages in the database have a corresponding
+on-disk message file and there are no unrecognized files. If option -fix is
+specified, unrecognized message files are moved away. This may be needed after
+a restore, because messages enqueued or delivered in the future may get those
+message sequence numbers assigned and writing the message file would fail.
+Consistency of message/mailbox UID, UIDNEXT and UIDVALIDITY is verified as
+well.
+
+Because verifydata opens the database files, schema upgrades may automatically
+be applied. This can happen if you use a new mox release. It is useful to run
+"mox verifydata" with a new binary before attempting an upgrade, but only on a
+copy of the database files, as made with "mox backup". Before upgrading, make a
+new backup again since "mox verifydata" may have upgraded the database files,
+possibly making them potentially no longer readable by the previous version.
+
+	usage: mox verifydata data-dir
+	  -fix
+	    	fix fixable problems, such as moving away message files not referenced by their database
 
 # mox config test
 
@@ -404,13 +479,16 @@ these addresses will be rejected.
 
 Adds an address to an account and reloads the configuration.
 
+If address starts with a @ (i.e. a missing localpart), this is a catchall
+address for the domain.
+
 	usage: mox config address add address account
 
 # mox config address rm
 
 Remove an address and reload the configuration.
 
-Incoming email for this address will be rejected.
+Incoming email for this address will be rejected after removing an address.
 
 	usage: mox config address rm address
 
@@ -633,7 +711,9 @@ If submitting an email fails, it is added to a directory moxsubmit.failures in
 the user's home directory.
 
 Most flags are ignored to fake compatibility with other sendmail
-implementations. A single recipient is required, or the tflag.
+implementations. A single recipient or the -t flag with a To-header is required.
+With the -t flag, Cc and Bcc headers are not handled specially, so Bcc is not
+removed and the addresses do not receive the email.
 
 /etc/moxsubmit.conf should be group-readable and not readable by others and this
 binary should be setgid that group:

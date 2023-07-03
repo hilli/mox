@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mjl-/mox/config"
@@ -185,7 +186,7 @@ func MakeDomainConfig(ctx context.Context, domain, hostname dns.Domain, accountN
 	addSelector := func(kind, name string, privKey []byte) error {
 		record := fmt.Sprintf("%s._domainkey.%s", name, domain.ASCII)
 		keyPath := filepath.Join("dkim", fmt.Sprintf("%s.%s.%skey.pkcs8.pem", record, timestamp, kind))
-		p := ConfigDirPath(keyPath)
+		p := configDirPath(ConfigDynamicPath, keyPath)
 		if err := writeFile(p, privKey); err != nil {
 			return err
 		}
@@ -269,7 +270,7 @@ func MakeDomainConfig(ctx context.Context, domain, hostname dns.Domain, accountN
 // DomainAdd adds the domain to the domains config, rewriting domains.conf and
 // marking it loaded.
 //
-// accountName is used for DMARC/TLS report.
+// accountName is used for DMARC/TLS report and potentially for the postmaster address.
 // If the account does not exist, it is created with localpart. Localpart must be
 // set only if the account does not yet exist.
 func DomainAdd(ctx context.Context, domain dns.Domain, accountName string, localpart smtp.Localpart) (rerr error) {
@@ -324,6 +325,16 @@ func DomainAdd(ctx context.Context, domain dns.Domain, accountName string, local
 		return fmt.Errorf("account name is empty")
 	} else if !ok {
 		nc.Accounts[accountName] = MakeAccountConfig(smtp.Address{Localpart: localpart, Domain: domain})
+	} else if accountName != Conf.Static.Postmaster.Account {
+		nacc := nc.Accounts[accountName]
+		nd := map[string]config.Destination{}
+		for k, v := range nacc.Destinations {
+			nd[k] = v
+		}
+		pmaddr := smtp.Address{Localpart: "postmaster", Domain: domain}
+		nd[pmaddr.String()] = config.Destination{}
+		nacc.Destinations = nd
+		nc.Accounts[accountName] = nacc
 	}
 
 	nc.Domains[domain.Name()] = confDomain
@@ -552,8 +563,10 @@ func DomainRecords(domConf config.Domain, domain dns.Domain) ([]string, error) {
 // AccountAdd adds an account and an initial address and reloads the
 // configuration.
 //
-// The new account does not have a password, so cannot log in. Email can be
+// The new account does not have a password, so cannot yet log in. Email can be
 // delivered.
+//
+// Catchall addresses are not supported for AccountAdd. Add separately with AddressAdd.
 func AccountAdd(ctx context.Context, account, address string) (rerr error) {
 	log := xlog.WithContext(ctx)
 	defer func() {
@@ -561,6 +574,11 @@ func AccountAdd(ctx context.Context, account, address string) (rerr error) {
 			log.Errorx("adding account", rerr, mlog.Field("account", account), mlog.Field("address", address))
 		}
 	}()
+
+	addr, err := smtp.ParseAddress(address)
+	if err != nil {
+		return fmt.Errorf("parsing email address: %v", err)
+	}
 
 	Conf.dynamicMutex.Lock()
 	defer Conf.dynamicMutex.Unlock()
@@ -570,17 +588,8 @@ func AccountAdd(ctx context.Context, account, address string) (rerr error) {
 		return fmt.Errorf("account already present")
 	}
 
-	addr, err := smtp.ParseAddress(address)
-	if err != nil {
-		return fmt.Errorf("parsing email address: %v", err)
-	}
-	if _, ok := Conf.accountDestinations[addr.String()]; ok {
-		return fmt.Errorf("address already exists")
-	}
-
-	dname := addr.Domain.Name()
-	if _, ok := c.Domains[dname]; !ok {
-		return fmt.Errorf("domain does not exist")
+	if err := checkAddressAvailable(addr); err != nil {
+		return fmt.Errorf("address not available: %v", err)
 	}
 
 	// Compose new config without modifying existing data structures. If we fail, we
@@ -633,8 +642,26 @@ func AccountRemove(ctx context.Context, account string) (rerr error) {
 	return nil
 }
 
-// AddressAdd adds an email address to an account and reloads the
-// configuration.
+// checkAddressAvailable checks that the address after canonicalization is not
+// already configured, and that its localpart does not contain the catchall
+// localpart separator.
+//
+// Must be called with config lock held.
+func checkAddressAvailable(addr smtp.Address) error {
+	if dc, ok := Conf.Dynamic.Domains[addr.Domain.Name()]; !ok {
+		return fmt.Errorf("domain does not exist")
+	} else if lp, err := CanonicalLocalpart(addr.Localpart, dc); err != nil {
+		return fmt.Errorf("canonicalizing localpart: %v", err)
+	} else if _, ok := Conf.accountDestinations[smtp.NewAddress(lp, addr.Domain).String()]; ok {
+		return fmt.Errorf("canonicalized address %s already configured", smtp.NewAddress(lp, addr.Domain))
+	} else if dc.LocalpartCatchallSeparator != "" && strings.Contains(string(addr.Localpart), dc.LocalpartCatchallSeparator) {
+		return fmt.Errorf("localpart cannot include domain catchall separator %s", dc.LocalpartCatchallSeparator)
+	}
+	return nil
+}
+
+// AddressAdd adds an email address to an account and reloads the configuration. If
+// address starts with an @ it is treated as a catchall address for the domain.
 func AddressAdd(ctx context.Context, address, account string) (rerr error) {
 	log := xlog.WithContext(ctx)
 	defer func() {
@@ -652,17 +679,29 @@ func AddressAdd(ctx context.Context, address, account string) (rerr error) {
 		return fmt.Errorf("account does not exist")
 	}
 
-	addr, err := smtp.ParseAddress(address)
-	if err != nil {
-		return fmt.Errorf("parsing email address: %v", err)
-	}
-	if _, ok := Conf.accountDestinations[addr.String()]; ok {
-		return fmt.Errorf("address already exists")
-	}
+	var destAddr string
+	if strings.HasPrefix(address, "@") {
+		d, err := dns.ParseDomain(address[1:])
+		if err != nil {
+			return fmt.Errorf("parsing domain: %v", err)
+		}
+		dname := d.Name()
+		destAddr = "@" + dname
+		if _, ok := Conf.Dynamic.Domains[dname]; !ok {
+			return fmt.Errorf("domain does not exist")
+		} else if _, ok := Conf.accountDestinations[destAddr]; ok {
+			return fmt.Errorf("catchall address already configured for domain")
+		}
+	} else {
+		addr, err := smtp.ParseAddress(address)
+		if err != nil {
+			return fmt.Errorf("parsing email address: %v", err)
+		}
 
-	dname := addr.Domain.Name()
-	if _, ok := c.Domains[dname]; !ok {
-		return fmt.Errorf("domain does not exist")
+		if err := checkAddressAvailable(addr); err != nil {
+			return fmt.Errorf("address not available: %v", err)
+		}
+		destAddr = addr.String()
 	}
 
 	// Compose new config without modifying existing data structures. If we fail, we
@@ -676,14 +715,14 @@ func AddressAdd(ctx context.Context, address, account string) (rerr error) {
 	for name, d := range a.Destinations {
 		nd[name] = d
 	}
-	nd[addr.String()] = config.Destination{}
+	nd[destAddr] = config.Destination{}
 	a.Destinations = nd
 	nc.Accounts[account] = a
 
 	if err := writeDynamic(ctx, log, nc); err != nil {
 		return fmt.Errorf("writing domains.conf: %v", err)
 	}
-	log.Info("address added", mlog.Field("address", addr), mlog.Field("account", account))
+	log.Info("address added", mlog.Field("address", address), mlog.Field("account", account))
 	return nil
 }
 
@@ -699,31 +738,23 @@ func AddressRemove(ctx context.Context, address string) (rerr error) {
 	Conf.dynamicMutex.Lock()
 	defer Conf.dynamicMutex.Unlock()
 
-	c := Conf.Dynamic
-
-	addr, err := smtp.ParseAddress(address)
-	if err != nil {
-		return fmt.Errorf("parsing email address: %v", err)
-	}
-	ad, ok := Conf.accountDestinations[addr.String()]
+	ad, ok := Conf.accountDestinations[address]
 	if !ok {
 		return fmt.Errorf("address does not exists")
 	}
-	addrStr := addr.String()
 
 	// Compose new config without modifying existing data structures. If we fail, we
 	// leave no trace.
-	a, ok := c.Accounts[ad.Account]
+	a, ok := Conf.Dynamic.Accounts[ad.Account]
 	if !ok {
 		return fmt.Errorf("internal error: cannot find account")
 	}
 	na := a
 	na.Destinations = map[string]config.Destination{}
 	var dropped bool
-	for name, d := range a.Destinations {
-		// todo deprecated: remove support for localpart-only with default domain as destination address.
-		if !(name == addr.Localpart.String() && a.DNSDomain == addr.Domain || name == addrStr) {
-			na.Destinations[name] = d
+	for destAddr, d := range a.Destinations {
+		if destAddr != address {
+			na.Destinations[destAddr] = d
 		} else {
 			dropped = true
 		}
@@ -731,9 +762,9 @@ func AddressRemove(ctx context.Context, address string) (rerr error) {
 	if !dropped {
 		return fmt.Errorf("address not removed, likely a postmaster/reporting address")
 	}
-	nc := c
+	nc := Conf.Dynamic
 	nc.Accounts = map[string]config.Account{}
-	for name, a := range c.Accounts {
+	for name, a := range Conf.Dynamic.Accounts {
 		nc.Accounts[name] = a
 	}
 	nc.Accounts[ad.Account] = na
@@ -741,7 +772,7 @@ func AddressRemove(ctx context.Context, address string) (rerr error) {
 	if err := writeDynamic(ctx, log, nc); err != nil {
 		return fmt.Errorf("writing domains.conf: %v", err)
 	}
-	log.Info("address removed", mlog.Field("address", addr), mlog.Field("account", ad.Account))
+	log.Info("address removed", mlog.Field("address", address), mlog.Field("account", ad.Account))
 	return nil
 }
 
@@ -787,6 +818,42 @@ func DestinationSave(ctx context.Context, account, destName string, newDest conf
 		return fmt.Errorf("writing domains.conf: %v", err)
 	}
 	log.Info("destination saved", mlog.Field("account", account), mlog.Field("destname", destName))
+	return nil
+}
+
+// AccountLimitsSave saves new message sending limits for an account.
+func AccountLimitsSave(ctx context.Context, account string, maxOutgoingMessagesPerDay, maxFirstTimeRecipientsPerDay int) (rerr error) {
+	log := xlog.WithContext(ctx)
+	defer func() {
+		if rerr != nil {
+			log.Errorx("saving account limits", rerr, mlog.Field("account", account))
+		}
+	}()
+
+	Conf.dynamicMutex.Lock()
+	defer Conf.dynamicMutex.Unlock()
+
+	c := Conf.Dynamic
+	acc, ok := c.Accounts[account]
+	if !ok {
+		return fmt.Errorf("account not present")
+	}
+
+	// Compose new config without modifying existing data structures. If we fail, we
+	// leave no trace.
+	nc := c
+	nc.Accounts = map[string]config.Account{}
+	for name, a := range c.Accounts {
+		nc.Accounts[name] = a
+	}
+	acc.MaxOutgoingMessagesPerDay = maxOutgoingMessagesPerDay
+	acc.MaxFirstTimeRecipientsPerDay = maxFirstTimeRecipientsPerDay
+	nc.Accounts[account] = acc
+
+	if err := writeDynamic(ctx, log, nc); err != nil {
+		return fmt.Errorf("writing domains.conf: %v", err)
+	}
+	log.Info("account limits saved", mlog.Field("account", account))
 	return nil
 }
 
@@ -856,8 +923,8 @@ func ClientConfigDomain(d dns.Domain) (ClientConfig, error) {
 	return c, nil
 }
 
-// return IPs we may be listening on or connecting from to the outside.
-func IPs(ctx context.Context) ([]net.IP, error) {
+// return IPs we may be listening/receiving mail on or connecting/sending from to the outside.
+func IPs(ctx context.Context, receiveOnly bool) ([]net.IP, error) {
 	log := xlog.WithContext(ctx)
 
 	// Try to gather all IPs we are listening on by going through the config.
@@ -915,5 +982,16 @@ func IPs(ctx context.Context) ([]net.IP, error) {
 			}
 		}
 	}
+
+	if receiveOnly {
+		return ips, nil
+	}
+
+	for _, t := range Conf.Static.Transports {
+		if t.Socks != nil {
+			ips = append(ips, t.Socks.IPs...)
+		}
+	}
+
 	return ips, nil
 }

@@ -11,7 +11,7 @@ github.com/golang/protobuf/ptypes/timestamp
 # github.com/matttproud/golang_protobuf_extensions v1.0.1
 ## explicit
 github.com/matttproud/golang_protobuf_extensions/pbutil
-# github.com/mjl-/bstore v0.0.0-20230211204415-a9899ef6e782
+# github.com/mjl-/bstore v0.0.1
 ## explicit; go 1.19
 github.com/mjl-/bstore
 # github.com/mjl-/sconf v0.0.4
@@ -52,7 +52,7 @@ github.com/prometheus/procfs/internal/util
 # go.etcd.io/bbolt v1.3.7
 ## explicit; go 1.17
 go.etcd.io/bbolt
-# golang.org/x/crypto v0.7.0
+# golang.org/x/crypto v0.10.0
 ## explicit; go 1.17
 golang.org/x/crypto/acme
 golang.org/x/crypto/acme/autocert
@@ -60,25 +60,33 @@ golang.org/x/crypto/bcrypt
 golang.org/x/crypto/blake2b
 golang.org/x/crypto/blowfish
 golang.org/x/crypto/pbkdf2
-# golang.org/x/mod v0.8.0
+# golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df
+## explicit; go 1.20
+golang.org/x/exp/constraints
+golang.org/x/exp/maps
+golang.org/x/exp/slices
+# golang.org/x/mod v0.11.0
 ## explicit; go 1.17
 golang.org/x/mod/internal/lazyregexp
 golang.org/x/mod/modfile
 golang.org/x/mod/module
 golang.org/x/mod/semver
-# golang.org/x/net v0.8.0
+# golang.org/x/net v0.11.0
 ## explicit; go 1.17
 golang.org/x/net/html
 golang.org/x/net/html/atom
 golang.org/x/net/idna
-# golang.org/x/sys v0.6.0
+golang.org/x/net/internal/socks
+golang.org/x/net/proxy
+golang.org/x/net/websocket
+# golang.org/x/sys v0.9.0
 ## explicit; go 1.17
 golang.org/x/sys/cpu
 golang.org/x/sys/execabs
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.8.0
+# golang.org/x/text v0.10.0
 ## explicit; go 1.17
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform

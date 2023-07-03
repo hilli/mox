@@ -195,9 +195,9 @@ const formatSize = n => {
 
 const index = async () => {
 	const [domains, queueSize, checkUpdatesEnabled] = await Promise.all([
-		await api.Domains(),
-		await api.QueueSize(),
-		await api.CheckUpdatesEnabled(),
+		api.Domains(),
+		api.QueueSize(),
+		api.CheckUpdatesEnabled(),
 	])
 
 	let fieldset, domain, account, localpart
@@ -265,6 +265,7 @@ const index = async () => {
 		dom.div(dom.a('MTA-STS policies', attr({href: '#mtasts'}))),
 		// todo: outgoing DMARC findings
 		// todo: outgoing TLSRPT findings
+		// todo: routing, globally, per domain and per account
 		dom.br(),
 		dom.h2('DNS blocklist status'),
 		dom.div(dom.a('DNSBL status', attr({href: '#dnsbl'}))),
@@ -476,6 +477,7 @@ const account = async (name) => {
 	const config = await api.Account(name)
 
 	let form, fieldset, email
+	let formSendlimits, fieldsetSendlimits, maxOutgoingMessagesPerDay, maxFirstTimeRecipientsPerDay
 	let formPassword, fieldsetPassword, password, passwordHint
 
 	const page = document.getElementById('page')
@@ -508,6 +510,9 @@ const account = async (name) => {
 							lp, '@',
 							dom.a(d, attr({href: '#domains/'+d})),
 						]
+						if (lp === '') {
+							v.unshift('(catchall) ')
+						}
 					}
 					return dom.tr(
 						dom.td(v),
@@ -567,13 +572,49 @@ const account = async (name) => {
 			fieldset=dom.fieldset(
 				dom.label(
 					style({display: 'inline-block'}),
-					'Email address or localpart',
+					dom.span('Email address or localpart', attr({title: 'If empty, or localpart is empty, a catchall address is configured for the domain.'})),
 					dom.br(),
-					email=dom.input(attr({required: ''})),
+					email=dom.input(),
 				),
 				' ',
 				dom.button('Add address'),
 			),
+		),
+		dom.br(),
+		dom.h2('Send limits'),
+		formSendlimits=dom.form(
+			fieldsetSendlimits=dom.fieldset(
+				dom.label(
+					style({display: 'inline-block'}),
+					dom.span('Maximum outgoing messages per day', attr({title: 'Maximum number of outgoing messages for this account in a 24 hour window. This limits the damage to recipients and the reputation of this mail server in case of account compromise. Default 1000. MaxOutgoingMessagesPerDay in configuration file.'})),
+					dom.br(),
+					maxOutgoingMessagesPerDay=dom.input(attr({type: 'number', required: '', value: config.MaxOutgoingMessagesPerDay || 1000})),
+				),
+				' ',
+				dom.label(
+					style({display: 'inline-block'}),
+					dom.span('Maximum first-time recipients per day', attr({title: 'Maximum number of first-time recipients in outgoing messages for this account in a 24 hour window. This limits the damage to recipients and the reputation of this mail server in case of account compromise. Default 200. MaxFirstTimeRecipientsPerDay in configuration file.'})),
+					dom.br(),
+					maxFirstTimeRecipientsPerDay=dom.input(attr({type: 'number', required: '', value: config.MaxFirstTimeRecipientsPerDay || 200})),
+				),
+				' ',
+				dom.button('Save'),
+			),
+			async function submit(e) {
+				e.stopPropagation()
+				e.preventDefault()
+				fieldsetSendlimits.disabled = true
+				try {
+					await api.SetAccountLimits(name, parseInt(maxOutgoingMessagesPerDay.value) || 0, parseInt(maxFirstTimeRecipientsPerDay.value) || 0)
+					window.alert('Send limits saved.')
+				} catch (err) {
+					console.log({err})
+					window.alert('Error: ' + err.message)
+					return
+				} finally {
+					fieldsetSendlimits.disabled = false
+				}
+			},
 		),
 		dom.br(),
 		dom.h2('Set new password'),
@@ -711,7 +752,7 @@ const domain = async (d) => {
 			dom.tbody(
 				Object.entries(localpartAccounts).map(t =>
 					dom.tr(
-						dom.td(t[0]),
+						dom.td(t[0] || '(catchall)'),
 						dom.td(dom.a(t[1], attr({href: '#accounts/'+t[1]}))),
 						dom.td(
 							dom.button('Remove address', async function click(e) {
@@ -721,7 +762,7 @@ const domain = async (d) => {
 								}
 								e.target.disabled = true
 								try {
-									await api.AddressRemove(t[0] + '@'+d)
+									await api.AddressRemove(t[0] + '@' + d)
 								} catch (err) {
 									console.log({err})
 									window.alert('Error: ' + err.message)
@@ -758,9 +799,9 @@ const domain = async (d) => {
 			fieldset=dom.fieldset(
 				dom.label(
 					style({display: 'inline-block'}),
-					'Localpart',
+					dom.span('Localpart', attr({title: 'An empty localpart is the catchall destination/address for the domain.'})),
 					dom.br(),
-					localpart=dom.input(attr({required: ''})),
+					localpart=dom.input(),
 				),
 				' ',
 				dom.label(
@@ -1485,9 +1526,13 @@ const dnsbl = async () => {
 }
 
 const queueList = async () => {
-	const msgs = await api.QueueList()
+	const [msgs, transports] = await Promise.all([
+		api.QueueList(),
+		api.Transports(),
+	])
 
 	const nowSecs = new Date().getTime()/1000
+	let transport
 
 	const page = document.getElementById('page')
 	dom._kids(page,
@@ -1510,7 +1555,8 @@ const queueList = async () => {
 						dom.th('Next attempt'),
 						dom.th('Last attempt'),
 						dom.th('Last error'),
-						dom.th('Action'),
+						dom.th('Transport/Retry'),
+						dom.th('Remove'),
 					),
 				),
 				dom.tbody(
@@ -1525,11 +1571,17 @@ const queueList = async () => {
 						dom.td(m.LastAttempt ? age(new Date(m.LastAttempt), false, nowSecs) : '-'),
 						dom.td(m.LastError || '-'),
 						dom.td(
-							dom.button('Try now', async function click(e) {
+							transport=dom.select(
+								attr({title: 'Transport to use for delivery attempts. The default is direct delivery, connecting to the MX hosts of the domain.'}),
+								dom.option('(default)', attr({value: ''})),
+								Object.keys(transports).sort().map(t => dom.option(t, m.Transport === t ? attr({checked: ''}) : [])),
+							),
+							' ',
+							dom.button('Retry now', async function click(e) {
 								e.preventDefault()
 								try {
 									e.target.disabled = true
-									await api.QueueKick(m.ID)
+									await api.QueueKick(m.ID, transport.value)
 								} catch (err) {
 									console.log({err})
 									window.alert('Error: ' + err.message)
@@ -1539,7 +1591,8 @@ const queueList = async () => {
 								}
 								window.location.reload() // todo: only refresh the list
 							}),
-							' ',
+						),
+						dom.td(
 							dom.button('Remove', async function click(e) {
 								e.preventDefault()
 								if (!window.confirm('Are you sure you want to remove this message? It will be removed completely.')) {
@@ -1815,7 +1868,7 @@ const webserver = async () => {
 					),
 					dom.td(
 						'URL',
-						attr({title: "URL to forward HTTP requests to, e.g. http://127.0.0.1:8123/base. If StripPath is false the full request path is added to the URL. Host headers are sent unmodified. New X-Forwarded-{For,Host,Proto} headers are set. Any query string in the URL is ignored. Requests are made using Go's net/http.DefaultTransport that takes environment variables HTTP_PROXY and HTTPS_PROXY into account."}),
+						attr({title: "URL to forward HTTP requests to, e.g. http://127.0.0.1:8123/base. If StripPath is false the full request path is added to the URL. Host headers are sent unmodified. New X-Forwarded-{For,Host,Proto} headers are set. Any query string in the URL is ignored. Requests are made using Go's net/http.DefaultTransport that takes environment variables HTTP_PROXY and HTTPS_PROXY into account. Websocket connections are forwarded and data is copied between client and backend without looking at the framing. The websocket 'version' and 'key'/'accept' headers are verified during the handshake, but other websocket headers, including 'origin', 'protocol' and 'extensions' headers, are not inspected and the backend is responsible for verifying/interpreting them."}),
 					),
 					dom.td(
 						dom.span(

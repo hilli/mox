@@ -21,7 +21,7 @@ func TestExport(t *testing.T) {
 
 	os.RemoveAll("../testdata/store/data")
 	mox.ConfigStaticPath = "../testdata/store/mox.conf"
-	mox.MustLoadConfig(false)
+	mox.MustLoadConfig(true, false)
 	acc, err := OpenAccount("mjl")
 	tcheck(t, err, "open account")
 	defer acc.Close()
@@ -49,7 +49,7 @@ func TestExport(t *testing.T) {
 
 	archive := func(archiver Archiver, maildir bool) {
 		t.Helper()
-		err = ExportMessages(log, acc.DB, acc.Dir, archiver, maildir, "")
+		err = ExportMessages(ctxbg, log, acc.DB, acc.Dir, archiver, maildir, "")
 		tcheck(t, err, "export messages")
 		err = archiver.Close()
 		tcheck(t, err, "archiver close")

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"os"
 	"regexp"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"github.com/mjl-/mox/mox-"
 )
 
+var ctxbg = context.Background()
+
 func tcheck(t *testing.T, err error, msg string) {
 	t.Helper()
 	if err != nil {
@@ -26,7 +29,7 @@ func tcheck(t *testing.T, err error, msg string) {
 func TestMailbox(t *testing.T) {
 	os.RemoveAll("../testdata/store/data")
 	mox.ConfigStaticPath = "../testdata/store/mox.conf"
-	mox.MustLoadConfig(false)
+	mox.MustLoadConfig(true, false)
 	acc, err := OpenAccount("mjl")
 	tcheck(t, err, "open account")
 	defer acc.Close()
@@ -66,19 +69,21 @@ func TestMailbox(t *testing.T) {
 		err := acc.Deliver(xlog, conf.Destinations["mjl"], &m, msgFile, false)
 		tcheck(t, err, "deliver without consume")
 
-		err = acc.DB.Write(func(tx *bstore.Tx) error {
+		err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
 			var err error
 			mbsent, err = bstore.QueryTx[Mailbox](tx).FilterNonzero(Mailbox{Name: "Sent"}).Get()
 			tcheck(t, err, "sent mailbox")
 			msent.MailboxID = mbsent.ID
 			msent.MailboxOrigID = mbsent.ID
-			acc.DeliverX(xlog, tx, &msent, msgFile, false, true, true, false)
+			err = acc.DeliverMessage(xlog, tx, &msent, msgFile, false, true, true, false)
+			tcheck(t, err, "deliver message")
 
 			err = tx.Insert(&mbrejects)
 			tcheck(t, err, "insert rejects mailbox")
 			mreject.MailboxID = mbrejects.ID
 			mreject.MailboxOrigID = mbrejects.ID
-			acc.DeliverX(xlog, tx, &mreject, msgFile, false, false, true, false)
+			err = acc.DeliverMessage(xlog, tx, &mreject, msgFile, false, false, true, false)
+			tcheck(t, err, "deliver message")
 
 			return nil
 		})
@@ -87,10 +92,10 @@ func TestMailbox(t *testing.T) {
 		err = acc.Deliver(xlog, conf.Destinations["mjl"], &mconsumed, msgFile, true)
 		tcheck(t, err, "deliver with consume")
 
-		err = acc.DB.Write(func(tx *bstore.Tx) error {
+		err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
 			m.Junk = true
 			l := []Message{m}
-			err = acc.RetrainMessages(log, tx, l, false)
+			err = acc.RetrainMessages(ctxbg, log, tx, l, false)
 			tcheck(t, err, "train as junk")
 			m = l[0]
 			return nil
@@ -100,18 +105,18 @@ func TestMailbox(t *testing.T) {
 
 	m.Junk = false
 	m.Notjunk = true
-	jf, _, err := acc.OpenJunkFilter(log)
+	jf, _, err := acc.OpenJunkFilter(ctxbg, log)
 	tcheck(t, err, "open junk filter")
-	err = acc.DB.Write(func(tx *bstore.Tx) error {
-		return acc.RetrainMessage(log, tx, jf, &m, false)
+	err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
+		return acc.RetrainMessage(ctxbg, log, tx, jf, &m, false)
 	})
 	tcheck(t, err, "retraining as non-junk")
 	err = jf.Close()
 	tcheck(t, err, "close junk filter")
 
 	m.Notjunk = false
-	err = acc.DB.Write(func(tx *bstore.Tx) error {
-		return acc.RetrainMessages(log, tx, []Message{m}, false)
+	err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
+		return acc.RetrainMessages(ctxbg, log, tx, []Message{m}, false)
 	})
 	tcheck(t, err, "untraining non-junk")
 
@@ -132,45 +137,51 @@ func TestMailbox(t *testing.T) {
 	}
 
 	acc.WithWLock(func() {
-		err := acc.DB.Write(func(tx *bstore.Tx) error {
-			acc.MailboxEnsureX(tx, "Testbox", true)
-			return nil
+		err := acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
+			_, _, err := acc.MailboxEnsure(tx, "Testbox", true)
+			return err
 		})
 		tcheck(t, err, "ensure mailbox exists")
-		err = acc.DB.Read(func(tx *bstore.Tx) error {
-			acc.MailboxEnsureX(tx, "Testbox", true)
-			return nil
+		err = acc.DB.Read(ctxbg, func(tx *bstore.Tx) error {
+			_, _, err := acc.MailboxEnsure(tx, "Testbox", true)
+			return err
 		})
 		tcheck(t, err, "ensure mailbox exists")
 
-		err = acc.DB.Write(func(tx *bstore.Tx) error {
-			acc.MailboxEnsureX(tx, "Testbox2", false)
+		err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
+			_, _, err := acc.MailboxEnsure(tx, "Testbox2", false)
 			tcheck(t, err, "create mailbox")
 
-			exists := acc.MailboxExistsX(tx, "Testbox2")
+			exists, err := acc.MailboxExists(tx, "Testbox2")
+			tcheck(t, err, "checking that mailbox exists")
 			if !exists {
 				t.Fatalf("mailbox does not exist")
 			}
 
-			exists = acc.MailboxExistsX(tx, "Testbox3")
+			exists, err = acc.MailboxExists(tx, "Testbox3")
+			tcheck(t, err, "checking that mailbox does not exist")
 			if exists {
 				t.Fatalf("mailbox does exist")
 			}
 
-			xmb := acc.MailboxFindX(tx, "Testbox3")
+			xmb, err := acc.MailboxFind(tx, "Testbox3")
+			tcheck(t, err, "finding non-existing mailbox")
 			if xmb != nil {
 				t.Fatalf("did find Testbox3: %v", xmb)
 			}
-			xmb = acc.MailboxFindX(tx, "Testbox2")
+			xmb, err = acc.MailboxFind(tx, "Testbox2")
+			tcheck(t, err, "finding existing mailbox")
 			if xmb == nil {
 				t.Fatalf("did not find Testbox2")
 			}
 
-			changes := acc.SubscriptionEnsureX(tx, "Testbox2")
+			changes, err := acc.SubscriptionEnsure(tx, "Testbox2")
+			tcheck(t, err, "ensuring new subscription")
 			if len(changes) == 0 {
 				t.Fatalf("new subscription did not result in changes")
 			}
-			changes = acc.SubscriptionEnsureX(tx, "Testbox2")
+			changes, err = acc.SubscriptionEnsure(tx, "Testbox2")
+			tcheck(t, err, "ensuring already present subscription")
 			if len(changes) != 0 {
 				t.Fatalf("already present subscription resulted in changes")
 			}

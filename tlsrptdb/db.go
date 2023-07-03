@@ -23,8 +23,9 @@ import (
 var (
 	xlog = mlog.New("tlsrptdb")
 
-	tlsrptDB *bstore.DB
-	mutex    sync.Mutex
+	DBTypes = []any{TLSReportRecord{}}
+	DB      *bstore.DB
+	mutex   sync.Mutex
 
 	metricSession = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -61,24 +62,24 @@ type TLSReportRecord struct {
 	Report     tlsrpt.Report
 }
 
-func database() (rdb *bstore.DB, rerr error) {
+func database(ctx context.Context) (rdb *bstore.DB, rerr error) {
 	mutex.Lock()
 	defer mutex.Unlock()
-	if tlsrptDB == nil {
+	if DB == nil {
 		p := mox.DataDirPath("tlsrpt.db")
 		os.MkdirAll(filepath.Dir(p), 0770)
-		db, err := bstore.Open(p, &bstore.Options{Timeout: 5 * time.Second, Perm: 0660}, TLSReportRecord{})
+		db, err := bstore.Open(ctx, p, &bstore.Options{Timeout: 5 * time.Second, Perm: 0660}, DBTypes...)
 		if err != nil {
 			return nil, err
 		}
-		tlsrptDB = db
+		DB = db
 	}
-	return tlsrptDB, nil
+	return DB, nil
 }
 
 // Init opens and possibly initializes the database.
 func Init() error {
-	_, err := database()
+	_, err := database(mox.Shutdown)
 	return err
 }
 
@@ -86,10 +87,10 @@ func Init() error {
 func Close() {
 	mutex.Lock()
 	defer mutex.Unlock()
-	if tlsrptDB != nil {
-		err := tlsrptDB.Close()
+	if DB != nil {
+		err := DB.Close()
 		xlog.Check(err, "closing database")
-		tlsrptDB = nil
+		DB = nil
 	}
 }
 
@@ -106,7 +107,7 @@ func Close() {
 func AddReport(ctx context.Context, verifiedFromDomain dns.Domain, mailFrom string, r *tlsrpt.Report) error {
 	log := xlog.WithContext(ctx)
 
-	db, err := database()
+	db, err := database(ctx)
 	if err != nil {
 		return err
 	}
@@ -149,39 +150,39 @@ func AddReport(ctx context.Context, verifiedFromDomain dns.Domain, mailFrom stri
 		}
 	}
 	record.Domain = reportdom.Name()
-	return db.Insert(&record)
+	return db.Insert(ctx, &record)
 }
 
 // Records returns all TLS reports in the database.
 func Records(ctx context.Context) ([]TLSReportRecord, error) {
-	db, err := database()
+	db, err := database(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return bstore.QueryDB[TLSReportRecord](db).List()
+	return bstore.QueryDB[TLSReportRecord](ctx, db).List()
 }
 
 // RecordID returns the report for the ID.
 func RecordID(ctx context.Context, id int64) (TLSReportRecord, error) {
-	db, err := database()
+	db, err := database(ctx)
 	if err != nil {
 		return TLSReportRecord{}, err
 	}
 
 	e := TLSReportRecord{ID: id}
-	err = db.Get(&e)
+	err = db.Get(ctx, &e)
 	return e, err
 }
 
 // RecordsPeriodDomain returns the reports overlapping start and end, for the given
 // domain. If domain is empty, all records match for domain.
 func RecordsPeriodDomain(ctx context.Context, start, end time.Time, domain string) ([]TLSReportRecord, error) {
-	db, err := database()
+	db, err := database(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	q := bstore.QueryDB[TLSReportRecord](db)
+	q := bstore.QueryDB[TLSReportRecord](ctx, db)
 	if domain != "" {
 		q.FilterNonzero(TLSReportRecord{Domain: domain})
 	}

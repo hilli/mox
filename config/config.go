@@ -52,8 +52,9 @@ type Static struct {
 	Postmaster        struct {
 		Account string
 		Mailbox string `sconf-doc:"E.g. Postmaster or Inbox."`
-	} `sconf-doc:"Destination for emails delivered to postmaster address."`
-	DefaultMailboxes []string `sconf:"optional" sconf-doc:"Mailboxes to create when adding an account. Inbox is always created. If no mailboxes are specified, the following are automatically created: Sent, Archive, Trash, Drafts and Junk."`
+	} `sconf-doc:"Destination for emails delivered to postmaster addresses: a plain 'postmaster' without domain, 'postmaster@<hostname>' (also for each listener with SMTP enabled), and as fallback for each domain without explicitly configured postmaster destination."`
+	DefaultMailboxes []string             `sconf:"optional" sconf-doc:"Mailboxes to create when adding an account. Inbox is always created. If no mailboxes are specified, the following are automatically created: Sent, Archive, Trash, Drafts and Junk."`
+	Transports       map[string]Transport `sconf:"optional" sconf-doc:"Transport are mechanisms for delivering messages. Transports can be referenced from Routes in accounts, domains and the global configuration. There is always an implicit/fallback delivery transport doing direct delivery with SMTP from the outgoing message queue. Transports are typically only configured when using smarthosts, i.e. when delivering through another SMTP server. Zero or one transport methods must be set in a transport, never multiple. When using an external party to send email for a domain, keep in mind you may have to add their IP address to your domain's SPF record, and possibly additional DKIM records."`
 
 	// All IPs that were explicitly listen on for external SMTP. Only set when there
 	// are no unspecified external SMTP listeners and there is at most one for IPv4 and
@@ -75,6 +76,7 @@ type Dynamic struct {
 	Accounts           map[string]Account `sconf-doc:"Accounts to which email can be delivered. An account can accept email for multiple domains, for multiple localparts, and deliver to multiple mailboxes."`
 	WebDomainRedirects map[string]string  `sconf:"optional" sconf-doc:"Redirect all requests from domain (key) to domain (value). Always redirects to HTTPS. For plain HTTP redirects, use a WebHandler with a WebRedirect."`
 	WebHandlers        []WebHandler       `sconf:"optional" sconf-doc:"Handle webserver requests by serving static files, redirecting or reverse-proxying HTTP(s). The first matching WebHandler will handle the request. Built-in handlers, e.g. for account, admin, autoconfig and mta-sts always run first. If no handler matches, the response status code is file not found (404). If functionality you need is missng, simply forward the requests to an application that can provide the needed functionality."`
+	Routes             []Route            `sconf:"optional" sconf-doc:"Routes for delivering outgoing messages through the queue. Each delivery attempt evaluates account routes, domain routes and finally these global routes. The transport of the first matching route is used in the delivery attempt. If no routes match, which is the default with no configured routes, messages are delivered directly from the queue."`
 
 	WebDNSDomainRedirects map[dns.Domain]dns.Domain `sconf:"-"`
 }
@@ -98,11 +100,14 @@ type Listener struct {
 	SMTPMaxMessageSize int64 `sconf:"optional" sconf-doc:"Maximum size in bytes accepted incoming and outgoing messages. Default is 100MB."`
 	SMTP               struct {
 		Enabled         bool
-		Port            int          `sconf:"optional" sconf-doc:"Default 25."`
-		NoSTARTTLS      bool         `sconf:"optional" sconf-doc:"Do not offer STARTTLS to secure the connection. Not recommended."`
-		RequireSTARTTLS bool         `sconf:"optional" sconf-doc:"Do not accept incoming messages if STARTTLS is not active. Can be used in combination with a strict MTA-STS policy. A remote SMTP server may not support TLS and may not be able to deliver messages."`
-		DNSBLs          []string     `sconf:"optional" sconf-doc:"Addresses of DNS block lists for incoming messages. Block lists are only consulted for connections/messages without enough reputation to make an accept/reject decision. This prevents sending IPs of all communications to the block list provider. If any of the listed DNSBLs contains a requested IP address, the message is rejected as spam. The DNSBLs are checked for healthiness before use, at most once per 4 hours. Example DNSBLs: sbl.spamhaus.org, bl.spamcop.net"`
-		DNSBLZones      []dns.Domain `sconf:"-"`
+		Port            int      `sconf:"optional" sconf-doc:"Default 25."`
+		NoSTARTTLS      bool     `sconf:"optional" sconf-doc:"Do not offer STARTTLS to secure the connection. Not recommended."`
+		RequireSTARTTLS bool     `sconf:"optional" sconf-doc:"Do not accept incoming messages if STARTTLS is not active. Can be used in combination with a strict MTA-STS policy. A remote SMTP server may not support TLS and may not be able to deliver messages."`
+		DNSBLs          []string `sconf:"optional" sconf-doc:"Addresses of DNS block lists for incoming messages. Block lists are only consulted for connections/messages without enough reputation to make an accept/reject decision. This prevents sending IPs of all communications to the block list provider. If any of the listed DNSBLs contains a requested IP address, the message is rejected as spam. The DNSBLs are checked for healthiness before use, at most once per 4 hours. Example DNSBLs: sbl.spamhaus.org, bl.spamcop.net"`
+
+		FirstTimeSenderDelay *time.Duration `sconf:"optional" sconf-doc:"Delay before accepting a message from a first-time sender for the destination account. Default: 15s."`
+
+		DNSBLZones []dns.Domain `sconf:"-"`
 	} `sconf:"optional"`
 	Submission struct {
 		Enabled           bool
@@ -136,12 +141,12 @@ type Listener struct {
 		Enabled bool
 		Port    int    `sconf:"optional" sconf-doc:"Default 80."`
 		Path    string `sconf:"optional" sconf-doc:"Path to serve admin requests on, e.g. /moxadmin/. Useful if domain serves other resources. Default is /admin/."`
-	} `sconf:"optional" sconf-doc:"Admin web interface, for managing domains, accounts, etc. Served at /admin/. Preferrably only enable on non-public IPs. Hint: use 'ssh -L 8080:localhost:80 you@yourmachine' and open http://localhost:8080/admin/, or set up a tunnel (e.g. WireGuard) and add its IP to the mox 'internal' listener."`
+	} `sconf:"optional" sconf-doc:"Admin web interface, for managing domains, accounts, etc. Served at /admin/. Preferably only enable on non-public IPs. Hint: use 'ssh -L 8080:localhost:80 you@yourmachine' and open http://localhost:8080/admin/, or set up a tunnel (e.g. WireGuard) and add its IP to the mox 'internal' listener."`
 	AdminHTTPS struct {
 		Enabled bool
 		Port    int    `sconf:"optional" sconf-doc:"Default 443."`
 		Path    string `sconf:"optional" sconf-doc:"Path to serve admin requests on, e.g. /moxadmin/. Useful if domain serves other resources. Default is /admin/."`
-	} `sconf:"optional" sconf-doc:"Admin web interface listener for HTTPS. Requires a TLS config. Preferrably only enable on non-public IPs."`
+	} `sconf:"optional" sconf-doc:"Admin web interface listener for HTTPS. Requires a TLS config. Preferably only enable on non-public IPs."`
 	MetricsHTTP struct {
 		Enabled bool
 		Port    int `sconf:"optional" sconf-doc:"Default 8010."`
@@ -170,6 +175,50 @@ type Listener struct {
 	} `sconf:"optional" sconf-doc:"All configured WebHandlers will serve on an enabled listener. Either ACME must be configured, or for each WebHandler domain a TLS certificate must be configured."`
 }
 
+// Transport is a method to delivery a message. At most one of the fields can
+// be non-nil. The non-nil field represents the type of transport. For a
+// transport with all fields nil, regular email delivery is done.
+type Transport struct {
+	Submissions *TransportSMTP  `sconf:"optional" sconf-doc:"Submission SMTP over a TLS connection to submit email to a remote queue."`
+	Submission  *TransportSMTP  `sconf:"optional" sconf-doc:"Submission SMTP over a plain TCP connection (possibly with STARTTLS) to submit email to a remote queue."`
+	SMTP        *TransportSMTP  `sconf:"optional" sconf-doc:"SMTP over a plain connection (possibly with STARTTLS), typically for old-fashioned unauthenticated relaying to a remote queue."`
+	Socks       *TransportSocks `sconf:"optional" sconf-doc:"Like regular direct delivery, but makes outgoing connections through a SOCKS proxy."`
+}
+
+// TransportSMTP delivers messages by "submission" (SMTP, typically
+// authenticated) to the queue of a remote host (smarthost), or by relaying
+// (SMTP, typically unauthenticated).
+type TransportSMTP struct {
+	Host                       string    `sconf-doc:"Host name to connect to and for verifying its TLS certificate."`
+	Port                       int       `sconf:"optional" sconf-doc:"If unset or 0, the default port for submission(s)/smtp is used: 25 for SMTP, 465 for submissions (with TLS), 587 for submission (possibly with STARTTLS)."`
+	STARTTLSInsecureSkipVerify bool      `sconf:"optional" sconf-doc:"If set an unverifiable remote TLS certificate during STARTTLS is accepted."`
+	NoSTARTTLS                 bool      `sconf:"optional" sconf-doc:"If set for submission or smtp transport, do not attempt STARTTLS on the connection. Authentication credentials and messages will be transferred in clear text."`
+	Auth                       *SMTPAuth `sconf:"optional" sconf-doc:"If set, authentication credentials for the remote server."`
+
+	DNSHost dns.Domain `sconf:"-" json:"-"`
+}
+
+// SMTPAuth hold authentication credentials used when delivering messages
+// through a smarthost.
+type SMTPAuth struct {
+	Username   string
+	Password   string
+	Mechanisms []string `sconf:"optional" sconf-doc:"Allowed authentication mechanisms. Defaults to SCRAM-SHA-256, SCRAM-SHA-1, CRAM-MD5. Not included by default: PLAIN."`
+
+	EffectiveMechanisms []string `sconf:"-" json:"-"`
+}
+
+type TransportSocks struct {
+	Address        string   `sconf-doc:"Address of SOCKS proxy, of the form host:port or ip:port."`
+	RemoteIPs      []string `sconf-doc:"IP addresses connections from the SOCKS server will originate from. This IP addresses should be configured in the SPF record (keep in mind DNS record time to live (TTL) when adding a SOCKS proxy). Reverse DNS should be set up for these address, resolving to RemoteHostname. These are typically the IPv4 and IPv6 address for the host in the Address field."`
+	RemoteHostname string   `sconf-doc:"Hostname belonging to RemoteIPs. This name is used during in SMTP EHLO. This is typically the hostname of the host in the Address field."`
+
+	// todo: add authentication credentials?
+
+	IPs      []net.IP   `sconf:"-" json:"-"` // Parsed form of RemoteIPs.
+	Hostname dns.Domain `sconf:"-" json:"-"` // Parsed form of RemoteHostname
+}
+
 type Domain struct {
 	Description                string  `sconf:"optional" sconf-doc:"Free-form description of domain."`
 	LocalpartCatchallSeparator string  `sconf:"optional" sconf-doc:"If not empty, only the string before the separator is used to for email delivery decisions. For example, if set to \"+\", you+anything@example.com will be delivered to you@example.com."`
@@ -178,6 +227,7 @@ type Domain struct {
 	DMARC                      *DMARC  `sconf:"optional" sconf-doc:"With DMARC, a domain publishes, in DNS, a policy on how other mail servers should handle incoming messages with the From-header matching this domain and/or subdomain (depending on the configured alignment). Receiving mail servers use this to build up a reputation of this domain, which can help with mail delivery. A domain can also publish an email address to which reports about DMARC verification results can be sent by verifying mail servers, useful for monitoring. Incoming DMARC reports are automatically parsed, validated, added to metrics and stored in the reporting database for later display in the admin web pages."`
 	MTASTS                     *MTASTS `sconf:"optional" sconf-doc:"With MTA-STS a domain publishes, in DNS, presence of a policy for using/requiring TLS for SMTP connections. The policy is served over HTTPS."`
 	TLSRPT                     *TLSRPT `sconf:"optional" sconf-doc:"With TLSRPT a domain specifies in DNS where reports about encountered SMTP TLS behaviour should be sent. Useful for monitoring. Incoming TLS reports are automatically parsed, validated, added to metrics and stored in the reporting database for later display in the admin web pages."`
+	Routes                     []Route `sconf:"optional" sconf-doc:"Routes for delivering outgoing messages through the queue. Each delivery attempt evaluates account routes, these domain routes and finally global routes. The transport of the first matching route is used in the delivery attempt. If no routes match, which is the default with no configured routes, messages are delivered directly from the queue."`
 
 	Domain dns.Domain `sconf:"-" json:"-"`
 }
@@ -229,10 +279,23 @@ type DKIM struct {
 	Sign      []string            `sconf:"optional" sconf-doc:"List of selectors that emails will be signed with."`
 }
 
+type Route struct {
+	FromDomain      []string `sconf:"optional" sconf-doc:"Matches if the envelope from domain matches one of the configured domains, or if the list is empty. If a domain starts with a dot, prefixes of the domain also match."`
+	ToDomain        []string `sconf:"optional" sconf-doc:"Like FromDomain, but matching against the envelope to domain."`
+	MinimumAttempts int      `sconf:"optional" sconf-doc:"Matches if at least this many deliveries have already been attempted. This can be used to attempt sending through a smarthost when direct delivery has failed for several times."`
+	Transport       string   `sconf:"The transport used for delivering the message that matches requirements of the above fields."`
+
+	// todo future: add ToMX, where we look up the MX record of the destination domain and check (the first, any, all?) mx host against the values in ToMX.
+
+	FromDomainASCII   []string  `sconf:"-"`
+	ToDomainASCII     []string  `sconf:"-"`
+	ResolvedTransport Transport `sconf:"-" json:"-"`
+}
+
 type Account struct {
 	Domain       string                 `sconf-doc:"Default domain for account. Deprecated behaviour: If a destination is not a full address but only a localpart, this domain is added to form a full address."`
 	Description  string                 `sconf:"optional" sconf-doc:"Free form description, e.g. full name or alternative contact info."`
-	Destinations map[string]Destination `sconf-doc:"Destinations, keys are email addresses (with IDNA domains). Deprecated behaviour: If the address is not a full address but a localpart, it is combined with Domain to form a full address."`
+	Destinations map[string]Destination `sconf-doc:"Destinations, keys are email addresses (with IDNA domains). If the address is of the form '@domain', i.e. with localpart missing, it serves as a catchall for the domain, matching all messages that are not explicitly configured. Deprecated behaviour: If the address is not a full address but a localpart, it is combined with Domain to form a full address."`
 	SubjectPass  struct {
 		Period time.Duration `sconf-doc:"How long unique values are accepted after generating, e.g. 12h."` // todo: have a reasonable default for this?
 	} `sconf:"optional" sconf-doc:"If configured, messages classified as weakly spam are rejected with instructions to retry delivery, but this time with a signed token added to the subject. During the next delivery attempt, the signed token will bypass the spam filter. Messages with a clear spam signal, such as a known bad reputation, are rejected/delayed without a signed token."`
@@ -243,7 +306,10 @@ type Account struct {
 		NeutralMailboxRegexp string `sconf:"optional" sconf-doc:"Example: ^(inbox|neutral|postmaster|dmarc|tlsrpt|rejects), and you may wish to add trash depending on how you use it, or leave this empty."`
 		NotJunkMailboxRegexp string `sconf:"optional" sconf-doc:"Example: .* or an empty string."`
 	} `sconf:"optional" sconf-doc:"Automatically set $Junk and $NotJunk flags based on mailbox messages are delivered/moved/copied to. Email clients typically have too limited functionality to conveniently set these flags, especially $NonJunk, but they can all move messages to a different mailbox, so this helps them."`
-	JunkFilter *JunkFilter `sconf:"optional" sconf-doc:"Content-based filtering, using the junk-status of individual messages to rank words in such messages as spam or ham. It is recommended you always set the applicable (non)-junk status on messages, and that you do not empty your Trash because those messages contain valuable ham/spam training information."` // todo: sane defaults for junkfilter
+	JunkFilter                   *JunkFilter `sconf:"optional" sconf-doc:"Content-based filtering, using the junk-status of individual messages to rank words in such messages as spam or ham. It is recommended you always set the applicable (non)-junk status on messages, and that you do not empty your Trash because those messages contain valuable ham/spam training information."` // todo: sane defaults for junkfilter
+	MaxOutgoingMessagesPerDay    int         `sconf:"optional" sconf-doc:"Maximum number of outgoing messages for this account in a 24 hour window. This limits the damage to recipients and the reputation of this mail server in case of account compromise. Default 1000."`
+	MaxFirstTimeRecipientsPerDay int         `sconf:"optional" sconf-doc:"Maximum number of first-time recipients in outgoing messages for this account in a 24 hour window. This limits the damage to recipients and the reputation of this mail server in case of account compromise. Default 200."`
+	Routes                       []Route     `sconf:"optional" sconf-doc:"Routes for delivering outgoing messages through the queue. Each delivery attempt evaluates these account routes, domain routes and finally global routes. The transport of the first matching route is used in the delivery attempt. If no routes match, which is the default with no configured routes, messages are delivered directly from the queue."`
 
 	DNSDomain      dns.Domain     `sconf:"-"` // Parsed form of Domain.
 	JunkMailbox    *regexp.Regexp `sconf:"-" json:"-"`
@@ -311,7 +377,7 @@ type KeyCert struct {
 
 type TLS struct {
 	ACME       string    `sconf:"optional" sconf-doc:"Name of provider from top-level configuration to use for ACME, e.g. letsencrypt."`
-	KeyCerts   []KeyCert `sconf:"optional"`
+	KeyCerts   []KeyCert `sconf:"optional" sconf-doc:"Key and certificate files are opened by the privileged root process and passed to the unprivileged mox process, so no special permissions are required."`
 	MinVersion string    `sconf:"optional" sconf-doc:"Minimum TLS version. Default: TLSv1.2."`
 
 	Config     *tls.Config `sconf:"-" json:"-"` // TLS config for non-ACME-verification connections, i.e. SMTP and IMAP, and not port 443.
@@ -391,7 +457,7 @@ func (wr WebRedirect) equal(o WebRedirect) bool {
 
 type WebForward struct {
 	StripPath       bool              `sconf:"optional" sconf-doc:"Strip the matching WebHandler path from the WebHandler before forwarding the request."`
-	URL             string            `sconf-doc:"URL to forward HTTP requests to, e.g. http://127.0.0.1:8123/base. If StripPath is false the full request path is added to the URL. Host headers are sent unmodified. New X-Forwarded-{For,Host,Proto} headers are set. Any query string in the URL is ignored. Requests are made using Go's net/http.DefaultTransport that takes environment variables HTTP_PROXY and HTTPS_PROXY into account."`
+	URL             string            `sconf-doc:"URL to forward HTTP requests to, e.g. http://127.0.0.1:8123/base. If StripPath is false the full request path is added to the URL. Host headers are sent unmodified. New X-Forwarded-{For,Host,Proto} headers are set. Any query string in the URL is ignored. Requests are made using Go's net/http.DefaultTransport that takes environment variables HTTP_PROXY and HTTPS_PROXY into account. Websocket connections are forwarded and data is copied between client and backend without looking at the framing. The websocket 'version' and 'key'/'accept' headers are verified during the handshake, but other websocket headers, including 'origin', 'protocol' and 'extensions' headers, are not inspected and the backend is responsible for verifying/interpreting them."`
 	ResponseHeaders map[string]string `sconf:"optional" sconf-doc:"Headers to add to the response. Useful for adding security- and cache-related headers."`
 
 	TargetURL *url.URL `sconf:"-" json:"-"`
