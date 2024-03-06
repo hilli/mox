@@ -1,22 +1,28 @@
 /*
-Command mox is a modern full-featured open source secure mail server for
+Command mox is a modern, secure, full-featured, open source mail server for
 low-maintenance self-hosted email.
 
-  - Quick and easy to set up with quickstart and automatic TLS with ACME and
-    Let's Encrypt.
-  - IMAP4 with extensions for accessing email.
-  - SMTP with SPF, DKIM, DMARC, DNSBL, MTA-STS, TLSRPT for exchanging email.
-  - Reputation-based and content-based spam filtering.
-  - Internationalized email.
-  - Admin web interface.
+Mox is started with the "serve" subcommand, but mox also has many other
+subcommands.
 
-# Commands
+Many of those commands talk to a running mox instance, through the ctl file in
+the data directory. Specify the configuration file (that holds the path to the
+data directory) through the -config flag or MOXCONF environment variable.
+
+Commands that don't talk to a running mox instance are often for
+testing/debugging email functionality. For example for parsing an email message,
+or looking up SPF/DKIM/DMARC records.
+
+Below is the usage information as printed by the command when started without
+any parameters. Followed by the help and usage information for each command.
+
+# Usage
 
 	mox [-config config/mox.conf] [-pedantic] ...
 	mox serve
 	mox quickstart [-existing-webserver] [-hostname host] user@domain [user | uid]
 	mox stop
-	mox setaccountpassword address
+	mox setaccountpassword account
 	mox setadminpassword
 	mox loglevels [level [pkg]]
 	mox queue list
@@ -44,12 +50,17 @@ low-maintenance self-hosted email.
 	mox config domain rm domain
 	mox config describe-sendmail >/etc/moxsubmit.conf
 	mox config printservice >mox.service
+	mox config ensureacmehostprivatekeys
 	mox example [name]
 	mox checkupdate
 	mox cid cid
 	mox clientconfig domain
-	mox dkim gened25519 >$selector._domainkey.$domain.ed25519key.pkcs8.pem
-	mox dkim genrsa >$selector._domainkey.$domain.rsakey.pkcs8.pem
+	mox dane dial host:port
+	mox dane dialmx domain [destination-host]
+	mox dane makerecord usage selector matchtype [certificate.pem | publickey.pem | privatekey.pem]
+	mox dns lookup [ptr | mx | cname | ips | a | aaaa | ns | txt | srv | tlsa] name
+	mox dkim gened25519 >$selector._domainkey.$domain.ed25519.privatekey.pkcs8.pem
+	mox dkim genrsa >$selector._domainkey.$domain.rsa2048.privatekey.pkcs8.pem
 	mox dkim lookup selector domain
 	mox dkim txt <$selector._domainkey.$domain.key.pkcs8.pem
 	mox dkim verify message
@@ -57,6 +68,7 @@ low-maintenance self-hosted email.
 	mox dmarc lookup domain
 	mox dmarc parsereportmsg message ...
 	mox dmarc verify remoteip mailfromaddress helodomain < message
+	mox dmarc checkreportaddrs domain
 	mox dnsbl check zone ip
 	mox dnsbl checkhealth zone
 	mox mtasts lookup domain
@@ -68,10 +80,15 @@ low-maintenance self-hosted email.
 	mox tlsrpt lookup domain
 	mox tlsrpt parsereportmsg message ...
 	mox version
-
-Many commands talk to a running mox instance, through the ctl file in the data
-directory. Specify the configuration file (that holds the path to the data
-directory) through the -config flag or MOXCONF environment variable.
+	mox bumpuidvalidity account [mailbox]
+	mox reassignuids account [mailboxid]
+	mox fixuidmeta account
+	mox fixmsgsize [account]
+	mox reparse [account]
+	mox ensureparsed account
+	mox recalculatemailboxcounts account
+	mox message parse message.eml
+	mox reassignthreads [account]
 
 # mox serve
 
@@ -81,6 +98,8 @@ Incoming email is accepted over SMTP. Email can be retrieved by users using
 IMAP. HTTP listeners are started for the admin/account web interfaces, and for
 automated TLS configuration. Missing essential TLS certificates are immediately
 requested, other TLS certificates are requested on demand.
+
+Only implemented on unix systems, not Windows.
 
 	usage: mox serve
 
@@ -146,9 +165,11 @@ password itself, are stored in the account database. The stored secrets are for
 authentication with: scram-sha-256, scram-sha-1, cram-md5, plain text (bcrypt
 hash).
 
-Any email address configured for the account can be used.
+The parameter is an account name, as configured under Accounts in domains.conf
+and as present in the data/accounts/ directory, not a configured email address
+for an account.
 
-	usage: mox setaccountpassword address
+	usage: mox setaccountpassword account
 
 # mox setadminpassword
 
@@ -233,21 +254,24 @@ The message is printed to stdout and is in standard internet mail format.
 
 Import a maildir into an account.
 
+The mbox/maildir archive is accessed and imported by the running mox process, so
+it must have access to the archive files. The default suggested systemd service
+file isolates mox from most of the file system, with only the "data/" directory
+accessible, so you may want to put the mbox/maildir archive files in a
+directory like "data/import/" to make it available to mox.
+
 By default, messages will train the junk filter based on their flags and, if
 "automatic junk flags" configuration is set, based on mailbox naming.
 
-If the destination mailbox is "Sent", the recipients of the messages are added
-to the message metadata, causing later incoming messages from these recipients
-to be accepted, unless other reputation signals prevent that.
+If the destination mailbox is the Sent mailbox, the recipients of the messages
+are added to the message metadata, causing later incoming messages from these
+recipients to be accepted, unless other reputation signals prevent that.
 
 Users can also import mailboxes/messages through the account web page by
 uploading a zip or tgz file with mbox and/or maildirs.
 
 Mailbox flags, like "seen", "answered", will be imported. An optional
 dovecot-keywords file can specify additional flags, like Forwarded/Junk/NotJunk.
-
-The maildir files/directories are read by the mox process, so make sure it has
-access to the maildir directories/files.
 
 	usage: mox import maildir accountname mailboxname maildir
 
@@ -257,18 +281,21 @@ Import an mbox into an account.
 
 Using mbox is not recommended, maildir is a better defined format.
 
+The mbox/maildir archive is accessed and imported by the running mox process, so
+it must have access to the archive files. The default suggested systemd service
+file isolates mox from most of the file system, with only the "data/" directory
+accessible, so you may want to put the mbox/maildir archive files in a
+directory like "data/import/" to make it available to mox.
+
 By default, messages will train the junk filter based on their flags and, if
 "automatic junk flags" configuration is set, based on mailbox naming.
 
-If the destination mailbox is "Sent", the recipients of the messages are added
-to the message metadata, causing later incoming messages from these recipients
-to be accepted, unless other reputation signals prevent that.
+If the destination mailbox is the Sent mailbox, the recipients of the messages
+are added to the message metadata, causing later incoming messages from these
+recipients to be accepted, unless other reputation signals prevent that.
 
 Users can also import mailboxes/messages through the account web page by
 uploading a zip or tgz file with mbox and/or maildirs.
-
-The mailbox is read by the mox process, so make sure it has access to the
-maildir directories/files.
 
 	usage: mox import mbox accountname mailboxname mbox
 
@@ -329,6 +356,8 @@ during those commands instead of during "data".
 	usage: mox localserve
 	  -dir string
 	    	configuration storage directory (default "$userconfigdir/mox-localserve")
+	  -initonly
+	    	write configuration files and exit
 	  -ip string
 	    	serve on this ip instead of default 127.0.0.1 and ::1. only used when writing configuration, at first launch.
 
@@ -352,7 +381,7 @@ back to should an upgrade fail. Simply copying files in the data directory
 while mox is running can result in unusable database files.
 
 Message files never change (they are read-only, though can be removed) and are
-hardlinked so they don't consume additional space. If hardlinking fails, for
+hard-linked so they don't consume additional space. If hardlinking fails, for
 example when the backup destination directory is on a different file system, a
 regular copy is made. Using a destination directory like "data/tmp/backup"
 increases the odds hardlinking succeeds: the default systemd service file
@@ -405,6 +434,8 @@ possibly making them potentially no longer readable by the previous version.
 	usage: mox verifydata data-dir
 	  -fix
 	    	fix fixable problems, such as moving away message files not referenced by their database
+	  -skip-size-check
+	    	skip the check for message size
 
 # mox config test
 
@@ -527,6 +558,31 @@ date version.
 
 	usage: mox config printservice >mox.service
 
+# mox config ensureacmehostprivatekeys
+
+Ensure host private keys exist for TLS listeners with ACME.
+
+In mox.conf, each listener can have TLS configured. Long-lived private key files
+can be specified, which will be used when requesting ACME certificates.
+Configuring these private keys makes it feasible to publish DANE TLSA records
+for the corresponding public keys in DNS, protected with DNSSEC, allowing TLS
+certificate verification without depending on a list of Certificate Authorities
+(CAs). Previous versions of mox did not pre-generate private keys for use with
+ACME certificates, but would generate private keys on-demand. By explicitly
+configuring private keys, they will not change automatedly with new
+certificates, and the DNS TLSA records stay valid.
+
+This command looks for listeners in mox.conf with TLS with ACME configured. For
+each missing host private key (of type rsa-2048 and ecdsa-p256) a key is written
+to config/hostkeys/. If a certificate exists in the ACME "cache", its private
+key is copied. Otherwise a new private key is generated. Snippets for manually
+updating/editing mox.conf are printed.
+
+After running this command, and updating mox.conf, run "mox config dnsrecords"
+for a domain and create the TLSA DNS records it suggests to enable DANE.
+
+	usage: mox config ensureacmehostprivatekeys
+
 # mox example
 
 List available examples, or print a specific example.
@@ -539,7 +595,7 @@ Check if a newer version of mox is available.
 
 A single DNS TXT lookup to _updates.xmox.nl tells if a new version is
 available. If so, a changelog is fetched from https://updates.xmox.nl, and the
-individual entries validated with a builtin public key. The changelog is
+individual entries verified with a builtin public key. The changelog is
 printed.
 
 	usage: mox checkupdate
@@ -568,6 +624,80 @@ configured over otherwise secured connections, like a VPN.
 
 	usage: mox clientconfig domain
 
+# mox dane dial
+
+Dial the address using TLS with certificate verification using DANE.
+
+Data is copied between connection and stdin/stdout until either side closes the
+connection.
+
+	usage: mox dane dial host:port
+	  -usages string
+	    	allowed usages for dane, comma-separated list (default "pkix-ta,pkix-ee,dane-ta,dane-ee")
+
+# mox dane dialmx
+
+Connect to MX server for domain using STARTTLS verified with DANE.
+
+If no destination host is specified, regular delivery logic is used to find the
+hosts to attempt delivery too. This involves following CNAMEs for the domain,
+looking up MX records, and possibly falling back to the domain name itself as
+host.
+
+If a destination host is specified, that is the only candidate host considered
+for dialing.
+
+With a list of destinations gathered, each is dialed until a successful SMTP
+session verified with DANE has been initialized, including EHLO and STARTTLS
+commands.
+
+Once connected, data is copied between connection and stdin/stdout, until
+either side closes the connection.
+
+This command follows the same logic as delivery attempts made from the queue,
+sharing most of its code.
+
+	usage: mox dane dialmx domain [destination-host]
+	  -ehlohostname string
+	    	hostname to send in smtp ehlo command (default "localhost")
+
+# mox dane makerecord
+
+Print TLSA record for given certificate/key and parameters.
+
+Valid values:
+- usage: pkix-ta (0), pkix-ee (1), dane-ta (2), dane-ee (3)
+- selector: cert (0), spki (1)
+- matchtype: full (0), sha2-256 (1), sha2-512 (2)
+
+Common DANE TLSA record parameters are: dane-ee spki sha2-256, or 3 1 1,
+followed by a sha2-256 hash of the DER-encoded "SPKI" (subject public key info)
+from the certificate. An example DNS zone file entry:
+
+	_25._tcp.example.com. TLSA 3 1 1 133b919c9d65d8b1488157315327334ead8d83372db57465ecabf53ee5748aee
+
+The first usable information from the pem file is used to compose the TLSA
+record. In case of selector "cert", a certificate is required. Otherwise the
+"subject public key info" (spki) of the first certificate or public or private
+key (pkcs#8, pkcs#1 or ec private key) is used.
+
+	usage: mox dane makerecord usage selector matchtype [certificate.pem | publickey.pem | privatekey.pem]
+
+# mox dns lookup
+
+Lookup DNS name of given type.
+
+Lookup always prints whether the response was DNSSEC-protected.
+
+Examples:
+
+mox dns lookup ptr 1.1.1.1
+mox dns lookup mx xmox.nl
+mox dns lookup txt _dmarc.xmox.nl.
+mox dns lookup tlsa _25._tcp.xmox.nl
+
+	usage: mox dns lookup [ptr | mx | cname | ips | a | aaaa | ns | txt | srv | tlsa] name
+
 # mox dkim gened25519
 
 Generate a new ed25519 key for use with DKIM.
@@ -577,7 +707,7 @@ strength. This is convenient because of maximum DNS message sizes. At the time
 of writing, not many mail servers appear to support ed25519 DKIM keys though,
 so it is recommended to sign messages with both RSA and ed25519 keys.
 
-	usage: mox dkim gened25519 >$selector._domainkey.$domain.ed25519key.pkcs8.pem
+	usage: mox dkim gened25519 >$selector._domainkey.$domain.ed25519.privatekey.pkcs8.pem
 
 # mox dkim genrsa
 
@@ -586,7 +716,7 @@ Generate a new 2048 bit RSA private key for use with DKIM.
 The generated file is in PEM format, and has a comment it is generated for use
 with DKIM, by mox.
 
-	usage: mox dkim genrsa >$selector._domainkey.$domain.rsakey.pkcs8.pem
+	usage: mox dkim genrsa >$selector._domainkey.$domain.rsa2048.privatekey.pkcs8.pem
 
 # mox dkim lookup
 
@@ -654,6 +784,18 @@ the beginning of the SMTP transaction that delivered the message. These values
 can be found in message headers.
 
 	usage: mox dmarc verify remoteip mailfromaddress helodomain < message
+
+# mox dmarc checkreportaddrs
+
+For each reporting address in the domain's DMARC record, check if it has opted into receiving reports (if needed).
+
+A DMARC record can request reports about DMARC evaluations to be sent to an
+email/http address. If the organizational domains of that of the DMARC record
+and that of the report destination address do not match, the destination
+address must opt-in to receiving DMARC reports by creating a DMARC record at
+<dmarcdomain>._report._dmarc.<reportdestdomain>.
+
+	usage: mox dmarc checkreportaddrs domain
 
 # mox dnsbl check
 
@@ -775,6 +917,125 @@ The report is printed in formatted JSON.
 Prints this mox version.
 
 	usage: mox version
+
+# mox bumpuidvalidity
+
+Change the IMAP UID validity of the mailbox, causing IMAP clients to refetch messages.
+
+This can be useful after manually repairing metadata about the account/mailbox.
+
+Opens account database file directly. Ensure mox does not have the account
+open, or is not running.
+
+	usage: mox bumpuidvalidity account [mailbox]
+
+# mox reassignuids
+
+Reassign UIDs in one mailbox or all mailboxes in an account and bump UID validity, causing IMAP clients to refetch messages.
+
+Opens account database file directly. Ensure mox does not have the account
+open, or is not running.
+
+	usage: mox reassignuids account [mailboxid]
+
+# mox fixuidmeta
+
+Fix inconsistent UIDVALIDITY and UIDNEXT in messages/mailboxes/account.
+
+The next UID to use for a message in a mailbox should always be higher than any
+existing message UID in the mailbox. If it is not, the mailbox UIDNEXT is
+updated.
+
+Each mailbox has a UIDVALIDITY sequence number, which should always be lower
+than the per-account next UIDVALIDITY to use. If it is not, the account next
+UIDVALIDITY is updated.
+
+Opens account database file directly. Ensure mox does not have the account
+open, or is not running.
+
+	usage: mox fixuidmeta account
+
+# mox fixmsgsize
+
+Ensure message sizes in the database matching the sum of the message prefix length and on-disk file size.
+
+Messages with an inconsistent size are also parsed again.
+
+If an inconsistency is found, you should probably also run "mox
+bumpuidvalidity" on the mailboxes or entire account to force IMAP clients to
+refetch messages.
+
+	usage: mox fixmsgsize [account]
+
+# mox reparse
+
+# Parse all messages in the account or all accounts again
+
+Can be useful after upgrading mox with improved message parsing. Messages are
+parsed in batches, so other access to the mailboxes/messages are not blocked
+while reparsing all messages.
+
+	usage: mox reparse [account]
+
+# mox ensureparsed
+
+Ensure messages in the database have a pre-parsed MIME form in the database.
+
+	usage: mox ensureparsed account
+	  -all
+	    	store new parsed message for all messages
+
+# mox recalculatemailboxcounts
+
+Recalculate message counts for all mailboxes in the account, and total message size for quota.
+
+When a message is added to/removed from a mailbox, or when message flags change,
+the total, unread, unseen and deleted messages are accounted, the total size of
+the mailbox, and the total message size for the account. In case of a bug in
+this accounting, the numbers could become incorrect. This command will find, fix
+and print them.
+
+	usage: mox recalculatemailboxcounts account
+
+# mox message parse
+
+Parse message, print JSON representation.
+
+	usage: mox message parse message.eml
+
+# mox reassignthreads
+
+Reassign message threads.
+
+For all accounts, or optionally only the specified account.
+
+Threading for all messages in an account is first reset, and new base subject
+and normalized message-id saved with the message. Then all messages are
+evaluated and matched against their parents/ancestors.
+
+Messages are matched based on the References header, with a fall-back to an
+In-Reply-To header, and if neither is present/valid, based only on base
+subject.
+
+A References header typically points to multiple previous messages in a
+hierarchy. From oldest ancestor to most recent parent. An In-Reply-To header
+would have only a message-id of the parent message.
+
+A message is only linked to a parent/ancestor if their base subject is the
+same. This ensures unrelated replies, with a new subject, are placed in their
+own thread.
+
+The base subject is lower cased, has whitespace collapsed to a single
+space, and some components removed: leading "Re:", "Fwd:", "Fw:", or bracketed
+tag (that mailing lists often add, e.g. "[listname]"), trailing "(fwd)", or
+enclosing "[fwd: ...]".
+
+Messages are linked to all their ancestors. If an intermediate parent/ancestor
+message is deleted in the future, the message can still be linked to the earlier
+ancestors. If the direct parent already wasn't available while matching, this is
+stored as the message having a "missing link" to its stored ancestors.
+
+	usage: mox reassignthreads [account]
 */
 package main
 

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 )
 
 var ctxbg = context.Background()
+var pkglog = mlog.New("store", nil)
 
 func tcheck(t *testing.T, err error, msg string) {
 	t.Helper()
@@ -27,23 +29,25 @@ func tcheck(t *testing.T, err error, msg string) {
 }
 
 func TestMailbox(t *testing.T) {
+	log := mlog.New("store", nil)
 	os.RemoveAll("../testdata/store/data")
-	mox.ConfigStaticPath = "../testdata/store/mox.conf"
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/store/mox.conf")
 	mox.MustLoadConfig(true, false)
-	acc, err := OpenAccount("mjl")
+	acc, err := OpenAccount(log, "mjl")
 	tcheck(t, err, "open account")
-	defer acc.Close()
-	switchDone := Switchboard()
-	defer close(switchDone)
+	defer func() {
+		err = acc.Close()
+		tcheck(t, err, "closing account")
+	}()
+	defer Switchboard()()
 
-	log := mlog.New("store")
-
-	msgFile, err := CreateMessageTemp("account-test")
+	msgFile, err := CreateMessageTemp(log, "account-test")
 	if err != nil {
 		t.Fatalf("creating temp msg file: %s", err)
 	}
+	defer os.Remove(msgFile.Name())
 	defer msgFile.Close()
-	msgWriter := &message.Writer{Writer: msgFile}
+	msgWriter := message.NewWriter(msgFile)
 	if _, err := msgWriter.Write([]byte(" message")); err != nil {
 		t.Fatalf("writing to temp message: %s", err)
 	}
@@ -56,8 +60,10 @@ func TestMailbox(t *testing.T) {
 		MsgPrefix: msgPrefix,
 	}
 	msent := m
+	m.ThreadMuted = true
+	m.ThreadCollapsed = true
 	var mbsent Mailbox
-	mbrejects := Mailbox{Name: "Rejects", UIDValidity: 1, UIDNext: 1}
+	mbrejects := Mailbox{Name: "Rejects", UIDValidity: 1, UIDNext: 1, HaveCounts: true}
 	mreject := m
 	mconsumed := Message{
 		Received:  m.Received,
@@ -66,7 +72,7 @@ func TestMailbox(t *testing.T) {
 	}
 	acc.WithWLock(func() {
 		conf, _ := acc.Conf()
-		err := acc.Deliver(xlog, conf.Destinations["mjl"], &m, msgFile, false)
+		err := acc.DeliverDestination(log, conf.Destinations["mjl"], &m, msgFile)
 		tcheck(t, err, "deliver without consume")
 
 		err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
@@ -75,21 +81,36 @@ func TestMailbox(t *testing.T) {
 			tcheck(t, err, "sent mailbox")
 			msent.MailboxID = mbsent.ID
 			msent.MailboxOrigID = mbsent.ID
-			err = acc.DeliverMessage(xlog, tx, &msent, msgFile, false, true, true, false)
+			err = acc.DeliverMessage(pkglog, tx, &msent, msgFile, true, false, false, true)
 			tcheck(t, err, "deliver message")
+			if !msent.ThreadMuted || !msent.ThreadCollapsed {
+				t.Fatalf("thread muted & collapsed should have been copied from parent (duplicate message-id) m")
+			}
+
+			err = tx.Get(&mbsent)
+			tcheck(t, err, "get mbsent")
+			mbsent.Add(msent.MailboxCounts())
+			err = tx.Update(&mbsent)
+			tcheck(t, err, "update mbsent")
 
 			err = tx.Insert(&mbrejects)
 			tcheck(t, err, "insert rejects mailbox")
 			mreject.MailboxID = mbrejects.ID
 			mreject.MailboxOrigID = mbrejects.ID
-			err = acc.DeliverMessage(xlog, tx, &mreject, msgFile, false, false, true, false)
+			err = acc.DeliverMessage(pkglog, tx, &mreject, msgFile, true, false, false, true)
 			tcheck(t, err, "deliver message")
+
+			err = tx.Get(&mbrejects)
+			tcheck(t, err, "get mbrejects")
+			mbrejects.Add(mreject.MailboxCounts())
+			err = tx.Update(&mbrejects)
+			tcheck(t, err, "update mbrejects")
 
 			return nil
 		})
 		tcheck(t, err, "deliver as sent and rejects")
 
-		err = acc.Deliver(xlog, conf.Destinations["mjl"], &mconsumed, msgFile, true)
+		err = acc.DeliverDestination(pkglog, conf.Destinations["mjl"], &mconsumed, msgFile)
 		tcheck(t, err, "deliver with consume")
 
 		err = acc.DB.Write(ctxbg, func(tx *bstore.Tx) error {
@@ -120,7 +141,7 @@ func TestMailbox(t *testing.T) {
 	})
 	tcheck(t, err, "untraining non-junk")
 
-	err = acc.SetPassword("testtest")
+	err = acc.SetPassword(log, "testtest")
 	tcheck(t, err, "set password")
 
 	key0, err := acc.Subjectpass("test@localhost")
@@ -202,53 +223,41 @@ func TestMailbox(t *testing.T) {
 
 	// Run the auth tests twice for possible cache effects.
 	for i := 0; i < 2; i++ {
-		_, err := OpenEmailAuth("mjl@mox.example", "bogus")
+		_, err := OpenEmailAuth(log, "mjl@mox.example", "bogus")
 		if err != ErrUnknownCredentials {
 			t.Fatalf("got %v, expected ErrUnknownCredentials", err)
 		}
 	}
 
 	for i := 0; i < 2; i++ {
-		acc2, err := OpenEmailAuth("mjl@mox.example", "testtest")
+		acc2, err := OpenEmailAuth(log, "mjl@mox.example", "testtest")
 		tcheck(t, err, "open for email with auth")
 		err = acc2.Close()
 		tcheck(t, err, "close account")
 	}
 
-	acc2, err := OpenEmailAuth("other@mox.example", "testtest")
+	acc2, err := OpenEmailAuth(log, "other@mox.example", "testtest")
 	tcheck(t, err, "open for email with auth")
 	err = acc2.Close()
 	tcheck(t, err, "close account")
 
-	_, err = OpenEmailAuth("bogus@mox.example", "testtest")
+	_, err = OpenEmailAuth(log, "bogus@mox.example", "testtest")
 	if err != ErrUnknownCredentials {
 		t.Fatalf("got %v, expected ErrUnknownCredentials", err)
 	}
 
-	_, err = OpenEmailAuth("mjl@test.example", "testtest")
+	_, err = OpenEmailAuth(log, "mjl@test.example", "testtest")
 	if err != ErrUnknownCredentials {
 		t.Fatalf("got %v, expected ErrUnknownCredentials", err)
-	}
-}
-
-func TestWriteFile(t *testing.T) {
-	name := "../testdata/account.test"
-	os.Remove(name)
-	defer os.Remove(name)
-	err := writeFile(name, strings.NewReader("test"))
-	if err != nil {
-		t.Fatalf("writeFile, unexpected error %v", err)
-	}
-	buf, err := os.ReadFile(name)
-	if err != nil || string(buf) != "test" {
-		t.Fatalf("writeFile, read file, got err %v, data %q", err, buf)
 	}
 }
 
 func TestMessageRuleset(t *testing.T) {
-	f, err := os.Open("/dev/null")
-	tcheck(t, err, "open")
+	f, err := CreateMessageTemp(pkglog, "msgruleset")
+	tcheck(t, err, "creating temp msg file")
+	defer os.Remove(f.Name())
 	defer f.Close()
+
 	msgBuf := []byte(strings.ReplaceAll(`List-ID:  <test.mox.example>
 
 test
@@ -275,7 +284,7 @@ Rulesets:
 	}
 	dest.Rulesets[0].HeadersRegexpCompiled = hdrs
 
-	c := MessageRuleset(xlog, dest, &Message{}, msgBuf, f)
+	c := MessageRuleset(pkglog, dest, &Message{}, msgBuf, f)
 	if c == nil {
 		t.Fatalf("expected ruleset match")
 	}
@@ -284,7 +293,7 @@ Rulesets:
 
 test
 `, "\n", "\r\n"))
-	c = MessageRuleset(xlog, dest, &Message{}, msg2Buf, f)
+	c = MessageRuleset(pkglog, dest, &Message{}, msg2Buf, f)
 	if c != nil {
 		t.Fatalf("expected no ruleset match")
 	}

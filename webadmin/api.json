@@ -1,0 +1,4619 @@
+{
+	"Name": "Admin",
+	"Docs": "Admin exports web API functions for the admin web interface. All its methods are\nexported under api/. Function calls require valid HTTP Authentication\ncredentials of a user.",
+	"Functions": [
+		{
+			"Name": "LoginPrep",
+			"Docs": "LoginPrep returns a login token, and also sets it as cookie. Both must be\npresent in the call to Login.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Login",
+			"Docs": "Login returns a session token for the credentials, or fails with error code\n\"user:badLogin\". Call LoginPrep to get a loginToken.",
+			"Params": [
+				{
+					"Name": "loginToken",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "password",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"CSRFToken"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Logout",
+			"Docs": "Logout invalidates the session token.",
+			"Params": [],
+			"Returns": []
+		},
+		{
+			"Name": "CheckDomain",
+			"Docs": "CheckDomain checks the configuration for the domain, such as MX, SMTP STARTTLS,\nSPF, DKIM, DMARC, TLSRPT, MTASTS, autoconfig, autodiscover.",
+			"Params": [
+				{
+					"Name": "domainName",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r",
+					"Typewords": [
+						"CheckResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Domains",
+			"Docs": "Domains returns all configured domain names, in UTF-8 for IDNA domains.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Domain",
+			"Docs": "Domain returns the dns domain for a (potentially unicode as IDNA) domain name.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ParseDomain",
+			"Docs": "ParseDomain parses a domain, possibly an IDNA domain.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DomainLocalparts",
+			"Docs": "DomainLocalparts returns the encoded localparts and accounts configured in domain.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "localpartAccounts",
+					"Typewords": [
+						"{}",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Accounts",
+			"Docs": "Accounts returns the names of all configured accounts.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Account",
+			"Docs": "Account returns the parsed configuration of an account.",
+			"Params": [
+				{
+					"Name": "account",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"{}",
+						"any"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ConfigFiles",
+			"Docs": "ConfigFiles returns the paths and contents of the static and dynamic configuration files.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "staticPath",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "dynamicPath",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "static",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "dynamic",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "MTASTSPolicies",
+			"Docs": "MTASTSPolicies returns all mtasts policies from the cache.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "records",
+					"Typewords": [
+						"[]",
+						"PolicyRecord"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSReports",
+			"Docs": "TLSReports returns TLS reports overlapping with period start/end, for the given\npolicy domain (or all domains if empty). The reports are sorted first by period\nend (most recent first), then by policy domain.",
+			"Params": [
+				{
+					"Name": "start",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "end",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "policyDomain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "reports",
+					"Typewords": [
+						"[]",
+						"TLSReportRecord"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSReportID",
+			"Docs": "TLSReportID returns a single TLS report.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "reportID",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"TLSReportRecord"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTSummaries",
+			"Docs": "TLSRPTSummaries returns a summary of received TLS reports overlapping with\nperiod start/end for one or all domains (when domain is empty).\nThe returned summaries are ordered by domain name.",
+			"Params": [
+				{
+					"Name": "start",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "end",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "policyDomain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "domainSummaries",
+					"Typewords": [
+						"[]",
+						"TLSRPTSummary"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCReports",
+			"Docs": "DMARCReports returns DMARC reports overlapping with period start/end, for the\ngiven domain (or all domains if empty). The reports are sorted first by period\nend (most recent first), then by domain.",
+			"Params": [
+				{
+					"Name": "start",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "end",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "reports",
+					"Typewords": [
+						"[]",
+						"DomainFeedback"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCReportID",
+			"Docs": "DMARCReportID returns a single DMARC report.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "reportID",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "report",
+					"Typewords": [
+						"DomainFeedback"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCSummaries",
+			"Docs": "DMARCSummaries returns a summary of received DMARC reports overlapping with\nperiod start/end for one or all domains (when domain is empty).\nThe returned summaries are ordered by domain name.",
+			"Params": [
+				{
+					"Name": "start",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "end",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "domainSummaries",
+					"Typewords": [
+						"[]",
+						"DMARCSummary"
+					]
+				}
+			]
+		},
+		{
+			"Name": "LookupIP",
+			"Docs": "LookupIP does a reverse lookup of ip.",
+			"Params": [
+				{
+					"Name": "ip",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"Reverse"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DNSBLStatus",
+			"Docs": "DNSBLStatus returns the IPs from which outgoing connections may be made and\ntheir current status in DNSBLs that are configured. The IPs are typically the\nconfigured listen IPs, or otherwise IPs on the machines network interfaces, with\ninternal/private IPs removed.\n\nThe returned value maps IPs to per DNSBL statuses, where \"pass\" means not listed and\nanything else is an error string, e.g. \"fail: ...\" or \"temperror: ...\".",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"{}",
+						"{}",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DomainRecords",
+			"Docs": "DomainRecords returns lines describing DNS records that should exist for the\nconfigured domain.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DomainAdd",
+			"Docs": "DomainAdd adds a new domain and reloads the configuration.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "localpart",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "DomainRemove",
+			"Docs": "DomainRemove removes an existing domain and reloads the configuration.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AccountAdd",
+			"Docs": "AccountAdd adds existing a new account, with an initial email address, and\nreloads the configuration.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "address",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AccountRemove",
+			"Docs": "AccountRemove removes an existing account and reloads the configuration.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AddressAdd",
+			"Docs": "AddressAdd adds a new address to the account, which must already exist.",
+			"Params": [
+				{
+					"Name": "address",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AddressRemove",
+			"Docs": "AddressRemove removes an existing address.",
+			"Params": [
+				{
+					"Name": "address",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "SetPassword",
+			"Docs": "SetPassword saves a new password for an account, invalidating the previous password.\nSessions are not interrupted, and will keep working. New login attempts must use the new password.\nPassword must be at least 8 characters.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "password",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "SetAccountLimits",
+			"Docs": "SetAccountLimits set new limits on outgoing messages for an account.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "maxOutgoingMessagesPerDay",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "maxFirstTimeRecipientsPerDay",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "maxMsgSize",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "ClientConfigsDomain",
+			"Docs": "ClientConfigsDomain returns configurations for email clients, IMAP and\nSubmission (SMTP) for the domain.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"ClientConfigs"
+					]
+				}
+			]
+		},
+		{
+			"Name": "QueueList",
+			"Docs": "QueueList returns the messages currently in the outgoing queue.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"Msg"
+					]
+				}
+			]
+		},
+		{
+			"Name": "QueueSize",
+			"Docs": "QueueSize returns the number of messages currently in the outgoing queue.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"int32"
+					]
+				}
+			]
+		},
+		{
+			"Name": "QueueKick",
+			"Docs": "QueueKick initiates delivery of a message from the queue and sets the transport\nto use for delivery.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "transport",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "QueueDrop",
+			"Docs": "QueueDrop removes a message from the queue.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "QueueSaveRequireTLS",
+			"Docs": "QueueSaveRequireTLS updates the requiretls field for a message in the queue,\nto be used for the next delivery.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "requireTLS",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "LogLevels",
+			"Docs": "LogLevels returns the current log levels.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"{}",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "LogLevelSet",
+			"Docs": "LogLevelSet sets a log level for a package.",
+			"Params": [
+				{
+					"Name": "pkg",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "levelStr",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "LogLevelRemove",
+			"Docs": "LogLevelRemove removes a log level for a package, which cannot be the empty string.",
+			"Params": [
+				{
+					"Name": "pkg",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "CheckUpdatesEnabled",
+			"Docs": "CheckUpdatesEnabled returns whether checking for updates is enabled.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"bool"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebserverConfig",
+			"Docs": "WebserverConfig returns the current webserver config",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "conf",
+					"Typewords": [
+						"WebserverConfig"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebserverConfigSave",
+			"Docs": "WebserverConfigSave saves a new webserver config. If oldConf is not equal to\nthe current config, an error is returned.",
+			"Params": [
+				{
+					"Name": "oldConf",
+					"Typewords": [
+						"WebserverConfig"
+					]
+				},
+				{
+					"Name": "newConf",
+					"Typewords": [
+						"WebserverConfig"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "savedConf",
+					"Typewords": [
+						"WebserverConfig"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Transports",
+			"Docs": "Transports returns the configured transports, for sending email.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"{}",
+						"Transport"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCEvaluationStats",
+			"Docs": "DMARCEvaluationStats returns a map of all domains with evaluations to a count of\nthe evaluations and whether those evaluations will cause a report to be sent.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"{}",
+						"EvaluationStat"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCEvaluationsDomain",
+			"Docs": "DMARCEvaluationsDomain returns all evaluations for aggregate reports for the\ndomain, sorted from oldest to most recent.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "r1",
+					"Typewords": [
+						"[]",
+						"Evaluation"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCRemoveEvaluations",
+			"Docs": "DMARCRemoveEvaluations removes evaluations for a domain.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "DMARCSuppressAdd",
+			"Docs": "DMARCSuppressAdd adds a reporting address to the suppress list. Outgoing\nreports will be suppressed for a period.",
+			"Params": [
+				{
+					"Name": "reportingAddress",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "until",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "comment",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "DMARCSuppressList",
+			"Docs": "DMARCSuppressList returns all reporting addresses on the suppress list.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"SuppressAddress"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCSuppressRemove",
+			"Docs": "DMARCSuppressRemove removes a reporting address record from the suppress list.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "DMARCSuppressExtend",
+			"Docs": "DMARCSuppressExtend updates the until field of a suppressed reporting address record.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "until",
+					"Typewords": [
+						"timestamp"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "TLSRPTResults",
+			"Docs": "TLSRPTResults returns all TLSRPT results in the database.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"TLSResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTResultsDomain",
+			"Docs": "TLSRPTResultsPolicyDomain returns the TLS results for a domain.",
+			"Params": [
+				{
+					"Name": "isRcptDom",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "policyDomain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "r1",
+					"Typewords": [
+						"[]",
+						"TLSResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "LookupTLSRPTRecord",
+			"Docs": "LookupTLSRPTRecord looks up a TLSRPT record and returns the parsed form, original txt\nform from DNS, and error with the TLSRPT record as a string.",
+			"Params": [
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "record",
+					"Typewords": [
+						"nullable",
+						"TLSRPTRecord"
+					]
+				},
+				{
+					"Name": "txt",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "errstr",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTRemoveResults",
+			"Docs": "TLSRPTRemoveResults removes the TLS results for a domain for the given day. If\nday is empty, all results are removed.",
+			"Params": [
+				{
+					"Name": "isRcptDom",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "domain",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "day",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "TLSRPTSuppressAdd",
+			"Docs": "TLSRPTSuppressAdd adds a reporting address to the suppress list. Outgoing\nreports will be suppressed for a period.",
+			"Params": [
+				{
+					"Name": "reportingAddress",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "until",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "comment",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "TLSRPTSuppressList",
+			"Docs": "TLSRPTSuppressList returns all reporting addresses on the suppress list.",
+			"Params": [],
+			"Returns": [
+				{
+					"Name": "r0",
+					"Typewords": [
+						"[]",
+						"TLSRPTSuppressAddress"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTSuppressRemove",
+			"Docs": "TLSRPTSuppressRemove removes a reporting address record from the suppress list.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "TLSRPTSuppressExtend",
+			"Docs": "TLSRPTSuppressExtend updates the until field of a suppressed reporting address record.",
+			"Params": [
+				{
+					"Name": "id",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "until",
+					"Typewords": [
+						"timestamp"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "LookupCid",
+			"Docs": "LookupCid turns an ID from a Received header into a cid as used in logging.",
+			"Params": [
+				{
+					"Name": "recvID",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "cid",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		}
+	],
+	"Sections": [],
+	"Structs": [
+		{
+			"Name": "CheckResult",
+			"Docs": "CheckResult is the analysis of a domain, its actual configuration (DNS, TLS,\nconnectivity) and the mox configuration. It includes configuration instructions\n(e.g. DNS records), and warnings and errors encountered.",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DNSSEC",
+					"Docs": "",
+					"Typewords": [
+						"DNSSECResult"
+					]
+				},
+				{
+					"Name": "IPRev",
+					"Docs": "",
+					"Typewords": [
+						"IPRevCheckResult"
+					]
+				},
+				{
+					"Name": "MX",
+					"Docs": "",
+					"Typewords": [
+						"MXCheckResult"
+					]
+				},
+				{
+					"Name": "TLS",
+					"Docs": "",
+					"Typewords": [
+						"TLSCheckResult"
+					]
+				},
+				{
+					"Name": "DANE",
+					"Docs": "",
+					"Typewords": [
+						"DANECheckResult"
+					]
+				},
+				{
+					"Name": "SPF",
+					"Docs": "",
+					"Typewords": [
+						"SPFCheckResult"
+					]
+				},
+				{
+					"Name": "DKIM",
+					"Docs": "",
+					"Typewords": [
+						"DKIMCheckResult"
+					]
+				},
+				{
+					"Name": "DMARC",
+					"Docs": "",
+					"Typewords": [
+						"DMARCCheckResult"
+					]
+				},
+				{
+					"Name": "HostTLSRPT",
+					"Docs": "",
+					"Typewords": [
+						"TLSRPTCheckResult"
+					]
+				},
+				{
+					"Name": "DomainTLSRPT",
+					"Docs": "",
+					"Typewords": [
+						"TLSRPTCheckResult"
+					]
+				},
+				{
+					"Name": "MTASTS",
+					"Docs": "",
+					"Typewords": [
+						"MTASTSCheckResult"
+					]
+				},
+				{
+					"Name": "SRVConf",
+					"Docs": "",
+					"Typewords": [
+						"SRVConfCheckResult"
+					]
+				},
+				{
+					"Name": "Autoconf",
+					"Docs": "",
+					"Typewords": [
+						"AutoconfCheckResult"
+					]
+				},
+				{
+					"Name": "Autodiscover",
+					"Docs": "",
+					"Typewords": [
+						"AutodiscoverCheckResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DNSSECResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "IPRevCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Hostname",
+					"Docs": "This hostname, IPs must resolve back to this.",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "IPNames",
+					"Docs": "IP to names.",
+					"Typewords": [
+						"{}",
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Domain",
+			"Docs": "Domain is a domain name, with one or more labels, with at least an ASCII\nrepresentation, and for IDNA non-ASCII domains a unicode representation.\nThe ASCII string must be used for DNS lookups. The strings do not have a\ntrailing dot. When using with StrictResolver, add the trailing dot.",
+			"Fields": [
+				{
+					"Name": "ASCII",
+					"Docs": "A non-unicode domain, e.g. with A-labels (xn--...) or NR-LDH (non-reserved letters/digits/hyphens) labels. Always in lower case. No trailing dot.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Unicode",
+					"Docs": "Name as U-labels. Empty if this is an ASCII-only domain. No trailing dot.",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "MXCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Records",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"MX"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "MX",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Host",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Pref",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "IPs",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DANECheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SPFCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "DomainTXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DomainRecord",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"SPFRecord"
+					]
+				},
+				{
+					"Name": "HostTXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "HostRecord",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"SPFRecord"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SPFRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "Must be \"spf1\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Directives",
+					"Docs": "An IP is evaluated against each directive until a match is found.",
+					"Typewords": [
+						"[]",
+						"Directive"
+					]
+				},
+				{
+					"Name": "Redirect",
+					"Docs": "Modifier that redirects SPF checks to other domain after directives did not match. Optional. For \"redirect=\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Explanation",
+					"Docs": "Modifier for creating a user-friendly error message when an IP results in status \"fail\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Other",
+					"Docs": "Other modifiers.",
+					"Typewords": [
+						"[]",
+						"Modifier"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Directive",
+			"Docs": "Directive consists of a mechanism that describes how to check if an IP matches,\nan (optional) qualifier indicating the policy for a match, and optional\nparameters specific to the mechanism.",
+			"Fields": [
+				{
+					"Name": "Qualifier",
+					"Docs": "Sets the result if this directive matches. \"\" and \"+\" are \"pass\", \"-\" is \"fail\", \"?\" is \"neutral\", \"~\" is \"softfail\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Mechanism",
+					"Docs": "\"all\", \"include\", \"a\", \"mx\", \"ptr\", \"ip4\", \"ip6\", \"exists\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DomainSpec",
+					"Docs": "For include, a, mx, ptr, exists. Always in lower-case when parsed using ParseRecord.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "IPstr",
+					"Docs": "Original string for IP, always with /subnet.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "IP4CIDRLen",
+					"Docs": "For a, mx, ip4.",
+					"Typewords": [
+						"nullable",
+						"int32"
+					]
+				},
+				{
+					"Name": "IP6CIDRLen",
+					"Docs": "For a, mx, ip6.",
+					"Typewords": [
+						"nullable",
+						"int32"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Modifier",
+			"Docs": "Modifier provides additional information for a policy.\n\"redirect\" and \"exp\" are not represented as a Modifier but explicitly in a Record.",
+			"Fields": [
+				{
+					"Name": "Key",
+					"Docs": "Key is case-insensitive.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Value",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DKIMCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Records",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"DKIMRecord"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DKIMRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Selector",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "TXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Record",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"Record"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Record",
+			"Docs": "Record is a DKIM DNS record, served on \u003cselector\u003e._domainkey.\u003cdomain\u003e for a\ngiven selector and domain (s= and d= in the DKIM-Signature).\n\nThe record is a semicolon-separated list of \"=\"-separated field value pairs.\nStrings should be compared case-insensitively, e.g. k=ed25519 is equivalent to k=ED25519.\n\nExample:\n\n\tv=DKIM1;h=sha256;k=ed25519;p=ln5zd/JEX4Jy60WAhUOv33IYm2YZMyTQAdr9stML504=",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "Version, fixed \"DKIM1\" (case sensitive). Field \"v\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Hashes",
+					"Docs": "Acceptable hash algorithms, e.g. \"sha1\", \"sha256\". Optional, defaults to all algorithms. Field \"h\".",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Key",
+					"Docs": "Key type, \"rsa\" or \"ed25519\". Optional, default \"rsa\". Field \"k\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Notes",
+					"Docs": "Debug notes. Field \"n\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Pubkey",
+					"Docs": "Public key, as base64 in record. If empty, the key has been revoked. Field \"p\".",
+					"Typewords": [
+						"[]",
+						"uint8"
+					]
+				},
+				{
+					"Name": "Services",
+					"Docs": "Service types. Optional, default \"*\" for all services. Other values: \"email\". Field \"s\".",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Flags",
+					"Docs": "Flags, colon-separated. Optional, default is no flags. Other values: \"y\" for testing DKIM, \"s\" for \"i=\" must have same domain as \"d\" in signatures. Field \"t\".",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "TXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Record",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"DMARCRecord"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "\"v=DMARC1\", fixed.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Policy",
+					"Docs": "Required, for \"p=\".",
+					"Typewords": [
+						"DMARCPolicy"
+					]
+				},
+				{
+					"Name": "SubdomainPolicy",
+					"Docs": "Like policy but for subdomains. Optional, for \"sp=\".",
+					"Typewords": [
+						"DMARCPolicy"
+					]
+				},
+				{
+					"Name": "AggregateReportAddresses",
+					"Docs": "Optional, for \"rua=\". Destination addresses for aggregate reports.",
+					"Typewords": [
+						"[]",
+						"URI"
+					]
+				},
+				{
+					"Name": "FailureReportAddresses",
+					"Docs": "Optional, for \"ruf=\". Destination addresses for failure reports.",
+					"Typewords": [
+						"[]",
+						"URI"
+					]
+				},
+				{
+					"Name": "ADKIM",
+					"Docs": "Alignment: \"r\" (default) for relaxed or \"s\" for simple. For \"adkim=\".",
+					"Typewords": [
+						"Align"
+					]
+				},
+				{
+					"Name": "ASPF",
+					"Docs": "Alignment: \"r\" (default) for relaxed or \"s\" for simple. For \"aspf=\".",
+					"Typewords": [
+						"Align"
+					]
+				},
+				{
+					"Name": "AggregateReportingInterval",
+					"Docs": "In seconds, default 86400. For \"ri=\"",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "FailureReportingOptions",
+					"Docs": "\"0\" (default), \"1\", \"d\", \"s\". For \"fo=\".",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "ReportingFormat",
+					"Docs": "\"afrf\" (default). For \"rf=\".",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Percentage",
+					"Docs": "Between 0 and 100, default 100. For \"pct=\". Policy applies randomly to this percentage of messages.",
+					"Typewords": [
+						"int32"
+					]
+				}
+			]
+		},
+		{
+			"Name": "URI",
+			"Docs": "URI is a destination address for reporting.",
+			"Fields": [
+				{
+					"Name": "Address",
+					"Docs": "Should start with \"mailto:\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "MaxSize",
+					"Docs": "Optional maximum message size, subject to Unit.",
+					"Typewords": [
+						"uint64"
+					]
+				},
+				{
+					"Name": "Unit",
+					"Docs": "\"\" (b), \"k\", \"m\", \"g\", \"t\" (case insensitive), unit size, where k is 2^10 etc.",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "TXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Record",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"TLSRPTRecord"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "\"TLSRPTv1\", for \"v=\".",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "RUAs",
+					"Docs": "Aggregate reporting URI, for \"rua=\". \"rua=\" can occur multiple times, each can be a list.",
+					"Typewords": [
+						"[]",
+						"[]",
+						"RUA"
+					]
+				},
+				{
+					"Name": "Extensions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"Extension"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Extension",
+			"Docs": "Extension is an additional key/value pair for a TLSRPT record.",
+			"Fields": [
+				{
+					"Name": "Key",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Value",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "MTASTSCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "TXT",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Record",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"MTASTSRecord"
+					]
+				},
+				{
+					"Name": "PolicyText",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Policy",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"Policy"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "MTASTSRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "\"STSv1\", for \"v=\". Required.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ID",
+					"Docs": "Record version, for \"id=\". Required.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Extensions",
+					"Docs": "Optional extensions.",
+					"Typewords": [
+						"[]",
+						"Pair"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Pair",
+			"Docs": "Pair is an extension key/value pair in a MTA-STS DNS record or policy.",
+			"Fields": [
+				{
+					"Name": "Key",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Value",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Policy",
+			"Docs": "Policy is an MTA-STS policy as served at \"https://mta-sts.\u003cdomain\u003e/.well-known/mta-sts.txt\".",
+			"Fields": [
+				{
+					"Name": "Version",
+					"Docs": "\"STSv1\"",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Mode",
+					"Docs": "",
+					"Typewords": [
+						"Mode"
+					]
+				},
+				{
+					"Name": "MX",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"STSMX"
+					]
+				},
+				{
+					"Name": "MaxAgeSeconds",
+					"Docs": "How long this policy can be cached. Suggested values are in weeks or more.",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "Extensions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"Pair"
+					]
+				}
+			]
+		},
+		{
+			"Name": "STSMX",
+			"Docs": "STSMX is an allowlisted MX host name/pattern.\ntodo: find a way to name this just STSMX without getting duplicate names for \"MX\" in the sherpa api.",
+			"Fields": [
+				{
+					"Name": "Wildcard",
+					"Docs": "\"*.\" wildcard, e.g. if a subdomain matches. A wildcard must match exactly one label. *.example.com matches mail.example.com, but not example.com, and not foor.bar.example.com.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SRVConfCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "SRVs",
+					"Docs": "Service (e.g. \"_imaps\") to records.",
+					"Typewords": [
+						"{}",
+						"[]",
+						"SRV"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SRV",
+			"Docs": "An SRV represents a single DNS SRV record.",
+			"Fields": [
+				{
+					"Name": "Target",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Port",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				},
+				{
+					"Name": "Priority",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				},
+				{
+					"Name": "Weight",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AutoconfCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "ClientSettingsDomainIPs",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "IPs",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AutodiscoverCheckResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Records",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"AutodiscoverSRV"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Warnings",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Instructions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AutodiscoverSRV",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Target",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Port",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				},
+				{
+					"Name": "Priority",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				},
+				{
+					"Name": "Weight",
+					"Docs": "",
+					"Typewords": [
+						"uint16"
+					]
+				},
+				{
+					"Name": "IPs",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "PolicyRecord",
+			"Docs": "PolicyRecord is a cached policy or absence of a policy.",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "Domain name, with unicode characters.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Inserted",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "ValidEnd",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "LastUpdate",
+					"Docs": "Policies are refreshed on use and periodically.",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "LastUse",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Backoff",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "RecordID",
+					"Docs": "As retrieved from DNS.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Version",
+					"Docs": "\"STSv1\"",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Mode",
+					"Docs": "",
+					"Typewords": [
+						"Mode"
+					]
+				},
+				{
+					"Name": "MX",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"STSMX"
+					]
+				},
+				{
+					"Name": "MaxAgeSeconds",
+					"Docs": "How long this policy can be cached. Suggested values are in weeks or more.",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "Extensions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"Pair"
+					]
+				},
+				{
+					"Name": "PolicyText",
+					"Docs": "Text that make up the policy, as retrieved. We didn't store this in the past. If empty, policy can be reconstructed from Policy field. Needed by TLSRPT.",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSReportRecord",
+			"Docs": "TLSReportRecord is a TLS report as a database record, including information\nabout the sender.\n\ntodo: should be named just Record, but it would cause a sherpa type name conflict.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "Policy domain to which the TLS report applies. Unicode.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "FromDomain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "MailFrom",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "HostReport",
+					"Docs": "Report for host TLSRPT record, as opposed to domain TLSRPT record.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Report",
+					"Docs": "",
+					"Typewords": [
+						"Report"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Report",
+			"Docs": "Report is a TLSRPT report.",
+			"Fields": [
+				{
+					"Name": "OrganizationName",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DateRange",
+					"Docs": "",
+					"Typewords": [
+						"TLSRPTDateRange"
+					]
+				},
+				{
+					"Name": "ContactInfo",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReportID",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Policies",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"Result"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTDateRange",
+			"Docs": "note: with TLSRPT prefix to prevent clash in sherpadoc types.",
+			"Fields": [
+				{
+					"Name": "Start",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "End",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Result",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Policy",
+					"Docs": "",
+					"Typewords": [
+						"ResultPolicy"
+					]
+				},
+				{
+					"Name": "Summary",
+					"Docs": "",
+					"Typewords": [
+						"Summary"
+					]
+				},
+				{
+					"Name": "FailureDetails",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"FailureDetails"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ResultPolicy",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Type",
+					"Docs": "",
+					"Typewords": [
+						"PolicyType"
+					]
+				},
+				{
+					"Name": "String",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "ASCII/A-labels, ../rfc/8460:704",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "MXHost",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Summary",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "TotalSuccessfulSessionCount",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "TotalFailureSessionCount",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				}
+			]
+		},
+		{
+			"Name": "FailureDetails",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "ResultType",
+					"Docs": "",
+					"Typewords": [
+						"ResultType"
+					]
+				},
+				{
+					"Name": "SendingMTAIP",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReceivingMXHostname",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReceivingMXHelo",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReceivingIP",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "FailedSessionCount",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "AdditionalInformation",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "FailureReasonCode",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTSummary",
+			"Docs": "TLSRPTSummary presents TLS reporting statistics for a single domain\nover a period.",
+			"Fields": [
+				{
+					"Name": "PolicyDomain",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "Success",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Failure",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "ResultTypeCounts",
+					"Docs": "",
+					"Typewords": [
+						"{}",
+						"int64"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DomainFeedback",
+			"Docs": "DomainFeedback is a single report stored in the database.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "Domain where DMARC DNS record was found, could be organizational domain.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "FromDomain",
+					"Docs": "Domain in From-header.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Version",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReportMetadata",
+					"Docs": "",
+					"Typewords": [
+						"ReportMetadata"
+					]
+				},
+				{
+					"Name": "PolicyPublished",
+					"Docs": "",
+					"Typewords": [
+						"PolicyPublished"
+					]
+				},
+				{
+					"Name": "Records",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"ReportRecord"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ReportMetadata",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "OrgName",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Email",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ExtraContactInfo",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReportID",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DateRange",
+					"Docs": "",
+					"Typewords": [
+						"DateRange"
+					]
+				},
+				{
+					"Name": "Errors",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DateRange",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Begin",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "End",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				}
+			]
+		},
+		{
+			"Name": "PolicyPublished",
+			"Docs": "PolicyPublished is the policy as found in DNS for the domain.",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "Domain is where DMARC record was found, not necessarily message From. Reports we generate use unicode names, incoming reports may have either ASCII-only or Unicode domains.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ADKIM",
+					"Docs": "",
+					"Typewords": [
+						"Alignment"
+					]
+				},
+				{
+					"Name": "ASPF",
+					"Docs": "",
+					"Typewords": [
+						"Alignment"
+					]
+				},
+				{
+					"Name": "Policy",
+					"Docs": "",
+					"Typewords": [
+						"Disposition"
+					]
+				},
+				{
+					"Name": "SubdomainPolicy",
+					"Docs": "",
+					"Typewords": [
+						"Disposition"
+					]
+				},
+				{
+					"Name": "Percentage",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "ReportingOptions",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ReportRecord",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Row",
+					"Docs": "",
+					"Typewords": [
+						"Row"
+					]
+				},
+				{
+					"Name": "Identifiers",
+					"Docs": "",
+					"Typewords": [
+						"Identifiers"
+					]
+				},
+				{
+					"Name": "AuthResults",
+					"Docs": "",
+					"Typewords": [
+						"AuthResults"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Row",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "SourceIP",
+					"Docs": "SourceIP must match the pattern ((1?[0-9]?[0-9]|2[0-4][0-9]|25[0-5]).){3} (1?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])| ([A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Count",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "PolicyEvaluated",
+					"Docs": "",
+					"Typewords": [
+						"PolicyEvaluated"
+					]
+				}
+			]
+		},
+		{
+			"Name": "PolicyEvaluated",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Disposition",
+					"Docs": "",
+					"Typewords": [
+						"Disposition"
+					]
+				},
+				{
+					"Name": "DKIM",
+					"Docs": "",
+					"Typewords": [
+						"DMARCResult"
+					]
+				},
+				{
+					"Name": "SPF",
+					"Docs": "",
+					"Typewords": [
+						"DMARCResult"
+					]
+				},
+				{
+					"Name": "Reasons",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"PolicyOverrideReason"
+					]
+				}
+			]
+		},
+		{
+			"Name": "PolicyOverrideReason",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Type",
+					"Docs": "",
+					"Typewords": [
+						"PolicyOverride"
+					]
+				},
+				{
+					"Name": "Comment",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Identifiers",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "EnvelopeTo",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "EnvelopeFrom",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "HeaderFrom",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AuthResults",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "DKIM",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"DKIMAuthResult"
+					]
+				},
+				{
+					"Name": "SPF",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"SPFAuthResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DKIMAuthResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Selector",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Result",
+					"Docs": "",
+					"Typewords": [
+						"DKIMResult"
+					]
+				},
+				{
+					"Name": "HumanResult",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SPFAuthResult",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Scope",
+					"Docs": "",
+					"Typewords": [
+						"SPFDomainScope"
+					]
+				},
+				{
+					"Name": "Result",
+					"Docs": "",
+					"Typewords": [
+						"SPFResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "DMARCSummary",
+			"Docs": "DMARCSummary presents DMARC aggregate reporting statistics for a single domain\nover a period.",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Total",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "DispositionNone",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "DispositionQuarantine",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "DispositionReject",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "DKIMFail",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "SPFFail",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "PolicyOverrides",
+					"Docs": "",
+					"Typewords": [
+						"{}",
+						"int32"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Reverse",
+			"Docs": "Reverse is the result of a reverse lookup.",
+			"Fields": [
+				{
+					"Name": "Hostnames",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ClientConfigs",
+			"Docs": "ClientConfigs holds the client configuration for IMAP/Submission for a\ndomain.",
+			"Fields": [
+				{
+					"Name": "Entries",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"ClientConfigsEntry"
+					]
+				}
+			]
+		},
+		{
+			"Name": "ClientConfigsEntry",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Protocol",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Host",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "Port",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "Listener",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Note",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Msg",
+			"Docs": "Msg is a message in the queue.\n\nUse MakeMsg to make a message with fields that Add needs. Add will further set\nqueueing related fields.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Queued",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "SenderAccount",
+					"Docs": "Failures are delivered back to this local account. Also used for routing.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "SenderLocalpart",
+					"Docs": "Should be a local user and domain.",
+					"Typewords": [
+						"Localpart"
+					]
+				},
+				{
+					"Name": "SenderDomain",
+					"Docs": "",
+					"Typewords": [
+						"IPDomain"
+					]
+				},
+				{
+					"Name": "RecipientLocalpart",
+					"Docs": "Typically a remote user and domain.",
+					"Typewords": [
+						"Localpart"
+					]
+				},
+				{
+					"Name": "RecipientDomain",
+					"Docs": "",
+					"Typewords": [
+						"IPDomain"
+					]
+				},
+				{
+					"Name": "RecipientDomainStr",
+					"Docs": "For filtering.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Attempts",
+					"Docs": "Next attempt is based on last attempt and exponential back off based on attempts.",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "MaxAttempts",
+					"Docs": "Max number of attempts before giving up. If 0, then the default of 8 attempts is used instead.",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "DialedIPs",
+					"Docs": "For each host, the IPs that were dialed. Used for IP selection for later attempts.",
+					"Typewords": [
+						"{}",
+						"[]",
+						"IP"
+					]
+				},
+				{
+					"Name": "NextAttempt",
+					"Docs": "For scheduling.",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "LastAttempt",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"timestamp"
+					]
+				},
+				{
+					"Name": "LastError",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Has8bit",
+					"Docs": "Whether message contains bytes with high bit set, determines whether 8BITMIME SMTP extension is needed.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "SMTPUTF8",
+					"Docs": "Whether message requires use of SMTPUTF8.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "IsDMARCReport",
+					"Docs": "Delivery failures for DMARC reports are handled differently.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "IsTLSReport",
+					"Docs": "Delivery failures for TLS reports are handled differently.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Size",
+					"Docs": "Full size of message, combined MsgPrefix with contents of message file.",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "MessageID",
+					"Docs": "Used when composing a DSN, in its References header.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "MsgPrefix",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"uint8"
+					]
+				},
+				{
+					"Name": "DSNUTF8",
+					"Docs": "If set, this message is a DSN and this is a version using utf-8, for the case the remote MTA supports smtputf8. In this case, Size and MsgPrefix are not relevant.",
+					"Typewords": [
+						"[]",
+						"uint8"
+					]
+				},
+				{
+					"Name": "Transport",
+					"Docs": "If non-empty, the transport to use for this message. Can be set through cli or admin interface. If empty (the default for a submitted message), regular routing rules apply.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "RequireTLS",
+					"Docs": "RequireTLS influences TLS verification during delivery.  If nil, the recipient domain policy is followed (MTA-STS and/or DANE), falling back to optional opportunistic non-verified STARTTLS.  If RequireTLS is true (through SMTP REQUIRETLS extension or webmail submit), MTA-STS or DANE is required, as well as REQUIRETLS support by the next hop server.  If RequireTLS is false (through messag header \"TLS-Required: No\"), the recipient domain's policy is ignored if it does not lead to a successful TLS connection, i.e. falling back to SMTP delivery with unverified STARTTLS or plain text.",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				},
+				{
+					"Name": "FutureReleaseRequest",
+					"Docs": "For DSNs, where the original FUTURERELEASE value must be included as per-message field. This field should be of the form \"for;\" plus interval, or \"until;\" plus utc date-time.",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "IPDomain",
+			"Docs": "IPDomain is an ip address, a domain, or empty.",
+			"Fields": [
+				{
+					"Name": "IP",
+					"Docs": "",
+					"Typewords": [
+						"IP"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebserverConfig",
+			"Docs": "WebserverConfig is the combination of WebDomainRedirects and WebHandlers\nfrom the domains.conf configuration file.",
+			"Fields": [
+				{
+					"Name": "WebDNSDomainRedirects",
+					"Docs": "From server to frontend.",
+					"Typewords": [
+						"[]",
+						"[]",
+						"Domain"
+					]
+				},
+				{
+					"Name": "WebDomainRedirects",
+					"Docs": "From frontend to server, it's not convenient to create dns.Domain in the frontend.",
+					"Typewords": [
+						"[]",
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "WebHandlers",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"WebHandler"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebHandler",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "LogName",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "PathRegexp",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DontRedirectPlainHTTP",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Compress",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "WebStatic",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"WebStatic"
+					]
+				},
+				{
+					"Name": "WebRedirect",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"WebRedirect"
+					]
+				},
+				{
+					"Name": "WebForward",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"WebForward"
+					]
+				},
+				{
+					"Name": "Name",
+					"Docs": "Either LogName, or numeric index if LogName was empty. Used instead of LogName in logging/metrics.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DNSDomain",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebStatic",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "StripPrefix",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Root",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ListFiles",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "ContinueNotFound",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "ResponseHeaders",
+					"Docs": "",
+					"Typewords": [
+						"{}",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebRedirect",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "BaseURL",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "OrigPathRegexp",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ReplacePath",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "StatusCode",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				}
+			]
+		},
+		{
+			"Name": "WebForward",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "StripPath",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "URL",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "ResponseHeaders",
+					"Docs": "",
+					"Typewords": [
+						"{}",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Transport",
+			"Docs": "Transport is a method to delivery a message. At most one of the fields can\nbe non-nil. The non-nil field represents the type of transport. For a\ntransport with all fields nil, regular email delivery is done.",
+			"Fields": [
+				{
+					"Name": "Submissions",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"TransportSMTP"
+					]
+				},
+				{
+					"Name": "Submission",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"TransportSMTP"
+					]
+				},
+				{
+					"Name": "SMTP",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"TransportSMTP"
+					]
+				},
+				{
+					"Name": "Socks",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"TransportSocks"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TransportSMTP",
+			"Docs": "TransportSMTP delivers messages by \"submission\" (SMTP, typically\nauthenticated) to the queue of a remote host (smarthost), or by relaying\n(SMTP, typically unauthenticated).",
+			"Fields": [
+				{
+					"Name": "Host",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Port",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "STARTTLSInsecureSkipVerify",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "NoSTARTTLS",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Auth",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"SMTPAuth"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SMTPAuth",
+			"Docs": "SMTPAuth hold authentication credentials used when delivering messages\nthrough a smarthost.",
+			"Fields": [
+				{
+					"Name": "Username",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Password",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Mechanisms",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TransportSocks",
+			"Docs": "",
+			"Fields": [
+				{
+					"Name": "Address",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "RemoteIPs",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "RemoteHostname",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "EvaluationStat",
+			"Docs": "EvaluationStat summarizes stored evaluations, for inclusion in an upcoming\naggregate report, for a domain.",
+			"Fields": [
+				{
+					"Name": "Domain",
+					"Docs": "",
+					"Typewords": [
+						"Domain"
+					]
+				},
+				{
+					"Name": "Dispositions",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "Count",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "SendReport",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				}
+			]
+		},
+		{
+			"Name": "Evaluation",
+			"Docs": "Evaluation is the result of an evaluation of a DMARC policy, to be included\nin a DMARC report.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "PolicyDomain",
+					"Docs": "Domain where DMARC policy was found, could be the organizational domain while evaluation was for a subdomain. Unicode. Same as domain found in PolicyPublished. A separate field for its index.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Evaluated",
+					"Docs": "Time of evaluation, determines which report (covering whole hours) this evaluation will be included in.",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Optional",
+					"Docs": "If optional, this evaluation is not a reason to send a DMARC report, but it will be included when a report is sent due to other non-optional evaluations. Set for evaluations of incoming DMARC reports. We don't want such deliveries causing us to send a report, or we would keep exchanging reporting messages forever. Also set for when evaluation is a DMARC reject for domains we haven't positively interacted with, to prevent being used to flood an unsuspecting domain with reports.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "IntervalHours",
+					"Docs": "Effective aggregate reporting interval in hours. Between 1 and 24, rounded up from seconds from policy to first number that can divide 24.",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "Addresses",
+					"Docs": "\"rua\" in DMARC record, we only store evaluations for records with aggregate reporting addresses, so always non-empty.",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "PolicyPublished",
+					"Docs": "Policy used for evaluation. We don't store the \"fo\" field for failure reporting options, since we don't send failure reports for individual messages.",
+					"Typewords": [
+						"PolicyPublished"
+					]
+				},
+				{
+					"Name": "SourceIP",
+					"Docs": "For \"row\" in a report record.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Disposition",
+					"Docs": "",
+					"Typewords": [
+						"Disposition"
+					]
+				},
+				{
+					"Name": "AlignedDKIMPass",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "AlignedSPFPass",
+					"Docs": "",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "OverrideReasons",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"PolicyOverrideReason"
+					]
+				},
+				{
+					"Name": "EnvelopeTo",
+					"Docs": "For \"identifiers\" in a report record.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "EnvelopeFrom",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "HeaderFrom",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DKIMResults",
+					"Docs": "For \"auth_results\" in a report record.",
+					"Typewords": [
+						"[]",
+						"DKIMAuthResult"
+					]
+				},
+				{
+					"Name": "SPFResults",
+					"Docs": "",
+					"Typewords": [
+						"[]",
+						"SPFAuthResult"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SuppressAddress",
+			"Docs": "SuppressAddress is a reporting address for which outgoing DMARC reports\nwill be suppressed for a period.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Inserted",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "ReportingAddress",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Until",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Comment",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSResult",
+			"Docs": "TLSResult is stored in the database to track TLS results per policy domain, day\nand recipient domain. These records will be included in TLS reports.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "PolicyDomain",
+					"Docs": "Domain potentially with TLSRPT DNS record, with addresses that will receive reports. Either a recipient domain (for MTA-STS policies) or an (MX) host (for DANE policies). Unicode.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "DayUTC",
+					"Docs": "DayUTC is of the form yyyymmdd.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "RecipientDomain",
+					"Docs": "Reports are sent per recipient domain and per MX host. For reports to a recipient domain, we type send a result for MTA-STS and one or more MX host (DANE) results. Unicode.",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Created",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Updated",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "IsHost",
+					"Docs": "Result is for MX host (DANE), not recipient domain (MTA-STS).",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "SendReport",
+					"Docs": "Whether to send a report. TLS results for delivering messages with TLS reports will be recorded, but will not cause a report to be sent.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "SentToRecipientDomain",
+					"Docs": "Set after sending to recipient domain, before sending results to policy domain (after which the record is removed).",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "RecipientDomainReportingAddresses",
+					"Docs": "Reporting addresses from the recipient domain TLSRPT record, not necessarily those we sent to (e.g. due to failure). Used to leave results to MX target (DANE) policy domains out that were already sent in the report to the recipient domain, so we don't report twice.",
+					"Typewords": [
+						"[]",
+						"string"
+					]
+				},
+				{
+					"Name": "SentToPolicyDomain",
+					"Docs": "Set after sending report to policy domain.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Results",
+					"Docs": "Results is updated for each TLS attempt.",
+					"Typewords": [
+						"[]",
+						"Result"
+					]
+				}
+			]
+		},
+		{
+			"Name": "TLSRPTSuppressAddress",
+			"Docs": "TLSRPTSuppressAddress is a reporting address for which outgoing TLS reports\nwill be suppressed for a period.",
+			"Fields": [
+				{
+					"Name": "ID",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Inserted",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "ReportingAddress",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Until",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Comment",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		}
+	],
+	"Ints": [],
+	"Strings": [
+		{
+			"Name": "CSRFToken",
+			"Docs": "",
+			"Values": null
+		},
+		{
+			"Name": "DMARCPolicy",
+			"Docs": "Policy as used in DMARC DNS record for \"p=\" or \"sp=\".",
+			"Values": [
+				{
+					"Name": "PolicyEmpty",
+					"Value": "",
+					"Docs": "Only for the optional Record.SubdomainPolicy."
+				},
+				{
+					"Name": "PolicyNone",
+					"Value": "none",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyQuarantine",
+					"Value": "quarantine",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyReject",
+					"Value": "reject",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "Align",
+			"Docs": "Align specifies the required alignment of a domain name.",
+			"Values": [
+				{
+					"Name": "AlignStrict",
+					"Value": "s",
+					"Docs": "Strict requires an exact domain name match."
+				},
+				{
+					"Name": "AlignRelaxed",
+					"Value": "r",
+					"Docs": "Relaxed requires either an exact or subdomain name match."
+				}
+			]
+		},
+		{
+			"Name": "RUA",
+			"Docs": "RUA is a reporting address with scheme and special characters \",\", \"!\" and\n\";\" not encoded.",
+			"Values": null
+		},
+		{
+			"Name": "Mode",
+			"Docs": "Mode indicates how the policy should be interpreted.",
+			"Values": [
+				{
+					"Name": "ModeEnforce",
+					"Value": "enforce",
+					"Docs": "Policy must be followed, i.e. deliveries must fail if a TLS connection cannot be made."
+				},
+				{
+					"Name": "ModeTesting",
+					"Value": "testing",
+					"Docs": "In case TLS cannot be negotiated, plain SMTP can be used, but failures must be reported, e.g. with TLSRPT."
+				},
+				{
+					"Name": "ModeNone",
+					"Value": "none",
+					"Docs": "In case MTA-STS is not or no longer implemented."
+				}
+			]
+		},
+		{
+			"Name": "PolicyType",
+			"Docs": "PolicyType indicates the policy success/failure results are for.",
+			"Values": [
+				{
+					"Name": "TLSA",
+					"Value": "tlsa",
+					"Docs": "For DANE, against a mail host (not recipient domain)."
+				},
+				{
+					"Name": "STS",
+					"Value": "sts",
+					"Docs": "For MTA-STS, against a recipient domain (not a mail host)."
+				},
+				{
+					"Name": "NoPolicyFound",
+					"Value": "no-policy-found",
+					"Docs": "Recipient domain did not have MTA-STS policy, or mail host (TSLA base domain)\ndid not have DANE TLSA records."
+				}
+			]
+		},
+		{
+			"Name": "ResultType",
+			"Docs": "ResultType represents a TLS error.",
+			"Values": [
+				{
+					"Name": "ResultSTARTTLSNotSupported",
+					"Value": "starttls-not-supported",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultCertificateHostMismatch",
+					"Value": "certificate-host-mismatch",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultCertificateExpired",
+					"Value": "certificate-expired",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultTLSAInvalid",
+					"Value": "tlsa-invalid",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultDNSSECInvalid",
+					"Value": "dnssec-invalid",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultDANERequired",
+					"Value": "dane-required",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultCertificateNotTrusted",
+					"Value": "certificate-not-trusted",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultSTSPolicyInvalid",
+					"Value": "sts-policy-invalid",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultSTSWebPKIInvalid",
+					"Value": "sts-webpki-invalid",
+					"Docs": ""
+				},
+				{
+					"Name": "ResultValidationFailure",
+					"Value": "validation-failure",
+					"Docs": "Other error."
+				},
+				{
+					"Name": "ResultSTSPolicyFetch",
+					"Value": "sts-policy-fetch-error",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "Alignment",
+			"Docs": "Alignment is the identifier alignment.",
+			"Values": [
+				{
+					"Name": "AlignmentAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "AlignmentRelaxed",
+					"Value": "r",
+					"Docs": "Subdomains match the DMARC from-domain."
+				},
+				{
+					"Name": "AlignmentStrict",
+					"Value": "s",
+					"Docs": "Only exact from-domain match."
+				}
+			]
+		},
+		{
+			"Name": "Disposition",
+			"Docs": "Disposition is the requested action for a DMARC fail as specified in the\nDMARC policy in DNS.",
+			"Values": [
+				{
+					"Name": "DispositionAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "DispositionNone",
+					"Value": "none",
+					"Docs": ""
+				},
+				{
+					"Name": "DispositionQuarantine",
+					"Value": "quarantine",
+					"Docs": ""
+				},
+				{
+					"Name": "DispositionReject",
+					"Value": "reject",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "DMARCResult",
+			"Docs": "DMARCResult is the final validation and alignment verdict for SPF and DKIM.",
+			"Values": [
+				{
+					"Name": "DMARCAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "DMARCPass",
+					"Value": "pass",
+					"Docs": ""
+				},
+				{
+					"Name": "DMARCFail",
+					"Value": "fail",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "PolicyOverride",
+			"Docs": "PolicyOverride is a reason the requested DMARC policy from the DNS record\nwas not applied.",
+			"Values": [
+				{
+					"Name": "PolicyOverrideForwarded",
+					"Value": "forwarded",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyOverrideSampledOut",
+					"Value": "sampled_out",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyOverrideTrustedForwarder",
+					"Value": "trusted_forwarder",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyOverrideMailingList",
+					"Value": "mailing_list",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyOverrideLocalPolicy",
+					"Value": "local_policy",
+					"Docs": ""
+				},
+				{
+					"Name": "PolicyOverrideOther",
+					"Value": "other",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "DKIMResult",
+			"Docs": "",
+			"Values": [
+				{
+					"Name": "DKIMAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMNone",
+					"Value": "none",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMPass",
+					"Value": "pass",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMFail",
+					"Value": "fail",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMPolicy",
+					"Value": "policy",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMNeutral",
+					"Value": "neutral",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMTemperror",
+					"Value": "temperror",
+					"Docs": ""
+				},
+				{
+					"Name": "DKIMPermerror",
+					"Value": "permerror",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "SPFDomainScope",
+			"Docs": "",
+			"Values": [
+				{
+					"Name": "SPFDomainScopeAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFDomainScopeHelo",
+					"Value": "helo",
+					"Docs": "SMTP EHLO"
+				},
+				{
+					"Name": "SPFDomainScopeMailFrom",
+					"Value": "mfrom",
+					"Docs": "SMTP \"MAIL FROM\"."
+				}
+			]
+		},
+		{
+			"Name": "SPFResult",
+			"Docs": "",
+			"Values": [
+				{
+					"Name": "SPFAbsent",
+					"Value": "",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFNone",
+					"Value": "none",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFNeutral",
+					"Value": "neutral",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFPass",
+					"Value": "pass",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFFail",
+					"Value": "fail",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFSoftfail",
+					"Value": "softfail",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFTemperror",
+					"Value": "temperror",
+					"Docs": ""
+				},
+				{
+					"Name": "SPFPermerror",
+					"Value": "permerror",
+					"Docs": ""
+				}
+			]
+		},
+		{
+			"Name": "Localpart",
+			"Docs": "Localpart is a decoded local part of an email address, before the \"@\".\nFor quoted strings, values do not hold the double quote or escaping backslashes.\nAn empty string can be a valid localpart.",
+			"Values": null
+		},
+		{
+			"Name": "IP",
+			"Docs": "An IP is a single IP address, a slice of bytes.\nFunctions in this package accept either 4-byte (IPv4)\nor 16-byte (IPv6) slices as input.\n\nNote that in this documentation, referring to an\nIP address as an IPv4 address or an IPv6 address\nis a semantic property of the address, not just the\nlength of the byte slice: a 16-byte slice can still\nbe an IPv4 address.",
+			"Values": []
+		}
+	],
+	"SherpaVersion": 0,
+	"SherpadocVersion": 1
+}

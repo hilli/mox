@@ -4,16 +4,20 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mjl-/bstore"
 
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/publicsuffix"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/store"
 )
+
+var pkglog = mlog.New("smtpserver", nil)
 
 func TestReputation(t *testing.T) {
 	boolptr := func(v bool) *bool {
@@ -24,6 +28,8 @@ func TestReputation(t *testing.T) {
 
 	now := time.Now()
 	var uidgen store.UID
+
+	log := mlog.New("smtpserver", nil)
 
 	message := func(junk bool, ageDays int, ehlo, mailfrom, msgfrom, rcptto string, msgfromvalidation store.Validation, dkimDomains []string, mailfromValid, ehloValid bool, ip string) store.Message {
 
@@ -76,7 +82,7 @@ func TestReputation(t *testing.T) {
 
 			MsgFromLocalpart: msgFrom.Localpart,
 			MsgFromDomain:    msgFrom.Domain.Name(),
-			MsgFromOrgDomain: publicsuffix.Lookup(ctxbg, msgFrom.Domain).Name(),
+			MsgFromOrgDomain: publicsuffix.Lookup(ctxbg, log.Logger, msgFrom.Domain).Name(),
 
 			MailFromValidated: mailfromValid,
 			EHLOValidated:     ehloValid,
@@ -99,7 +105,7 @@ func TestReputation(t *testing.T) {
 	check := func(m store.Message, history []store.Message, expJunk *bool, expConclusive bool, expMethod reputationMethod) {
 		t.Helper()
 
-		p := "../testdata/smtpserver-reputation.db"
+		p := filepath.FromSlash("../testdata/smtpserver-reputation.db")
 		defer os.Remove(p)
 
 		db, err := bstore.Open(ctxbg, p, &bstore.Options{Timeout: 5 * time.Second}, store.DBTypes...)
@@ -107,20 +113,24 @@ func TestReputation(t *testing.T) {
 		defer db.Close()
 
 		err = db.Write(ctxbg, func(tx *bstore.Tx) error {
-			err = tx.Insert(&store.Mailbox{ID: 1, Name: "Inbox"})
+			inbox := store.Mailbox{ID: 1, Name: "Inbox", HaveCounts: true}
+			err = tx.Insert(&inbox)
 			tcheck(t, err, "insert into db")
 
 			for _, hm := range history {
 				err := tx.Insert(&hm)
 				tcheck(t, err, "insert message")
+				inbox.Add(hm.MailboxCounts())
 
 				rcptToDomain, err := dns.ParseDomain(hm.RcptToDomain)
 				tcheck(t, err, "parse rcptToDomain")
-				rcptToOrgDomain := publicsuffix.Lookup(ctxbg, rcptToDomain)
+				rcptToOrgDomain := publicsuffix.Lookup(ctxbg, log.Logger, rcptToDomain)
 				r := store.Recipient{MessageID: hm.ID, Localpart: hm.RcptToLocalpart, Domain: hm.RcptToDomain, OrgDomain: rcptToOrgDomain.Name(), Sent: hm.Received}
 				err = tx.Insert(&r)
 				tcheck(t, err, "insert recipient")
 			}
+			err = tx.Update(&inbox)
+			tcheck(t, err, "update mailbox counts")
 
 			return nil
 		})
@@ -131,7 +141,7 @@ func TestReputation(t *testing.T) {
 		var method reputationMethod
 		err = db.Read(ctxbg, func(tx *bstore.Tx) error {
 			var err error
-			isjunk, conclusive, method, err = reputation(tx, xlog, &m)
+			isjunk, conclusive, method, err = reputation(tx, pkglog, &m)
 			return err
 		})
 		tcheck(t, err, "read tx")

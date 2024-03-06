@@ -9,14 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/mjl-/mox/message"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/moxio"
 )
 
-var ErrNoReport = errors.New("no dmarc report found in message")
+var ErrNoReport = errors.New("no dmarc aggregate report found in message")
 
 // ParseReport parses an XML aggregate feedback report.
 // The maximum report size is 20MB.
@@ -33,17 +35,18 @@ func ParseReport(r io.Reader) (*Feedback, error) {
 // ParseMessageReport parses an aggregate feedback report from a mail message. The
 // maximum message size is 15MB, the maximum report size after decompression is
 // 20MB.
-func ParseMessageReport(r io.ReaderAt) (*Feedback, error) {
+func ParseMessageReport(elog *slog.Logger, r io.ReaderAt) (*Feedback, error) {
+	log := mlog.New("dmarcrpt", elog)
 	// ../rfc/7489:1801
-	p, err := message.Parse(&moxio.LimitAtReader{R: r, Limit: 15 * 1024 * 1024})
+	p, err := message.Parse(log.Logger, true, &moxio.LimitAtReader{R: r, Limit: 15 * 1024 * 1024})
 	if err != nil {
 		return nil, fmt.Errorf("parsing mail message: %s", err)
 	}
 
-	return parseMessageReport(p)
+	return parseMessageReport(log, p)
 }
 
-func parseMessageReport(p message.Part) (*Feedback, error) {
+func parseMessageReport(log mlog.Log, p message.Part) (*Feedback, error) {
 	// Pretty much any mime structure is allowed. ../rfc/7489:1861
 	// In practice, some parties will send the report as the only (non-multipart)
 	// content of the message.
@@ -53,14 +56,14 @@ func parseMessageReport(p message.Part) (*Feedback, error) {
 	}
 
 	for {
-		sp, err := p.ParseNextPart()
+		sp, err := p.ParseNextPart(log.Logger)
 		if err == io.EOF {
 			return nil, ErrNoReport
 		}
 		if err != nil {
 			return nil, err
 		}
-		report, err := parseMessageReport(*sp)
+		report, err := parseMessageReport(log, *sp)
 		if err == ErrNoReport {
 			continue
 		} else if err != nil || report != nil {
@@ -74,7 +77,7 @@ func parseReport(p message.Part) (*Feedback, error) {
 	r := p.Reader()
 
 	// If no (useful) content-type is set, try to detect it.
-	if ct == "" || ct == "application/octect-stream" {
+	if ct == "" || ct == "application/octet-stream" {
 		data := make([]byte, 512)
 		n, err := io.ReadFull(r, data)
 		if err == io.EOF {
@@ -91,7 +94,7 @@ func parseReport(p message.Part) (*Feedback, error) {
 	case "application/zip":
 		// Google sends messages with direct application/zip content-type.
 		return parseZip(r)
-	case "application/gzip":
+	case "application/gzip", "application/x-gzip":
 		gzr, err := gzip.NewReader(r)
 		if err != nil {
 			return nil, fmt.Errorf("decoding gzip xml report: %s", err)

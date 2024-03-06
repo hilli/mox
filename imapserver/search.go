@@ -2,14 +2,13 @@ package imapserver
 
 import (
 	"fmt"
-	"io"
+	"log/slog"
 	"net/textproto"
 	"strings"
 
 	"github.com/mjl-/bstore"
 
 	"github.com/mjl-/mox/message"
-	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/store"
 )
 
@@ -77,6 +76,45 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 		c.searchResult = []store.UID{}
 	}
 
+	// We gather word and not-word searches from the top-level, turn them
+	// into a WordSearch for a more efficient search.
+	// todo optimize: also gather them out of AND searches.
+	var textWords, textNotWords, bodyWords, bodyNotWords []string
+	n := 0
+	for _, xsk := range sk.searchKeys {
+		switch xsk.op {
+		case "BODY":
+			bodyWords = append(bodyWords, xsk.astring)
+			continue
+		case "TEXT":
+			textWords = append(textWords, xsk.astring)
+			continue
+		case "NOT":
+			switch xsk.searchKey.op {
+			case "BODY":
+				bodyNotWords = append(bodyNotWords, xsk.searchKey.astring)
+				continue
+			case "TEXT":
+				textNotWords = append(textNotWords, xsk.searchKey.astring)
+				continue
+			}
+		}
+		sk.searchKeys[n] = xsk
+		n++
+	}
+	// We may be left with an empty but non-nil sk.searchKeys, which is important for
+	// matching.
+	sk.searchKeys = sk.searchKeys[:n]
+	var bodySearch, textSearch *store.WordSearch
+	if len(bodyWords) > 0 || len(bodyNotWords) > 0 {
+		ws := store.PrepareWordSearch(bodyWords, bodyNotWords)
+		bodySearch = &ws
+	}
+	if len(textWords) > 0 || len(textNotWords) > 0 {
+		ws := store.PrepareWordSearch(textWords, textNotWords)
+		textSearch = &ws
+	}
+
 	// Note: we only hold the account rlock for verifying the mailbox at the start.
 	c.account.RLock()
 	runlock := c.account.RUnlock
@@ -96,6 +134,7 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 	}
 
 	var expungeIssued bool
+	var maxModSeq store.ModSeq
 
 	var uids []store.UID
 	c.xdbread(func(tx *bstore.Tx) {
@@ -108,8 +147,11 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 		if eargs == nil || max == 0 || len(eargs) != 1 {
 			for i, uid := range c.uids {
 				lastIndex = i
-				if c.searchMatch(tx, msgseq(i+1), uid, *sk, &expungeIssued) {
+				if match, modseq := c.searchMatch(tx, msgseq(i+1), uid, *sk, bodySearch, textSearch, &expungeIssued); match {
 					uids = append(uids, uid)
+					if modseq > maxModSeq {
+						maxModSeq = modseq
+					}
 					if min == 1 && min+max == len(eargs) {
 						break
 					}
@@ -119,8 +161,11 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 		// And reverse search for MAX if we have only MAX or MAX combined with MIN.
 		if max == 1 && (len(eargs) == 1 || min+max == len(eargs)) {
 			for i := len(c.uids) - 1; i > lastIndex; i-- {
-				if c.searchMatch(tx, msgseq(i+1), c.uids[i], *sk, &expungeIssued) {
+				if match, modseq := c.searchMatch(tx, msgseq(i+1), c.uids[i], *sk, bodySearch, textSearch, &expungeIssued); match {
 					uids = append(uids, c.uids[i])
+					if modseq > maxModSeq {
+						maxModSeq = modseq
+					}
 					break
 				}
 			}
@@ -128,6 +173,11 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 	})
 
 	if eargs == nil {
+		// In IMAP4rev1, an untagged SEARCH response is required. ../rfc/3501:2728
+		if len(uids) == 0 {
+			c.bwritelinef("* SEARCH")
+		}
+
 		// Old-style SEARCH response. We must spell out each number. So we may be splitting
 		// into multiple responses. ../rfc/9051:6809 ../rfc/3501:4833
 		for len(uids) > 0 {
@@ -142,11 +192,24 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 				}
 				s += " " + fmt.Sprintf("%d", v)
 			}
+
+			// Since we don't have the max modseq for the possibly partial uid range we're
+			// writing here within hand reach, we conveniently interpret the ambiguous "for all
+			// messages being returned" in ../rfc/7162:1107 as meaning over all lines that we
+			// write. And that clients only commit this value after they have seen the tagged
+			// end of the command. Appears to be recommended behaviour, ../rfc/7162:2323.
+			// ../rfc/7162:1077 ../rfc/7162:1101
+			var modseq string
+			if sk.hasModseq() {
+				// ../rfc/7162:2557
+				modseq = fmt.Sprintf(" (MODSEQ %d)", maxModSeq.Client())
+			}
+
+			c.bwritelinef("* SEARCH%s%s", s, modseq)
 			uids = uids[n:]
-			c.bwritelinef("* SEARCH%s", s)
 		}
 	} else {
-		// New-style ESEARCH response. ../rfc/9051:6546 ../rfc/4466:522
+		// New-style ESEARCH response syntax: ../rfc/9051:6546 ../rfc/4466:522
 
 		if save {
 			// ../rfc/9051:3784 ../rfc/5182:13
@@ -158,7 +221,9 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 
 		// No untagged ESEARCH response if nothing was requested. ../rfc/9051:4160
 		if len(eargs) > 0 {
-			resp := fmt.Sprintf("* ESEARCH (TAG %s)", tag)
+			// The tag was originally a string, became an astring in IMAP4rev2, better stick to
+			// string. ../rfc/4466:707 ../rfc/5259:1163 ../rfc/9051:7087
+			resp := fmt.Sprintf(`* ESEARCH (TAG "%s")`, tag)
 			if isUID {
 				resp += " UID"
 			}
@@ -190,6 +255,13 @@ func (c *conn) cmdxSearch(isUID bool, tag, cmd string, p *parser) {
 			if eargs["ALL"] && len(uids) > 0 {
 				resp += fmt.Sprintf(" ALL %s", compactUIDSet(uids).String())
 			}
+
+			// Interaction between ESEARCH and CONDSTORE: ../rfc/7162:1211 ../rfc/4731:273
+			// Summary: send the highest modseq of the returned messages.
+			if sk.hasModseq() && len(uids) > 0 {
+				resp += fmt.Sprintf(" MODSEQ %d", maxModSeq.Client())
+			}
+
 			c.bwritelinef("%s", resp)
 		}
 	}
@@ -210,10 +282,11 @@ type search struct {
 	m             store.Message
 	p             *message.Part
 	expungeIssued *bool
+	hasModseq     bool
 }
 
-func (c *conn) searchMatch(tx *bstore.Tx, seq msgseq, uid store.UID, sk searchKey, expungeIssued *bool) bool {
-	s := search{c: c, tx: tx, seq: seq, uid: uid, expungeIssued: expungeIssued}
+func (c *conn) searchMatch(tx *bstore.Tx, seq msgseq, uid store.UID, sk searchKey, bodySearch, textSearch *store.WordSearch, expungeIssued *bool) (bool, store.ModSeq) {
+	s := search{c: c, tx: tx, seq: seq, uid: uid, expungeIssued: expungeIssued, hasModseq: sk.hasModseq()}
 	defer func() {
 		if s.mr != nil {
 			err := s.mr.Close()
@@ -221,15 +294,93 @@ func (c *conn) searchMatch(tx *bstore.Tx, seq msgseq, uid store.UID, sk searchKe
 			s.mr = nil
 		}
 	}()
-	return s.match(sk)
+	return s.match(sk, bodySearch, textSearch)
 }
 
-func (s *search) match(sk searchKey) bool {
+func (s *search) match(sk searchKey, bodySearch, textSearch *store.WordSearch) (match bool, modseq store.ModSeq) {
+	// Instead of littering all the cases in match0 with calls to get modseq, we do it once
+	// here in case of a match.
+	defer func() {
+		if match && s.hasModseq {
+			if s.m.ID == 0 {
+				match = s.xensureMessage()
+			}
+			modseq = s.m.ModSeq
+		}
+	}()
+
+	match = s.match0(sk)
+	if match && bodySearch != nil {
+		if !s.xensurePart() {
+			match = false
+			return
+		}
+		var err error
+		match, err = bodySearch.MatchPart(s.c.log, s.p, false)
+		xcheckf(err, "search words in bodies")
+	}
+	if match && textSearch != nil {
+		if !s.xensurePart() {
+			match = false
+			return
+		}
+		var err error
+		match, err = textSearch.MatchPart(s.c.log, s.p, true)
+		xcheckf(err, "search words in headers and bodies")
+	}
+	return
+}
+
+func (s *search) xensureMessage() bool {
+	if s.m.ID > 0 {
+		return true
+	}
+
+	q := bstore.QueryTx[store.Message](s.tx)
+	q.FilterNonzero(store.Message{MailboxID: s.c.mailboxID, UID: s.uid})
+	m, err := q.Get()
+	if err == bstore.ErrAbsent || err == nil && m.Expunged {
+		// ../rfc/2180:607
+		*s.expungeIssued = true
+		return false
+	}
+	xcheckf(err, "get message")
+	s.m = m
+	return true
+}
+
+// ensure message, reader and part are loaded. returns whether that was
+// successful.
+func (s *search) xensurePart() bool {
+	if s.mr != nil {
+		return s.p != nil
+	}
+
+	if !s.xensureMessage() {
+		return false
+	}
+
+	// Closed by searchMatch after all (recursive) search.match calls are finished.
+	s.mr = s.c.account.MessageReader(s.m)
+
+	if s.m.ParsedBuf == nil {
+		s.c.log.Error("missing parsed message")
+		return false
+	}
+	p, err := s.m.LoadPart(s.mr)
+	xcheckf(err, "load parsed message")
+	s.p = &p
+	return true
+}
+
+func (s *search) match0(sk searchKey) bool {
 	c := s.c
 
+	// Difference between sk.searchKeys nil and length 0 is important. Because we take
+	// out word/notword searches, the list may be empty but non-nil.
 	if sk.searchKeys != nil {
 		for _, ssk := range sk.searchKeys {
-			if !s.match(ssk) {
+			if !s.match0(ssk) {
 				return false
 			}
 		}
@@ -242,7 +393,7 @@ func (s *search) match(sk searchKey) bool {
 		lower := strings.ToLower(value)
 		h, err := s.p.Header()
 		if err != nil {
-			c.log.Debugx("parsing message header", err, mlog.Field("uid", s.uid))
+			c.log.Debugx("parsing message header", err, slog.Any("uid", s.uid))
 			return false
 		}
 		for _, v := range h.Values(field) {
@@ -268,36 +419,16 @@ func (s *search) match(sk searchKey) bool {
 		// We do not implement the RECENT flag. All messages are not recent.
 		return false
 	case "NOT":
-		return !s.match(*sk.searchKey)
+		return !s.match0(*sk.searchKey)
 	case "OR":
-		return s.match(*sk.searchKey) || s.match(*sk.searchKey2)
+		return s.match0(*sk.searchKey) || s.match0(*sk.searchKey2)
 	case "UID":
 		return sk.uidSet.containsUID(s.uid, c.uids, c.searchResult)
 	}
 
-	// Parsed message.
-	if s.mr == nil {
-		q := bstore.QueryTx[store.Message](s.tx)
-		q.FilterNonzero(store.Message{MailboxID: c.mailboxID, UID: s.uid})
-		m, err := q.Get()
-		if err == bstore.ErrAbsent {
-			// ../rfc/2180:607
-			*s.expungeIssued = true
-			return false
-		}
-		xcheckf(err, "get message")
-		s.m = m
-
-		// Closed by searchMatch after all (recursive) search.match calls are finished.
-		s.mr = c.account.MessageReader(m)
-
-		if m.ParsedBuf == nil {
-			c.log.Error("missing parsed message")
-		} else {
-			p, err := m.LoadPart(s.mr)
-			xcheckf(err, "load parsed message")
-			s.p = &p
-		}
+	// Parsed part.
+	if !s.xensurePart() {
+		return false
 	}
 
 	// Parsed message, basic info.
@@ -380,10 +511,13 @@ func (s *search) match(sk searchKey) bool {
 		return s.m.Size > sk.number
 	case "SMALLER":
 		return s.m.Size < sk.number
+	case "MODSEQ":
+		// ../rfc/7162:1045
+		return s.m.ModSeq.Client() >= *sk.clientModseq
 	}
 
 	if s.p == nil {
-		c.log.Info("missing parsed message, not matching", mlog.Field("uid", s.uid))
+		c.log.Info("missing parsed message, not matching", slog.Any("uid", s.uid))
 		return false
 	}
 
@@ -392,9 +526,13 @@ func (s *search) match(sk searchKey) bool {
 	case "BCC":
 		return filterHeader("Bcc", sk.astring)
 	case "BODY", "TEXT":
+		// We gathered word/notword searches from the top-level, but we can also get them
+		// nested.
+		// todo optimize: handle deeper nested word/not-word searches more efficiently.
 		headerToo := sk.op == "TEXT"
-		lower := strings.ToLower(sk.astring)
-		return mailContains(c, s.uid, s.p, lower, headerToo)
+		match, err := store.PrepareWordSearch([]string{sk.astring}, nil).MatchPart(s.c.log, s.p, headerToo)
+		xcheckf(err, "word search")
+		return match
 	case "CC":
 		return filterHeader("Cc", sk.astring)
 	case "FROM":
@@ -408,7 +546,7 @@ func (s *search) match(sk searchKey) bool {
 		lower := strings.ToLower(sk.astring)
 		h, err := s.p.Header()
 		if err != nil {
-			c.log.Errorx("parsing header for search", err, mlog.Field("uid", s.uid))
+			c.log.Errorx("parsing header for search", err, slog.Any("uid", s.uid))
 			return false
 		}
 		k := textproto.CanonicalMIMEHeaderKey(sk.headerField)
@@ -435,39 +573,4 @@ func (s *search) match(sk searchKey) bool {
 		panic("missing case")
 	}
 	panic(serverError{fmt.Errorf("missing case for search key op %q", sk.op)})
-}
-
-// mailContains returns whether the mail message or part represented by p contains (case-insensitive) string lower.
-// The (decoded) text bodies are tested for a match.
-// If headerToo is set, the header part of the message is checked as well.
-func mailContains(c *conn, uid store.UID, p *message.Part, lower string, headerToo bool) bool {
-	if headerToo && mailContainsReader(c, uid, p.HeaderReader(), lower) {
-		return true
-	}
-
-	if len(p.Parts) == 0 {
-		if p.MediaType != "TEXT" {
-			// todo: for types we could try to find a library for parsing and search in there too
-			return false
-		}
-		// todo: for html and perhaps other types, we could try to parse as text and filter on the text.
-		return mailContainsReader(c, uid, p.Reader(), lower)
-	}
-	for _, pp := range p.Parts {
-		headerToo = pp.MediaType == "MESSAGE" && (pp.MediaSubType == "RFC822" || pp.MediaSubType == "GLOBAL")
-		if mailContains(c, uid, &pp, lower, headerToo) {
-			return true
-		}
-	}
-	return false
-}
-
-func mailContainsReader(c *conn, uid store.UID, r io.Reader, lower string) bool {
-	// todo: match as we read
-	buf, err := io.ReadAll(r)
-	if err != nil {
-		c.log.Errorx("reading for search text match", err, mlog.Field("uid", uid))
-		return false
-	}
-	return strings.Contains(strings.ToLower(string(buf)), lower)
 }

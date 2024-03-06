@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -27,10 +29,8 @@ import (
 )
 
 var (
-	xlog = mlog.New("junk")
-
-	errBadContentType = errors.New("bad content-type") // sure sign of spam
-	errClosed         = errors.New("filter is closed")
+	// errBadContentType = errors.New("bad content-type") // sure sign of spam, todo: use this error
+	errClosed = errors.New("filter is closed")
 )
 
 type word struct {
@@ -61,7 +61,7 @@ var DBTypes = []any{wordscore{}} // Stored in DB.
 type Filter struct {
 	Params
 
-	log               *mlog.Log // For logging cid.
+	log               mlog.Log // For logging cid.
 	closed            bool
 	modified          bool            // Whether any modifications are pending. Cleared by Save.
 	hams, spams       uint32          // Message count, stored in db under word "-".
@@ -111,7 +111,7 @@ func (f *Filter) Close() error {
 	return err
 }
 
-func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloomPath string, loadBloom bool) (*Filter, error) {
+func OpenFilter(ctx context.Context, log mlog.Log, params Params, dbPath, bloomPath string, loadBloom bool) (*Filter, error) {
 	var bloom *Bloom
 	if loadBloom {
 		var err error
@@ -159,7 +159,7 @@ func OpenFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloom
 // filter is marked as new until the first save, will be done automatically if
 // TrainDirs is called. If the bloom and/or database files exist, an error is
 // returned.
-func NewFilter(ctx context.Context, log *mlog.Log, params Params, dbPath, bloomPath string) (*Filter, error) {
+func NewFilter(ctx context.Context, log mlog.Log, params Params, dbPath, bloomPath string) (*Filter, error) {
 	var err error
 	if _, err := os.Stat(bloomPath); err == nil {
 		return nil, fmt.Errorf("bloom filter already exists on disk: %s", bloomPath)
@@ -219,7 +219,7 @@ func openBloom(path string) (*Bloom, error) {
 	return NewBloom(buf, bloomK)
 }
 
-func newDB(ctx context.Context, log *mlog.Log, path string) (db *bstore.DB, rerr error) {
+func newDB(ctx context.Context, log mlog.Log, path string) (db *bstore.DB, rerr error) {
 	// Remove any existing files.
 	os.Remove(path)
 
@@ -271,7 +271,7 @@ func (f *Filter) Save() error {
 		return words[i] < words[j]
 	})
 
-	f.log.Debug("inserting words in junkfilter db", mlog.Field("words", len(f.changed)))
+	f.log.Debug("inserting words in junkfilter db", slog.Any("words", len(f.changed)))
 	// start := time.Now()
 	if f.isNew {
 		if err := f.db.HintAppend(true, wordscore{}); err != nil {
@@ -317,7 +317,7 @@ func (f *Filter) Save() error {
 	f.changed = map[string]word{}
 	f.modified = false
 	f.isNew = false
-	// f.log.Info("wrote filter to db", mlog.Field("duration", time.Since(start)))
+	// f.log.Info("wrote filter to db", slog.Any("duration", time.Since(start)))
 	return nil
 }
 
@@ -377,7 +377,10 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 		expect[w] = struct{}{}
 	}
 	if len(unknowns) > 0 {
-		f.log.Debug("unknown words in bloom filter, showing max 50", mlog.Field("words", unknowns), mlog.Field("totalunknown", totalUnknown), mlog.Field("totalwords", len(words)))
+		f.log.Debug("unknown words in bloom filter, showing max 50",
+			slog.Any("words", unknowns),
+			slog.Any("totalunknown", totalUnknown),
+			slog.Any("totalwords", len(words)))
 	}
 
 	// Fetch words from database.
@@ -390,7 +393,10 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 			delete(expect, w)
 			f.cache[w] = c
 		}
-		f.log.Debug("unknown words in db", mlog.Field("words", expect), mlog.Field("totalunknown", len(expect)), mlog.Field("totalwords", len(words)))
+		f.log.Debug("unknown words in db",
+			slog.Any("words", expect),
+			slog.Any("totalunknown", len(expect)),
+			slog.Any("totalwords", len(words)))
 	}
 
 	for w := range words {
@@ -473,7 +479,7 @@ func (f *Filter) ClassifyWords(ctx context.Context, words map[string]struct{}) (
 		eta += math.Log(1-x.R) - math.Log(x.R)
 	}
 
-	f.log.Debug("top words", mlog.Field("hams", topHam), mlog.Field("spams", topSpam))
+	f.log.Debug("top words", slog.Any("hams", topHam), slog.Any("spams", topSpam))
 
 	prob := 1 / (1 + math.Pow(math.E, eta))
 	return prob, len(topHam), len(topSpam), nil
@@ -501,7 +507,7 @@ func (f *Filter) ClassifyMessagePath(ctx context.Context, path string) (probabil
 }
 
 func (f *Filter) ClassifyMessageReader(ctx context.Context, mf io.ReaderAt, size int64) (probability float64, words map[string]struct{}, nham, nspam int, rerr error) {
-	m, err := message.EnsurePart(mf, size)
+	m, err := message.EnsurePart(f.log.Logger, false, mf, size)
 	if err != nil && errors.Is(err, message.ErrBadContentType) {
 		// Invalid content-type header is a sure sign of spam.
 		//f.log.Infox("parsing content", err)
@@ -567,7 +573,7 @@ func (f *Filter) Train(ctx context.Context, ham bool, words map[string]struct{})
 }
 
 func (f *Filter) TrainMessage(ctx context.Context, r io.ReaderAt, size int64, ham bool) error {
-	p, _ := message.EnsurePart(r, size)
+	p, _ := message.EnsurePart(f.log.Logger, false, r, size)
 	words, err := f.ParseMessage(p)
 	if err != nil {
 		return fmt.Errorf("parsing mail contents: %v", err)
@@ -576,7 +582,7 @@ func (f *Filter) TrainMessage(ctx context.Context, r io.ReaderAt, size int64, ha
 }
 
 func (f *Filter) UntrainMessage(ctx context.Context, r io.ReaderAt, size int64, ham bool) error {
-	p, _ := message.EnsurePart(r, size)
+	p, _ := message.EnsurePart(f.log.Logger, false, r, size)
 	words, err := f.ParseMessage(p)
 	if err != nil {
 		return fmt.Errorf("parsing mail contents: %v", err)
@@ -644,10 +650,10 @@ func (f *Filter) TrainDir(dir string, files []string, ham bool) (n, malformed ui
 	}
 
 	for _, name := range files {
-		p := fmt.Sprintf("%s/%s", dir, name)
+		p := filepath.Join(dir, name)
 		valid, words, err := f.tokenizeMail(p)
 		if err != nil {
-			// f.log.Infox("tokenizing mail", err, mlog.Field("path", p))
+			// f.log.Infox("tokenizing mail", err, slog.Any("path", p))
 			malformed++
 			continue
 		}
@@ -719,21 +725,20 @@ func (f *Filter) TrainDirs(hamDir, sentDir, spamDir string, hamFiles, sentFiles,
 	dbSize := f.fileSize(f.dbPath)
 	bloomSize := f.fileSize(f.bloomPath)
 
-	fields := []mlog.Pair{
-		mlog.Field("hams", hams),
-		mlog.Field("hamtime", tham),
-		mlog.Field("hammalformed", hamMalformed),
-		mlog.Field("sent", sent),
-		mlog.Field("senttime", tsent),
-		mlog.Field("sentmalformed", sentMalformed),
-		mlog.Field("spams", f.spams),
-		mlog.Field("spamtime", tspam),
-		mlog.Field("spammalformed", spamMalformed),
-		mlog.Field("dbsize", fmt.Sprintf("%.1fmb", float64(dbSize)/(1024*1024))),
-		mlog.Field("bloomsize", fmt.Sprintf("%.1fmb", float64(bloomSize)/(1024*1024))),
-		mlog.Field("bloom1ratio", fmt.Sprintf("%.4f", float64(f.bloom.Ones())/float64(len(f.bloom.Bytes())*8))),
-	}
-	xlog.Print("training done", fields...)
+	f.log.Print("training done",
+		slog.Any("hams", hams),
+		slog.Any("hamtime", tham),
+		slog.Any("hammalformed", hamMalformed),
+		slog.Any("sent", sent),
+		slog.Any("senttime", tsent),
+		slog.Any("sentmalformed", sentMalformed),
+		slog.Any("spams", f.spams),
+		slog.Any("spamtime", tspam),
+		slog.Any("spammalformed", spamMalformed),
+		slog.Any("dbsize", fmt.Sprintf("%.1fmb", float64(dbSize)/(1024*1024))),
+		slog.Any("bloomsize", fmt.Sprintf("%.1fmb", float64(bloomSize)/(1024*1024))),
+		slog.Any("bloom1ratio", fmt.Sprintf("%.4f", float64(f.bloom.Ones())/float64(len(f.bloom.Bytes())*8))),
+	)
 
 	return nil
 }
@@ -741,7 +746,7 @@ func (f *Filter) TrainDirs(hamDir, sentDir, spamDir string, hamFiles, sentFiles,
 func (f *Filter) fileSize(p string) int {
 	fi, err := os.Stat(p)
 	if err != nil {
-		f.log.Infox("stat", err, mlog.Field("path", p))
+		f.log.Infox("stat", err, slog.Any("path", p))
 		return 0
 	}
 	return int(fi.Size())

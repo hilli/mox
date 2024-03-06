@@ -1,11 +1,17 @@
 package dmarcrpt
 
 import (
+	"encoding/xml"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/mjl-/mox/mlog"
 )
+
+var pkglog = mlog.New("dmarcrpt", nil)
 
 const reportExample = `<?xml version="1.0" encoding="UTF-8" ?>
 <feedback>
@@ -57,6 +63,7 @@ const reportExample = `<?xml version="1.0" encoding="UTF-8" ?>
 
 func TestParseReport(t *testing.T) {
 	var expect = &Feedback{
+		XMLName: xml.Name{Local: "feedback"},
 		ReportMetadata: ReportMetadata{
 			OrgName:          "google.com",
 			Email:            "noreply-dmarc-support@google.com",
@@ -118,19 +125,19 @@ func TestParseReport(t *testing.T) {
 }
 
 func TestParseMessageReport(t *testing.T) {
-	const dir = "../testdata/dmarc-reports"
+	dir := filepath.FromSlash("../testdata/dmarc-reports")
 	files, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("listing dmarc report emails: %s", err)
+		t.Fatalf("listing dmarc aggregate report emails: %s", err)
 	}
 
 	for _, file := range files {
-		p := dir + "/" + file.Name()
+		p := filepath.Join(dir, file.Name())
 		f, err := os.Open(p)
 		if err != nil {
 			t.Fatalf("open %q: %s", p, err)
 		}
-		_, err = ParseMessageReport(f)
+		_, err = ParseMessageReport(pkglog.Logger, f)
 		if err != nil {
 			t.Fatalf("ParseMessageReport: %q: %s", p, err)
 		}
@@ -138,7 +145,7 @@ func TestParseMessageReport(t *testing.T) {
 	}
 
 	// No report in a non-multipart message.
-	_, err = ParseMessageReport(strings.NewReader("From: <mjl@mox.example>\r\n\r\nNo report.\r\n"))
+	_, err = ParseMessageReport(pkglog.Logger, strings.NewReader("From: <mjl@mox.example>\r\n\r\nNo report.\r\n"))
 	if err != ErrNoReport {
 		t.Fatalf("message without report, got err %#v, expected ErrNoreport", err)
 	}
@@ -164,7 +171,7 @@ MIME-Version: 1.0
 
 --===============5735553800636657282==--
 `, "\n", "\r\n")
-	_, err = ParseMessageReport(strings.NewReader(multipartNoreport))
+	_, err = ParseMessageReport(pkglog.Logger, strings.NewReader(multipartNoreport))
 	if err != ErrNoReport {
 		t.Fatalf("message without report, got err %#v, expected ErrNoreport", err)
 	}

@@ -34,9 +34,22 @@ type JSON struct {
 
 // HandlerOpts are options for creating a new handler.
 type HandlerOpts struct {
-	Collector           Collector // Holds functions for collecting metrics about function calls and other incoming HTTP requests. May be nil.
-	LaxParameterParsing bool      // If enabled, incoming sherpa function calls will ignore unrecognized fields in struct parameters, instead of failing.
-	AdjustFunctionNames string    // If empty, only the first character of function names are lower cased. For "lowerWord", the first string of capitals is lowercased, for "none", the function name is left as is.
+	// Holds functions for collecting metrics about function calls and other incoming
+	// HTTP requests. May be nil.
+	Collector Collector
+
+	// If enabled, incoming sherpa function calls will ignore unrecognized fields in
+	// struct parameters, instead of failing.
+	LaxParameterParsing bool
+
+	// If empty, only the first character of function names are lower cased. For
+	// "lowerWord", the first string of capitals is lowercased, for "none", the
+	// function name is left as is.
+	AdjustFunctionNames string
+
+	// Don't send any CORS headers, and respond to OPTIONS requests with 405 "bad
+	// method".
+	NoCORS bool
 }
 
 // Raw signals a raw JSON response.
@@ -336,7 +349,7 @@ func adjustFunctionNameCapitals(s string, opts HandlerOpts) string {
 
 func gatherFunctions(functions map[string]reflect.Value, t reflect.Type, v reflect.Value, opts HandlerOpts) error {
 	if t.Kind() != reflect.Struct {
-		return fmt.Errorf("sherpa sections must be a struct (not a ptr)")
+		return fmt.Errorf("sherpa sections must be a struct (is %v)", t)
 	}
 	for i := 0; i < t.NumMethod(); i++ {
 		name := adjustFunctionNameCapitals(t.Method(i).Name, opts)
@@ -347,7 +360,11 @@ func gatherFunctions(functions map[string]reflect.Value, t reflect.Type, v refle
 		functions[name] = m
 	}
 	for i := 0; i < t.NumField(); i++ {
-		err := gatherFunctions(functions, t.Field(i).Type, v.Field(i), opts)
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		err := gatherFunctions(functions, f.Type, v.Field(i), opts)
 		if err != nil {
 			return err
 		}
@@ -459,13 +476,16 @@ func validCallback(cb string) bool {
 //   - sherpa.js, a small stand-alone client JavaScript library that makes it trivial to start using this API from a browser.
 //   - functionName, for function invocations on this API.
 //
-// HTTP response will have CORS-headers set, and support the OPTIONS HTTP method.
+// HTTP response will have CORS-headers set, and support the OPTIONS HTTP method,
+// unless the NoCORS option was set.
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	hdr := w.Header()
-	hdr.Set("Access-Control-Allow-Origin", "*")
-	hdr.Set("Access-Control-Allow-Methods", "GET, POST")
-	hdr.Set("Access-Control-Allow-Headers", "Content-Type")
+	if !h.opts.NoCORS {
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Set("Access-Control-Allow-Methods", "GET, POST")
+		hdr.Set("Access-Control-Allow-Headers", "Content-Type")
+	}
 
 	collector := h.opts.Collector
 
@@ -485,14 +505,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case r.URL.Path == "sherpa.json":
-		switch r.Method {
-		case "OPTIONS":
+		switch {
+		case !h.opts.NoCORS && r.Method == "OPTIONS":
 			w.WriteHeader(204)
-		case "GET":
+		case r.Method == "GET":
 			collector.JSON()
 			hdr.Set("Content-Type", "application/json; charset=utf-8")
 			hdr.Set("Cache-Control", "no-cache")
-			sherpaJSON := &*h.sherpaJSON
+			sherpaJSON := *h.sherpaJSON
 			sherpaJSON.BaseURL = getBaseURL(r) + h.path
 			err := json.NewEncoder(w).Encode(sherpaJSON)
 			if err != nil {
@@ -508,11 +528,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		collector.JavaScript()
-		hdr.Set("Content-Type", "text/javascript; charset=utf-8")
-		hdr.Set("Cache-Control", "no-cache")
-		sherpaJSON := &*h.sherpaJSON
+		sherpaJSON := *h.sherpaJSON
 		sherpaJSON.BaseURL = getBaseURL(r) + h.path
 		buf, err := json.Marshal(sherpaJSON)
+		if err != nil {
+			log.Println("marshal sherpa.json:", err)
+			http.Error(w, "500 - internal server error - marshal sherpa json failed", http.StatusInternalServerError)
+			return
+		}
+		hdr.Set("Content-Type", "text/javascript; charset=utf-8")
+		hdr.Set("Cache-Control", "no-cache")
 		js := strings.Replace(sherpaJS, "{{.sherpaJSON}}", string(buf), -1)
 		_, err = w.Write([]byte(js))
 		if err != nil {
@@ -522,11 +547,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		name := r.URL.Path
 		fn, ok := h.functions[name]
-		switch r.Method {
-		case "OPTIONS":
+		switch {
+		case !h.opts.NoCORS && r.Method == "OPTIONS":
 			w.WriteHeader(204)
 
-		case "POST":
+		case r.Method == "POST":
 			hdr.Set("Cache-Control", "no-store")
 
 			if !ok {
@@ -538,7 +563,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ct := r.Header.Get("Content-Type")
 			if ct == "" {
 				collector.ProtocolError()
-				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: fmt.Sprintf("missing content-type")}})
+				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: "missing content-type"}})
 				return
 			}
 			mt, mtparams, err := mime.ParseMediaType(ct)
@@ -552,8 +577,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: fmt.Sprintf(`unrecognized content-type %q, expecting "application/json"`, mt)}})
 				return
 			}
-			charset, ok := mtparams["charset"]
-			if ok && strings.ToLower(charset) != "utf-8" {
+			if charset, chok := mtparams["charset"]; chok && strings.ToLower(charset) != "utf-8" {
 				collector.ProtocolError()
 				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: fmt.Sprintf(`unexpected charset %q, expecting "utf-8"`, charset)}})
 				return
@@ -561,7 +585,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			t0 := time.Now()
 			r, xerr := h.call(r.Context(), name, fn, r.Body)
-			durationSec := float64(time.Now().Sub(t0)) / float64(time.Second)
+			durationSec := float64(time.Since(t0)) / float64(time.Second)
 			if xerr != nil {
 				switch err := xerr.(type) {
 				case *InternalServerError:
@@ -576,7 +600,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				var v interface{}
-				if raw, ok := r.(Raw); ok {
+				if raw, rok := r.(Raw); rok {
 					v = raw
 				} else {
 					v = &response{Result: r}
@@ -585,7 +609,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				respondJSON(w, 200, v)
 			}
 
-		case "GET":
+		case r.Method == "GET":
 			hdr.Set("Cache-Control", "no-store")
 
 			jsonp := false
@@ -598,7 +622,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err := r.ParseForm()
 			if err != nil {
 				collector.ProtocolError()
-				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: fmt.Sprintf("could not parse query string")}})
+				respondJSON(w, 200, &response{Error: &Error{Code: SherpaBadRequest, Message: "could not parse query string"}})
 				return
 			}
 
@@ -622,7 +646,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			t0 := time.Now()
 			r, xerr := h.call(r.Context(), name, fn, strings.NewReader(body))
-			durationSec := float64(time.Now().Sub(t0)) / float64(time.Second)
+			durationSec := float64(time.Since(t0)) / float64(time.Second)
 			if xerr != nil {
 				switch err := xerr.(type) {
 				case *InternalServerError:

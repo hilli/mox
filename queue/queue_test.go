@@ -5,28 +5,35 @@ import (
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mjl-/adns"
 	"github.com/mjl-/bstore"
 
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/smtp"
+	"github.com/mjl-/mox/smtpclient"
 	"github.com/mjl-/mox/store"
+	"github.com/mjl-/mox/tlsrpt"
+	"github.com/mjl-/mox/tlsrptdb"
 )
 
 var ctxbg = context.Background()
+var pkglog = mlog.New("queue", nil)
 
 func tcheck(t *testing.T, err error, msg string) {
 	if err != nil {
@@ -35,24 +42,43 @@ func tcheck(t *testing.T, err error, msg string) {
 	}
 }
 
+func tcompare(t *testing.T, got, exp any) {
+	t.Helper()
+	if !reflect.DeepEqual(got, exp) {
+		t.Fatalf("got %v, expected %v", got, exp)
+	}
+}
+
+var keepAccount bool
+
 func setup(t *testing.T) (*store.Account, func()) {
 	// Prepare config so email can be delivered to mjl@mox.example.
-	os.RemoveAll("../testdata/queue/data")
+
+	// Don't trigger the account consistency checks. Only remove account files on first
+	// (of randomized) runs.
+	if !keepAccount {
+		os.RemoveAll("../testdata/queue/data")
+		keepAccount = true
+	} else {
+		os.RemoveAll("../testdata/queue/data/queue")
+	}
+
+	log := mlog.New("queue", nil)
 	mox.Context = ctxbg
-	mox.ConfigStaticPath = "../testdata/queue/mox.conf"
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/queue/mox.conf")
 	mox.MustLoadConfig(true, false)
-	acc, err := store.OpenAccount("mjl")
+	acc, err := store.OpenAccount(log, "mjl")
 	tcheck(t, err, "open account")
-	err = acc.SetPassword("testtest")
+	err = acc.SetPassword(log, "testtest")
 	tcheck(t, err, "set password")
-	switchDone := store.Switchboard()
+	switchStop := store.Switchboard()
 	mox.Shutdown, mox.ShutdownCancel = context.WithCancel(ctxbg)
 	return acc, func() {
 		acc.Close()
 		mox.ShutdownCancel()
 		mox.Shutdown, mox.ShutdownCancel = context.WithCancel(ctxbg)
 		Shutdown()
-		close(switchDone)
+		switchStop()
 	}
 }
 
@@ -65,7 +91,7 @@ test email
 
 func prepareFile(t *testing.T) *os.File {
 	t.Helper()
-	msgFile, err := store.CreateMessageTemp("queue")
+	msgFile, err := store.CreateMessageTemp(pkglog, "queue")
 	tcheck(t, err, "create temp message for delivery to queue")
 	_, err = msgFile.Write([]byte(testmsg))
 	tcheck(t, err, "write message file")
@@ -85,13 +111,19 @@ func TestQueue(t *testing.T) {
 	}
 
 	path := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "mox.example"}}}
-	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	mf := prepareFile(t)
+	defer os.Remove(mf.Name())
+	defer mf.Close()
+
+	var qm Msg
+
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 
-	mf2 := prepareFile(t)
-	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, mf2, nil, false)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
-	os.Remove(mf2.Name())
 
 	msgs, err = List(ctxbg)
 	tcheck(t, err, "listing queue")
@@ -102,7 +134,7 @@ func TestQueue(t *testing.T) {
 	if msg.Attempts != 0 {
 		t.Fatalf("msg attempts %d, expected 0", msg.Attempts)
 	}
-	n, err := Drop(ctxbg, msgs[1].ID, "", "")
+	n, err := Drop(ctxbg, pkglog, msgs[1].ID, "", "")
 	tcheck(t, err, "drop")
 	if n != 1 {
 		t.Fatalf("dropped %d, expected 1", n)
@@ -111,33 +143,40 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("dropped message not removed from file system")
 	}
 
-	next := nextWork(ctxbg, nil)
+	next := nextWork(ctxbg, pkglog, nil)
 	if next > 0 {
 		t.Fatalf("nextWork in %s, should be now", next)
 	}
 	busy := map[string]struct{}{"mox.example": {}}
-	if x := nextWork(ctxbg, busy); x != 24*time.Hour {
+	if x := nextWork(ctxbg, pkglog, busy); x != 24*time.Hour {
 		t.Fatalf("nextWork in %s for busy domain, should be in 24 hours", x)
 	}
-	if nn := launchWork(nil, busy); nn != 0 {
+	if nn := launchWork(pkglog, nil, busy); nn != 0 {
 		t.Fatalf("launchWork launched %d deliveries, expected 0", nn)
 	}
 
-	// Override dial function. We'll make connecting fail for now.
+	mailDomain := dns.Domain{ASCII: "mox.example"}
+	mailHost := dns.Domain{ASCII: "mail.mox.example"}
 	resolver := dns.MockResolver{
 		A: map[string][]string{
-			"mox.example.":        {"127.0.0.1"},
+			"mail.mox.example.":   {"127.0.0.1"},
 			"submission.example.": {"127.0.0.1"},
 		},
-		MX: map[string][]*net.MX{"mox.example.": {{Host: "mox.example", Pref: 10}}},
+		MX: map[string][]*net.MX{"mox.example.": {{Host: "mail.mox.example", Pref: 10}}},
 	}
+	// Override dial function. We'll make connecting fail for now.
 	dialed := make(chan struct{}, 1)
-	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	smtpclient.DialHook = func(ctx context.Context, dialer smtpclient.Dialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		dialed <- struct{}{}
 		return nil, fmt.Errorf("failure from test")
 	}
+	defer func() {
+		smtpclient.DialHook = nil
+	}()
 
-	launchWork(resolver, map[string]struct{}{})
+	launchWork(pkglog, resolver, map[string]struct{}{})
+
+	moxCert := fakeCert(t, "mail.mox.example", false)
 
 	// Wait until we see the dial and the failed attempt.
 	timer := time.NewTimer(time.Second)
@@ -189,29 +228,111 @@ func TestQueue(t *testing.T) {
 	smtpdone := make(chan struct{})
 
 	fakeSMTPServer := func(server net.Conn) {
+		defer func() {
+			smtpdone <- struct{}{}
+		}()
+
 		// We do a minimal fake smtp server. We cannot import smtpserver.Serve due to cyclic dependencies.
-		fmt.Fprintf(server, "220 mox.example\r\n")
+		fmt.Fprintf(server, "220 mail.mox.example\r\n")
 		br := bufio.NewReader(server)
-		br.ReadString('\n') // Should be EHLO.
-		fmt.Fprintf(server, "250 ok\r\n")
-		br.ReadString('\n') // Should be MAIL FROM.
-		fmt.Fprintf(server, "250 ok\r\n")
-		br.ReadString('\n') // Should be RCPT TO.
-		fmt.Fprintf(server, "250 ok\r\n")
-		br.ReadString('\n') // Should be DATA.
-		fmt.Fprintf(server, "354 continue\r\n")
+
+		readline := func(cmd string) {
+			line, err := br.ReadString('\n')
+			if err == nil && !strings.HasPrefix(strings.ToLower(line), cmd) {
+				panic(fmt.Sprintf("unexpected line %q, expected %q", line, cmd))
+			}
+		}
+		writeline := func(s string) {
+			fmt.Fprintf(server, "%s\r\n", s)
+		}
+
+		readline("ehlo")
+		writeline("250 mail.mox.example")
+		readline("mail")
+		writeline("250 ok")
+		readline("rcpt")
+		writeline("250 ok")
+		readline("data")
+		writeline("354 continue")
 		reader := smtp.NewDataReader(br)
 		io.Copy(io.Discard, reader)
-		fmt.Fprintf(server, "250 ok\r\n")
-		br.ReadString('\n') // Should be QUIT.
-		fmt.Fprintf(server, "221 ok\r\n")
+		writeline("250 ok")
+		readline("quit")
+		writeline("221 ok")
+	}
 
-		smtpdone <- struct{}{}
+	goodTLSConfig := tls.Config{Certificates: []tls.Certificate{moxCert}}
+	makeFakeSMTPSTARTTLSServer := func(tlsConfig *tls.Config, nstarttls int, requiretls bool) func(server net.Conn) {
+		attempt := 0
+		return func(server net.Conn) {
+			defer func() {
+				smtpdone <- struct{}{}
+			}()
+
+			attempt++
+
+			// We do a minimal fake smtp server. We cannot import smtpserver.Serve due to cyclic dependencies.
+			fmt.Fprintf(server, "220 mail.mox.example\r\n")
+			br := bufio.NewReader(server)
+
+			readline := func(cmd string) {
+				line, err := br.ReadString('\n')
+				if err == nil && !strings.HasPrefix(strings.ToLower(line), cmd) {
+					panic(fmt.Sprintf("unexpected line %q, expected %q", line, cmd))
+				}
+			}
+			writeline := func(s string) {
+				fmt.Fprintf(server, "%s\r\n", s)
+			}
+
+			readline("ehlo")
+			writeline("250-mail.mox.example")
+			writeline("250 starttls")
+			if nstarttls == 0 || attempt <= nstarttls {
+				readline("starttls")
+				writeline("220 ok")
+				tlsConn := tls.Server(server, tlsConfig)
+				err := tlsConn.Handshake()
+				if err != nil {
+					return
+				}
+				server = tlsConn
+				br = bufio.NewReader(server)
+
+				readline("ehlo")
+				if requiretls {
+					writeline("250-mail.mox.example")
+					writeline("250 requiretls")
+				} else {
+					writeline("250 mail.mox.example")
+				}
+			}
+			readline("mail")
+			writeline("250 ok")
+			readline("rcpt")
+			writeline("250 ok")
+			readline("data")
+			writeline("354 continue")
+			reader := smtp.NewDataReader(br)
+			io.Copy(io.Discard, reader)
+			writeline("250 ok")
+			readline("quit")
+			writeline("221 ok")
+		}
+	}
+
+	fakeSMTPSTARTTLSServer := makeFakeSMTPSTARTTLSServer(&goodTLSConfig, 0, true)
+	makeBadFakeSMTPSTARTTLSServer := func(requiretls bool) func(server net.Conn) {
+		return makeFakeSMTPSTARTTLSServer(&tls.Config{MaxVersion: tls.VersionTLS10, Certificates: []tls.Certificate{moxCert}}, 1, requiretls)
 	}
 
 	fakeSubmitServer := func(server net.Conn) {
+		defer func() {
+			smtpdone <- struct{}{}
+		}()
+
 		// We do a minimal fake smtp server. We cannot import smtpserver.Serve due to cyclic dependencies.
-		fmt.Fprintf(server, "220 mox.example\r\n")
+		fmt.Fprintf(server, "220 mail.mox.example\r\n")
 		br := bufio.NewReader(server)
 		br.ReadString('\n') // Should be EHLO.
 		fmt.Fprintf(server, "250-localhost\r\n")
@@ -229,26 +350,48 @@ func TestQueue(t *testing.T) {
 		fmt.Fprintf(server, "250 ok\r\n")
 		br.ReadString('\n') // Should be QUIT.
 		fmt.Fprintf(server, "221 ok\r\n")
-
-		smtpdone <- struct{}{}
 	}
 
-	testDeliver := func(fakeServer func(conn net.Conn)) bool {
+	testQueue := func(expectDSN bool, fakeServer func(conn net.Conn)) bool {
 		t.Helper()
 
-		// Setting up a pipe. We'll start a fake smtp server on the server-side. And return the
-		// client-side to the invocation dial, for the attempted delivery from the queue.
-		// The delivery should succeed.
-		server, client := net.Pipe()
-		defer server.Close()
-		defer client.Close()
+		var pipes []net.Conn
+		defer func() {
+			for _, conn := range pipes {
+				conn.Close()
+			}
+		}()
 
 		var wasNetDialer bool
-		dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+		smtpclient.DialHook = func(ctx context.Context, dialer smtpclient.Dialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+			// Setting up a pipe. We'll start a fake smtp server on the server-side. And return the
+			// client-side to the invocation dial, for the attempted delivery from the queue.
+			server, client := net.Pipe()
+			for _, c := range pipes {
+				c.Close()
+			}
+			pipes = []net.Conn{server, client}
+			go fakeServer(server)
+
 			_, wasNetDialer = dialer.(*net.Dialer)
-			dialed <- struct{}{}
+
+			// For reconnects, we are already waiting for delivery below.
+			select {
+			case dialed <- struct{}{}:
+			default:
+			}
+
 			return client, nil
 		}
+		defer func() {
+			smtpclient.DialHook = nil
+		}()
+
+		inbox, err := bstore.QueryDB[store.Mailbox](ctxbg, acc.DB).FilterNonzero(store.Mailbox{Name: "Inbox"}).Get()
+		tcheck(t, err, "get inbox")
+
+		inboxCount, err := bstore.QueryDB[store.Message](ctxbg, acc.DB).FilterNonzero(store.Message{MailboxID: inbox.ID}).Count()
+		tcheck(t, err, "querying messages in inbox")
 
 		waitDeliver := func() {
 			t.Helper()
@@ -262,6 +405,14 @@ func TestQueue(t *testing.T) {
 						xmsgs, err := List(ctxbg)
 						tcheck(t, err, "list queue")
 						if len(xmsgs) == 0 {
+							ninbox, err := bstore.QueryDB[store.Message](ctxbg, acc.DB).FilterNonzero(store.Message{MailboxID: inbox.ID}).Count()
+							tcheck(t, err, "querying messages in inbox")
+							if expectDSN && ninbox != inboxCount+1 {
+								t.Fatalf("got %d messages in inbox, previously %d, expected 1 additional for dsn", ninbox, inboxCount)
+							} else if !expectDSN && ninbox != inboxCount {
+								t.Fatalf("got %d messages in inbox, previously %d, expected no additional messages", ninbox, inboxCount)
+							}
+
 							break
 						}
 						i++
@@ -279,10 +430,17 @@ func TestQueue(t *testing.T) {
 			<-deliveryResult // Deliver sends here.
 		}
 
-		go fakeServer(server)
-		launchWork(resolver, map[string]struct{}{})
+		launchWork(pkglog, resolver, map[string]struct{}{})
 		waitDeliver()
 		return wasNetDialer
+	}
+	testDeliver := func(fakeServer func(conn net.Conn)) bool {
+		t.Helper()
+		return testQueue(false, fakeServer)
+	}
+	testDSN := func(fakeServer func(conn net.Conn)) bool {
+		t.Helper()
+		return testQueue(true, fakeServer)
 	}
 
 	// Test direct delivery.
@@ -293,7 +451,8 @@ func TestQueue(t *testing.T) {
 
 	// Add a message to be delivered with submit because of its route.
 	topath := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "submit.example"}}}
-	_, err = Add(ctxbg, xlog, "mjl", path, topath, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	qm = MakeMsg("mjl", path, topath, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 	wasNetDialer = testDeliver(fakeSubmitServer)
 	if !wasNetDialer {
@@ -301,10 +460,11 @@ func TestQueue(t *testing.T) {
 	}
 
 	// Add a message to be delivered with submit because of explicitly configured transport, that uses TLS.
-	msgID, err := Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 	transportSubmitTLS := "submittls"
-	n, err = Kick(ctxbg, msgID, "", "", &transportSubmitTLS)
+	n, err = Kick(ctxbg, qm.ID, "", "", &transportSubmitTLS)
 	tcheck(t, err, "kick queue")
 	if n != 1 {
 		t.Fatalf("kick changed %d messages, expected 1", n)
@@ -324,11 +484,36 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("expected net.Dialer as dialer")
 	}
 
+	// Various failure reasons.
+	fdNotTrusted := tlsrpt.FailureDetails{
+		ResultType:          tlsrpt.ResultCertificateNotTrusted,
+		SendingMTAIP:        "", // Missing due to pipe.
+		ReceivingMXHostname: "mail.mox.example",
+		ReceivingMXHelo:     "mail.mox.example",
+		ReceivingIP:         "", // Missing due to pipe.
+		FailedSessionCount:  1,
+		FailureReasonCode:   "",
+	}
+	fdTLSAUnusable := tlsrpt.FailureDetails{
+		ResultType:          tlsrpt.ResultTLSAInvalid,
+		ReceivingMXHostname: "mail.mox.example",
+		FailedSessionCount:  0,
+		FailureReasonCode:   "all-unusable-records+ignored",
+	}
+	fdBadProtocol := tlsrpt.FailureDetails{
+		ResultType:          tlsrpt.ResultValidationFailure,
+		ReceivingMXHostname: "mail.mox.example",
+		ReceivingMXHelo:     "mail.mox.example",
+		FailedSessionCount:  1,
+		FailureReasonCode:   "tls-remote-alert-70-protocol-version-not-supported",
+	}
+
 	// Add a message to be delivered with socks.
-	msgID, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<socks@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 	transportSocks := "socks"
-	n, err = Kick(ctxbg, msgID, "", "", &transportSocks)
+	n, err = Kick(ctxbg, qm.ID, "", "", &transportSocks)
 	tcheck(t, err, "kick queue")
 	if n != 1 {
 		t.Fatalf("kick changed %d messages, expected 1", n)
@@ -338,8 +523,177 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("expected non-net.Dialer as dialer") // SOCKS5 dialer is a private type, we cannot check for it.
 	}
 
+	// Add message to be delivered with opportunistic TLS verification.
+	clearTLSResults(t)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<opportunistictls@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(fakeSMTPSTARTTLSServer)
+	checkTLSResults(t, "mox.example", "mox.example", false, addCounts(1, 0, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailDomain, fdNotTrusted)))
+	checkTLSResults(t, "mail.mox.example", "mox.example", true, addCounts(1, 0, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailHost)))
+
+	// Test fallback to plain text with TLS handshake fails.
+	clearTLSResults(t)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<badtls@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(makeBadFakeSMTPSTARTTLSServer(true))
+	checkTLSResults(t, "mox.example", "mox.example", false, addCounts(0, 1, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailDomain, fdBadProtocol)))
+	checkTLSResults(t, "mail.mox.example", "mox.example", true, addCounts(0, 1, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailHost, fdBadProtocol)))
+
+	// Add message to be delivered with DANE verification.
+	clearTLSResults(t)
+	resolver.AllAuthentic = true
+	resolver.TLSA = map[string][]adns.TLSA{
+		"_25._tcp.mail.mox.example.": {
+			{Usage: adns.TLSAUsageDANEEE, Selector: adns.TLSASelectorSPKI, MatchType: adns.TLSAMatchTypeFull, CertAssoc: moxCert.Leaf.RawSubjectPublicKeyInfo},
+		},
+	}
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<dane@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(fakeSMTPSTARTTLSServer)
+	checkTLSResults(t, "mox.example", "mox.example", false, addCounts(1, 0, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailDomain, fdNotTrusted)))
+	checkTLSResults(t, "mail.mox.example", "mox.example", true, addCounts(1, 0, tlsrpt.Result{Policy: tlsrpt.TLSAPolicy(resolver.TLSA["_25._tcp.mail.mox.example."], mailHost), FailureDetails: []tlsrpt.FailureDetails{}}))
+
+	// We should know starttls/requiretls by now.
+	rdt := store.RecipientDomainTLS{Domain: "mox.example"}
+	err = acc.DB.Get(ctxbg, &rdt)
+	tcheck(t, err, "get recipientdomaintls")
+	tcompare(t, rdt.STARTTLS, true)
+	tcompare(t, rdt.RequireTLS, true)
+
+	// Add message to be delivered with verified TLS and REQUIRETLS.
+	yes := true
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<opportunistictls@localhost>", nil, &yes)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(fakeSMTPSTARTTLSServer)
+
+	// Check that message is delivered with all unusable DANE records.
+	clearTLSResults(t)
+	resolver.TLSA = map[string][]adns.TLSA{
+		"_25._tcp.mail.mox.example.": {
+			{},
+		},
+	}
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<daneunusable@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(fakeSMTPSTARTTLSServer)
+	checkTLSResults(t, "mox.example", "mox.example", false, addCounts(1, 0, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailDomain, fdNotTrusted)))
+	checkTLSResults(t, "mail.mox.example", "mox.example", true, addCounts(1, 0, tlsrpt.Result{Policy: tlsrpt.TLSAPolicy([]adns.TLSA{}, mailHost), FailureDetails: []tlsrpt.FailureDetails{fdTLSAUnusable}}))
+
+	// Check that message is delivered with insecure TLSA records. They should be
+	// ignored and regular STARTTLS tried.
+	clearTLSResults(t)
+	resolver.Inauthentic = []string{"tlsa _25._tcp.mail.mox.example."}
+	resolver.TLSA = map[string][]adns.TLSA{
+		"_25._tcp.mail.mox.example.": {
+			{Usage: adns.TLSAUsageDANEEE, Selector: adns.TLSASelectorSPKI, MatchType: adns.TLSAMatchTypeFull, CertAssoc: make([]byte, sha256.Size)},
+		},
+	}
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<daneinsecure@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(makeBadFakeSMTPSTARTTLSServer(true))
+	resolver.Inauthentic = nil
+	checkTLSResults(t, "mox.example", "mox.example", false, addCounts(0, 1, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailDomain, fdBadProtocol)))
+	checkTLSResults(t, "mail.mox.example", "mox.example", true, addCounts(0, 1, tlsrpt.MakeResult(tlsrpt.NoPolicyFound, mailHost, fdBadProtocol)))
+
+	// STARTTLS failed, so not known supported.
+	rdt = store.RecipientDomainTLS{Domain: "mox.example"}
+	err = acc.DB.Get(ctxbg, &rdt)
+	tcheck(t, err, "get recipientdomaintls")
+	tcompare(t, rdt.STARTTLS, false)
+	tcompare(t, rdt.RequireTLS, false)
+
+	// Check that message is delivered with TLS-Required: No and non-matching DANE record.
+	no := false
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<tlsrequirednostarttls@localhost>", nil, &no)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(fakeSMTPSTARTTLSServer)
+
+	// Check that message is delivered with TLS-Required: No and bad TLS, falling back to plain text.
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<tlsrequirednoplaintext@localhost>", nil, &no)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDeliver(makeBadFakeSMTPSTARTTLSServer(true))
+
+	// Add message with requiretls that fails immediately due to no REQUIRETLS support in all servers.
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<tlsrequiredunsupported@localhost>", nil, &yes)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	testDSN(makeBadFakeSMTPSTARTTLSServer(false))
+
+	// Restore pre-DANE behaviour.
+	resolver.AllAuthentic = false
+	resolver.TLSA = nil
+
+	// Add message with requiretls that fails immediately due to no verification policy for recipient domain.
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<tlsrequirednopolicy@localhost>", nil, &yes)
+	err = Add(ctxbg, pkglog, &qm, mf)
+	tcheck(t, err, "add message to queue for delivery")
+	n, err = Kick(ctxbg, qm.ID, "", "", nil)
+	tcheck(t, err, "kick queue")
+	if n != 1 {
+		t.Fatalf("kick changed %d messages, expected 1", n)
+	}
+	// Based on DNS lookups, there won't be any dialing or SMTP connection.
+	dialed <- struct{}{}
+	testDSN(func(conn net.Conn) {
+		smtpdone <- struct{}{}
+	})
+
 	// Add another message that we'll fail to deliver entirely.
-	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	qm = MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 
 	msgs, err = List(ctxbg)
@@ -349,10 +703,10 @@ func TestQueue(t *testing.T) {
 	}
 	msg = msgs[0]
 
-	prepServer := func(code string) (net.Conn, func()) {
+	prepServer := func(fn func(c net.Conn)) (net.Conn, func()) {
 		server, client := net.Pipe()
 		go func() {
-			fmt.Fprintf(server, "%s mox.example\r\n", code)
+			fn(server)
 			server.Close()
 		}()
 		return client, func() {
@@ -361,15 +715,17 @@ func TestQueue(t *testing.T) {
 		}
 	}
 
-	conn2, cleanup2 := prepServer("220")
-	conn3, cleanup3 := prepServer("451")
+	conn2, cleanup2 := prepServer(func(conn net.Conn) { fmt.Fprintf(conn, "220 mail.mox.example\r\n") })
+	conn3, cleanup3 := prepServer(func(conn net.Conn) { fmt.Fprintf(conn, "451 mail.mox.example\r\n") })
+	conn4, cleanup4 := prepServer(fakeSMTPSTARTTLSServer)
 	defer func() {
 		cleanup2()
 		cleanup3()
+		cleanup4()
 	}()
 
 	seq := 0
-	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	smtpclient.DialHook = func(ctx context.Context, dialer smtpclient.Dialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		seq++
 		switch seq {
 		default:
@@ -378,15 +734,32 @@ func TestQueue(t *testing.T) {
 			return conn2, nil
 		case 3:
 			return conn3, nil
+		case 4:
+			return conn4, nil
 		}
 	}
+	defer func() {
+		smtpclient.DialHook = nil
+	}()
 
 	comm := store.RegisterComm(acc)
 	defer comm.Unregister()
 
 	for i := 1; i < 8; i++ {
 		go func() { <-deliveryResult }() // Deliver sends here.
-		deliver(resolver, msg)
+		if i == 4 {
+			resolver.AllAuthentic = true
+			resolver.TLSA = map[string][]adns.TLSA{
+				"_25._tcp.mail.mox.example.": {
+					// Non-matching zero CertAssoc, should cause failure.
+					{Usage: adns.TLSAUsageDANEEE, Selector: adns.TLSASelectorSPKI, MatchType: adns.TLSAMatchTypeSHA256, CertAssoc: make([]byte, sha256.Size)},
+				},
+			}
+		} else {
+			resolver.AllAuthentic = false
+			resolver.TLSA = nil
+		}
+		deliver(pkglog, resolver, msg)
 		err = DB.Get(ctxbg, &msg)
 		tcheck(t, err, "get msg")
 		if msg.Attempts != i {
@@ -409,7 +782,7 @@ func TestQueue(t *testing.T) {
 
 	// Trigger final failure.
 	go func() { <-deliveryResult }() // Deliver sends here.
-	deliver(resolver, msg)
+	deliver(pkglog, resolver, msg)
 	err = DB.Get(ctxbg, &msg)
 	if err != bstore.ErrAbsent {
 		t.Fatalf("attempt to fetch delivered and removed message from queue, got err %v, expected ErrAbsent", err)
@@ -428,6 +801,37 @@ func TestQueue(t *testing.T) {
 	}
 }
 
+func addCounts(success, failure int64, result tlsrpt.Result) tlsrpt.Result {
+	result.Summary.TotalSuccessfulSessionCount += success
+	result.Summary.TotalFailureSessionCount += failure
+	return result
+}
+
+func clearTLSResults(t *testing.T) {
+	_, err := bstore.QueryDB[tlsrptdb.TLSResult](ctxbg, tlsrptdb.ResultDB).Delete()
+	tcheck(t, err, "delete tls results")
+}
+
+func checkTLSResults(t *testing.T, policyDomain, expRecipientDomain string, expIsHost bool, expResults ...tlsrpt.Result) {
+	t.Helper()
+	q := bstore.QueryDB[tlsrptdb.TLSResult](ctxbg, tlsrptdb.ResultDB)
+	q.FilterNonzero(tlsrptdb.TLSResult{PolicyDomain: policyDomain})
+	result, err := q.Get()
+	tcheck(t, err, "get tls result")
+	tcompare(t, result.RecipientDomain, expRecipientDomain)
+	tcompare(t, result.IsHost, expIsHost)
+
+	// Before comparing, compensate for go1.20 vs go1.21 difference.
+	for i, r := range result.Results {
+		for j, fd := range r.FailureDetails {
+			if fd.FailureReasonCode == "tls-remote-alert-70" {
+				result.Results[i].FailureDetails[j].FailureReasonCode = "tls-remote-alert-70-protocol-version-not-supported"
+			}
+		}
+	}
+	tcompare(t, result.Results, expResults)
+}
+
 // test Start and that it attempts to deliver.
 func TestQueueStart(t *testing.T) {
 	// Override dial function. We'll make connecting fail and check the attempt.
@@ -436,10 +840,13 @@ func TestQueueStart(t *testing.T) {
 		MX: map[string][]*net.MX{"mox.example.": {{Host: "mox.example", Pref: 10}}},
 	}
 	dialed := make(chan struct{}, 1)
-	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
+	smtpclient.DialHook = func(ctx context.Context, dialer smtpclient.Dialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
 		dialed <- struct{}{}
 		return nil, fmt.Errorf("failure from test")
 	}
+	defer func() {
+		smtpclient.DialHook = nil
+	}()
 
 	_, cleanup := setup(t)
 	defer cleanup()
@@ -473,7 +880,11 @@ func TestQueueStart(t *testing.T) {
 	}
 
 	path := smtp.Path{Localpart: "mjl", IPDomain: dns.IPDomain{Domain: dns.Domain{ASCII: "mox.example"}}}
-	_, err = Add(ctxbg, xlog, "mjl", path, path, false, false, int64(len(testmsg)), nil, prepareFile(t), nil, true)
+	mf := prepareFile(t)
+	defer os.Remove(mf.Name())
+	defer mf.Close()
+	qm := MakeMsg("mjl", path, path, false, false, int64(len(testmsg)), "<test@localhost>", nil, nil)
+	err = Add(ctxbg, pkglog, &qm, mf)
 	tcheck(t, err, "add message to queue for delivery")
 	checkDialed(true)
 
@@ -489,153 +900,6 @@ func TestQueueStart(t *testing.T) {
 	}
 	checkDialed(true)
 	time.Sleep(100 * time.Millisecond) // Racy... we won't get notified when work is done...
-}
-
-func TestWriteFile(t *testing.T) {
-	name := "../testdata/queue.test"
-	os.Remove(name)
-	defer os.Remove(name)
-	err := writeFile(name, strings.NewReader("test"))
-	if err != nil {
-		t.Fatalf("writeFile, unexpected error %v", err)
-	}
-	buf, err := os.ReadFile(name)
-	if err != nil || string(buf) != "test" {
-		t.Fatalf("writeFile, read file, got err %v, data %q", err, buf)
-	}
-}
-
-func TestGatherHosts(t *testing.T) {
-	mox.Context = ctxbg
-
-	// Test basic MX lookup case, but also following CNAME, detecting CNAME loops and
-	// having a CNAME limit, connecting directly to a host, and domain that does not
-	// exist or has temporary error.
-
-	resolver := dns.MockResolver{
-		MX: map[string][]*net.MX{
-			"basic.example.":        {{Host: "mail.basic.example.", Pref: 10}},
-			"multimx.example.":      {{Host: "mail1.multimx.example.", Pref: 10}, {Host: "mail2.multimx.example.", Pref: 10}},
-			"nullmx.example.":       {{Host: ".", Pref: 10}},
-			"temperror-mx.example.": {{Host: "absent.example.", Pref: 10}},
-		},
-		A: map[string][]string{
-			"mail.basic.example":   {"10.0.0.1"},
-			"justhost.example.":    {"10.0.0.1"}, // No MX record for domain, only an A record.
-			"temperror-a.example.": {"10.0.0.1"},
-		},
-		AAAA: map[string][]string{
-			"justhost6.example.": {"2001:db8::1"}, // No MX record for domain, only an AAAA record.
-		},
-		CNAME: map[string]string{
-			"cname.example.":           "basic.example.",
-			"cnameloop.example.":       "cnameloop2.example.",
-			"cnameloop2.example.":      "cnameloop.example.",
-			"danglingcname.example.":   "absent.example.", // Points to missing name.
-			"temperror-cname.example.": "absent.example.",
-		},
-		Fail: map[dns.Mockreq]struct{}{
-			{Type: "mx", Name: "temperror-mx.example."}:       {},
-			{Type: "host", Name: "temperror-a.example."}:      {},
-			{Type: "cname", Name: "temperror-cname.example."}: {},
-		},
-	}
-	for i := 0; i <= 16; i++ {
-		s := fmt.Sprintf("cnamelimit%d.example.", i)
-		next := fmt.Sprintf("cnamelimit%d.example.", i+1)
-		resolver.CNAME[s] = next
-	}
-
-	test := func(ipd dns.IPDomain, expHosts []dns.IPDomain, expDomain dns.Domain, expPerm bool, expErr error) {
-		t.Helper()
-
-		m := Msg{RecipientDomain: ipd}
-		hosts, ed, perm, err := gatherHosts(resolver, m, 1, xlog)
-		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) {
-			// todo: could also check the individual errors? code currently does not have structured errors.
-			t.Fatalf("gather hosts: %v", err)
-		}
-		if err != nil {
-			return
-		}
-		if !reflect.DeepEqual(hosts, expHosts) || ed != expDomain || perm != expPerm {
-			t.Fatalf("got hosts %#v, effectiveDomain %#v, permanent %#v, expected %#v %#v %#v", hosts, ed, perm, expHosts, expDomain, expPerm)
-		}
-	}
-
-	domain := func(s string) dns.Domain {
-		d, err := dns.ParseDomain(s)
-		if err != nil {
-			t.Fatalf("parse domain: %v", err)
-		}
-		return d
-	}
-	ipdomain := func(s string) dns.IPDomain {
-		ip := net.ParseIP(s)
-		if ip != nil {
-			return dns.IPDomain{IP: ip}
-		}
-		d, err := dns.ParseDomain(s)
-		if err != nil {
-			t.Fatalf("parse domain %q: %v", s, err)
-		}
-		return dns.IPDomain{Domain: d}
-	}
-
-	ipdomains := func(s ...string) (l []dns.IPDomain) {
-		for _, e := range s {
-			l = append(l, ipdomain(e))
-		}
-		return
-	}
-
-	var zerodom dns.Domain
-
-	test(ipdomain("10.0.0.1"), ipdomains("10.0.0.1"), zerodom, false, nil)
-	test(ipdomain("basic.example"), ipdomains("mail.basic.example"), domain("basic.example"), false, nil)                                 // Basic with simple MX.
-	test(ipdomain("multimx.example"), ipdomains("mail1.multimx.example", "mail2.multimx.example"), domain("multimx.example"), false, nil) // Basic with simple MX.
-	test(ipdomain("justhost.example"), ipdomains("justhost.example"), domain("justhost.example"), false, nil)                             // Only an A record.
-	test(ipdomain("justhost6.example"), ipdomains("justhost6.example"), domain("justhost6.example"), false, nil)                          // Only an AAAA record.
-	test(ipdomain("cname.example"), ipdomains("mail.basic.example"), domain("basic.example"), false, nil)                                 // Follow CNAME.
-	test(ipdomain("cnamelimit1.example"), nil, zerodom, true, errCNAMELimit)
-	test(ipdomain("cnameloop.example"), nil, zerodom, true, errCNAMELoop)
-	test(ipdomain("absent.example"), nil, zerodom, true, errNoRecord)
-	test(ipdomain("danglingcname.example"), nil, zerodom, true, errNoRecord)
-	test(ipdomain("nullmx.example"), nil, zerodom, true, errNoMail)
-	test(ipdomain("temperror-mx.example"), nil, zerodom, false, errDNS)
-	test(ipdomain("temperror-cname.example"), nil, zerodom, false, errDNS)
-	test(ipdomain("temperror-a.example"), nil, zerodom, false, errDNS)
-}
-
-func TestDialHost(t *testing.T) {
-	// We mostly want to test that dialing a second time switches to the other address family.
-
-	resolver := dns.MockResolver{
-		A: map[string][]string{
-			"dualstack.example.": {"10.0.0.1"},
-		},
-		AAAA: map[string][]string{
-			"dualstack.example.": {"2001:db8::1"},
-		},
-	}
-
-	dial = func(ctx context.Context, dialer contextDialer, timeout time.Duration, addr string, laddr net.Addr) (net.Conn, error) {
-		return nil, nil // No error, nil connection isn't used.
-	}
-
-	ipdomain := func(s string) dns.IPDomain {
-		return dns.IPDomain{Domain: dns.Domain{ASCII: s}}
-	}
-
-	m := Msg{DialedIPs: map[string][]net.IP{}}
-	_, ip, dualstack, err := dialHost(ctxbg, xlog, resolver, nil, ipdomain("dualstack.example"), 25, &m)
-	if err != nil || ip.String() != "10.0.0.1" || !dualstack {
-		t.Fatalf("expected err nil, address 10.0.0.1, dualstack true, got %v %v %v", err, ip, dualstack)
-	}
-	_, ip, dualstack, err = dialHost(ctxbg, xlog, resolver, nil, ipdomain("dualstack.example"), 25, &m)
-	if err != nil || ip.String() != "2001:db8::1" || !dualstack {
-		t.Fatalf("expected err nil, address 2001:db8::1, dualstack true, got %v %v %v", err, ip, dualstack)
-	}
 }
 
 // Just a cert that appears valid.

@@ -22,6 +22,7 @@ import (
 	"github.com/mjl-/bstore"
 
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/mtasts"
 )
@@ -30,7 +31,7 @@ var ctxbg = context.Background()
 
 func TestRefresh(t *testing.T) {
 	mox.Shutdown = ctxbg
-	mox.ConfigStaticPath = "../testdata/mtasts/fake.conf"
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/mtasts/fake.conf")
 	mox.Conf.Static.DataDir = "."
 
 	dbpath := mox.DataDirPath("mtasts.db")
@@ -68,7 +69,7 @@ func TestRefresh(t *testing.T) {
 			Extensions:    nil,
 		}
 
-		pr := PolicyRecord{domain, time.Time{}, validEnd, lastUpdate, lastUse, backoff, recordID, policy}
+		pr := PolicyRecord{domain, time.Time{}, validEnd, lastUpdate, lastUse, backoff, recordID, policy, policy.String()}
 		if err := db.Insert(ctxbg, &pr); err != nil {
 			t.Fatalf("insert policy: %s", err)
 		}
@@ -135,7 +136,8 @@ func TestRefresh(t *testing.T) {
 			t.Fatalf("bad sleep duration %v", d)
 		}
 	}
-	if n, err := refresh1(ctxbg, resolver, sleep); err != nil || n != 3 {
+	log := mlog.New("mtastsdb", nil)
+	if n, err := refresh1(ctxbg, log, resolver, sleep); err != nil || n != 3 {
 		t.Fatalf("refresh1: err %s, n %d, expected no error, 3", err, n)
 	}
 	if slept != 2 {

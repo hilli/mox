@@ -4,10 +4,13 @@
 package http
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	golog "log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +20,8 @@ import (
 	"time"
 
 	_ "net/http/pprof"
+
+	"golang.org/x/exp/maps"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -28,9 +33,12 @@ import (
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/ratelimit"
+	"github.com/mjl-/mox/webaccount"
+	"github.com/mjl-/mox/webadmin"
+	"github.com/mjl-/mox/webmail"
 )
 
-var xlog = mlog.New("http")
+var pkglog = mlog.New("http", nil)
 
 var (
 	// metricRequest tracks performance (time to write response header) of server.
@@ -65,23 +73,39 @@ var (
 	)
 )
 
-// todo: automatic gzip on responses, if client supports it, content is not already compressed. in case of static file only if it isn't too large. skip for certain response content-types (image/*, video/*), or file extensions if there is no identifying content-type. if cpu load isn't too high. if first N kb look compressible and come in quickly enough after first byte (e.g. within 100ms). always flush after 100ms to prevent stalled real-time connections.
+type responseWriterFlusher interface {
+	http.ResponseWriter
+	http.Flusher
+}
 
 // http.ResponseWriter that writes access log and tracks metrics at end of response.
 type loggingWriter struct {
-	W                http.ResponseWriter // Calls are forwarded.
+	W                responseWriterFlusher // Calls are forwarded.
 	Start            time.Time
 	R                *http.Request
 	WebsocketRequest bool // Whether request from was websocket.
 
-	Handler string // Set by router.
+	// Set by router.
+	Handler  string
+	Compress bool
 
 	// Set by handlers.
 	StatusCode                   int
-	Size                         int64 // Of data served, for non-websocket responses.
+	Size                         int64        // Of data served to client, for non-websocket responses.
+	UncompressedSize             int64        // Can be set by a handler that already serves compressed data, and we update it while compressing.
+	Gzip                         *gzip.Writer // Only set if we transparently compress within loggingWriter (static handlers handle compression themselves, with a cache).
 	Err                          error
-	WebsocketResponse            bool  // If this was a successful websocket connection with backend.
-	SizeFromClient, SizeToClient int64 // Websocket data.
+	WebsocketResponse            bool        // If this was a successful websocket connection with backend.
+	SizeFromClient, SizeToClient int64       // Websocket data.
+	Attrs                        []slog.Attr // Additional fields to log.
+}
+
+func (w *loggingWriter) AddAttr(a slog.Attr) {
+	w.Attrs = append(w.Attrs, a)
+}
+
+func (w *loggingWriter) Flush() {
+	w.W.Flush()
 }
 
 func (w *loggingWriter) Header() http.Header {
@@ -100,6 +124,36 @@ func (w *loggingWriter) proto(websocket bool) string {
 	return proto
 }
 
+func (w *loggingWriter) Write(buf []byte) (int, error) {
+	if w.StatusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	var n int
+	var err error
+	if w.Gzip == nil {
+		n, err = w.W.Write(buf)
+		if n > 0 {
+			w.Size += int64(n)
+		}
+	} else {
+		// We flush after each write. Probably takes a few more bytes, but prevents any
+		// issues due to buffering.
+		// w.Gzip.Write updates w.Size with the compressed byte count.
+		n, err = w.Gzip.Write(buf)
+		if err == nil {
+			err = w.Gzip.Flush()
+		}
+		if n > 0 {
+			w.UncompressedSize += int64(n)
+		}
+	}
+	if err != nil {
+		w.error(err)
+	}
+	return n, err
+}
+
 func (w *loggingWriter) setStatusCode(statusCode int) {
 	if w.StatusCode != 0 {
 		return
@@ -110,24 +164,106 @@ func (w *loggingWriter) setStatusCode(statusCode int) {
 	metricRequest.WithLabelValues(w.Handler, w.proto(w.WebsocketRequest), method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
 }
 
-func (w *loggingWriter) Write(buf []byte) (int, error) {
-	if w.Size == 0 {
-		w.setStatusCode(http.StatusOK)
-	}
-
-	n, err := w.W.Write(buf)
-	if n > 0 {
-		w.Size += int64(n)
-	}
-	if err != nil {
-		w.error(err)
-	}
-	return n, err
+// SetUncompressedSize is used through an interface by
+// ../webmail/webmail.go:/WriteHeader, preventing an import cycle.
+func (w *loggingWriter) SetUncompressedSize(origSize int64) {
+	w.UncompressedSize = origSize
 }
 
 func (w *loggingWriter) WriteHeader(statusCode int) {
+	if w.StatusCode != 0 {
+		return
+	}
+
 	w.setStatusCode(statusCode)
+
+	// We transparently gzip-compress responses for requests under these conditions, all must apply:
+	//
+	// - Enabled for handler (static handlers make their own decisions).
+	// - Not a websocket request.
+	// - Regular success responses (not errors, or partial content or redirects or "not modified", etc).
+	// - Not already compressed, or any other Content-Encoding header (including "identity").
+	// - Client accepts gzip encoded responses.
+	// - The response has a content-type that is compressible (text/*, */*+{json,xml}, and a few common files (e.g. json, xml, javascript).
+	if w.Compress && !w.WebsocketRequest && statusCode == http.StatusOK && w.W.Header().Values("Content-Encoding") == nil && acceptsGzip(w.R) && compressibleContentType(w.W.Header().Get("Content-Type")) {
+		// todo: we should gather the first kb of data, see if it is compressible. if not, just return original. should set timer so we flush if it takes too long to gather 1kb. for smaller data we shouldn't compress at all.
+
+		// We track the gzipped output for the access log.
+		cw := countWriter{Writer: w.W, Size: &w.Size}
+		w.Gzip, _ = gzip.NewWriterLevel(cw, gzip.BestSpeed)
+		w.W.Header().Set("Content-Encoding", "gzip")
+		w.W.Header().Del("Content-Length") // No longer valid, set again for small responses by net/http.
+	}
 	w.W.WriteHeader(statusCode)
+}
+
+func acceptsGzip(r *http.Request) bool {
+	s := r.Header.Get("Accept-Encoding")
+	t := strings.Split(s, ",")
+	for _, e := range t {
+		e = strings.TrimSpace(e)
+		tt := strings.Split(e, ";")
+		if len(tt) > 1 && t[1] == "q=0" {
+			continue
+		}
+		if tt[0] == "gzip" {
+			return true
+		}
+	}
+	return false
+}
+
+var compressibleTypes = map[string]bool{
+	"application/csv":          true,
+	"application/javascript":   true,
+	"application/json":         true,
+	"application/x-javascript": true,
+	"application/xml":          true,
+	"image/vnd.microsoft.icon": true,
+	"image/x-icon":             true,
+	"font/ttf":                 true,
+	"font/eot":                 true,
+	"font/otf":                 true,
+	"font/opentype":            true,
+}
+
+func compressibleContentType(ct string) bool {
+	ct = strings.SplitN(ct, ";", 2)[0]
+	ct = strings.TrimSpace(ct)
+	ct = strings.ToLower(ct)
+	if compressibleTypes[ct] {
+		return true
+	}
+	t, st, _ := strings.Cut(ct, "/")
+	return t == "text" || strings.HasSuffix(st, "+json") || strings.HasSuffix(st, "+xml")
+}
+
+func compressibleContent(f *os.File) bool {
+	// We don't want to store many small files. They take up too much disk overhead.
+	if fi, err := f.Stat(); err != nil || fi.Size() < 1024 || fi.Size() > 10*1024*1024 {
+		return false
+	}
+
+	buf := make([]byte, 512)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return false
+	}
+	ct := http.DetectContentType(buf[:n])
+	return compressibleContentType(ct)
+}
+
+type countWriter struct {
+	Writer io.Writer
+	Size   *int64
+}
+
+func (w countWriter) Write(buf []byte) (int, error) {
+	n, err := w.Writer.Write(buf)
+	if n > 0 {
+		*w.Size += int64(n)
+	}
+	return n, err
 }
 
 var tlsVersions = map[uint16]string{
@@ -154,6 +290,12 @@ func (w *loggingWriter) error(err error) {
 }
 
 func (w *loggingWriter) Done() {
+	if w.Err == nil && w.Gzip != nil {
+		if err := w.Gzip.Close(); err != nil {
+			w.error(err)
+		}
+	}
+
 	method := metricHTTPMethod(w.R.Method)
 	metricResponse.WithLabelValues(w.Handler, w.proto(w.WebsocketResponse), method, fmt.Sprintf("%d", w.StatusCode)).Observe(float64(time.Since(w.Start)) / float64(time.Second))
 
@@ -169,37 +311,43 @@ func (w *loggingWriter) Done() {
 	if err == nil {
 		err = w.R.Context().Err()
 	}
-	fields := []mlog.Pair{
-		mlog.Field("httpaccess", ""),
-		mlog.Field("handler", w.Handler),
-		mlog.Field("method", method),
-		mlog.Field("url", w.R.URL),
-		mlog.Field("host", w.R.Host),
-		mlog.Field("duration", time.Since(w.Start)),
-		mlog.Field("statuscode", w.StatusCode),
-		mlog.Field("proto", strings.ToLower(w.R.Proto)),
-		mlog.Field("remoteaddr", w.R.RemoteAddr),
-		mlog.Field("tlsinfo", tlsinfo),
-		mlog.Field("useragent", w.R.Header.Get("User-Agent")),
-		mlog.Field("referrr", w.R.Header.Get("Referrer")),
+	attrs := []slog.Attr{
+		slog.String("httpaccess", ""),
+		slog.String("handler", w.Handler),
+		slog.String("method", method),
+		slog.Any("url", w.R.URL),
+		slog.String("host", w.R.Host),
+		slog.Duration("duration", time.Since(w.Start)),
+		slog.Int("statuscode", w.StatusCode),
+		slog.String("proto", strings.ToLower(w.R.Proto)),
+		slog.Any("remoteaddr", w.R.RemoteAddr),
+		slog.String("tlsinfo", tlsinfo),
+		slog.String("useragent", w.R.Header.Get("User-Agent")),
+		slog.String("referrr", w.R.Header.Get("Referrer")),
 	}
 	if w.WebsocketRequest {
-		fields = append(fields,
-			mlog.Field("websocketrequest", true),
+		attrs = append(attrs,
+			slog.Bool("websocketrequest", true),
 		)
 	}
 	if w.WebsocketResponse {
-		fields = append(fields,
-			mlog.Field("websocket", true),
-			mlog.Field("sizetoclient", w.SizeToClient),
-			mlog.Field("sizefromclient", w.SizeFromClient),
+		attrs = append(attrs,
+			slog.Bool("websocket", true),
+			slog.Int64("sizetoclient", w.SizeToClient),
+			slog.Int64("sizefromclient", w.SizeFromClient),
+		)
+	} else if w.UncompressedSize > 0 {
+		attrs = append(attrs,
+			slog.Int64("size", w.Size),
+			slog.Int64("uncompressedsize", w.UncompressedSize),
 		)
 	} else {
-		fields = append(fields,
-			mlog.Field("size", w.Size),
+		attrs = append(attrs,
+			slog.Int64("size", w.Size),
 		)
 	}
-	xlog.WithContext(w.R.Context()).Debugx("http request", err, fields...)
+	attrs = append(attrs, w.Attrs...)
+	pkglog.WithContext(w.R.Context()).Debugx("http request", err, attrs...)
 }
 
 // Set some http headers that should prevent potential abuse. Better safe than sorry.
@@ -258,9 +406,9 @@ func (s *serve) ServeHTTP(xw http.ResponseWriter, r *http.Request) {
 	// Rate limiting as early as possible.
 	ipstr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		xlog.Debugx("split host:port client remoteaddr", err, mlog.Field("remoteaddr", r.RemoteAddr))
+		pkglog.Debugx("split host:port client remoteaddr", err, slog.Any("remoteaddr", r.RemoteAddr))
 	} else if ip := net.ParseIP(ipstr); ip == nil {
-		xlog.Debug("parsing ip for client remoteaddr", mlog.Field("remoteaddr", r.RemoteAddr))
+		pkglog.Debug("parsing ip for client remoteaddr", slog.Any("remoteaddr", r.RemoteAddr))
 	} else if !limiterConnectionrate.Add(ip, now, 1) {
 		method := metricHTTPMethod(r.Method)
 		proto := "http"
@@ -277,8 +425,14 @@ func (s *serve) ServeHTTP(xw http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), mlog.CidKey, mox.Cid())
 	r = r.WithContext(ctx)
 
+	wf, ok := xw.(responseWriterFlusher)
+	if !ok {
+		http.Error(xw, "500 - internal server error - cannot access underlying connection"+recvid(r), http.StatusInternalServerError)
+		return
+	}
+
 	nw := &loggingWriter{
-		W:     xw,
+		W:     wf,
 		Start: now,
 		R:     r,
 	}
@@ -312,6 +466,7 @@ func (s *serve) ServeHTTP(xw http.ResponseWriter, r *http.Request) {
 		}
 		if r.URL.Path == h.Path || strings.HasSuffix(h.Path, "/") && strings.HasPrefix(r.URL.Path, h.Path) {
 			nw.Handler = h.Name
+			nw.Compress = true
 			h.Handler.ServeHTTP(nw, r)
 			return
 		}
@@ -338,7 +493,13 @@ func Listen() {
 		}
 	}
 
-	for name, l := range mox.Conf.Static.Listeners {
+	// Initialize listeners in deterministic order for the same potential error
+	// messages.
+	names := maps.Keys(mox.Conf.Static.Listeners)
+	sort.Strings(names)
+	for _, name := range names {
+		l := mox.Conf.Static.Listeners[name]
+
 		portServe := map[int]*serve{}
 
 		var ensureServe func(https bool, port int, kind string) *serve
@@ -373,7 +534,7 @@ func Listen() {
 				path = l.AccountHTTP.Path
 			}
 			srv := ensureServe(false, port, "account-http at "+path)
-			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(accountHandle)))
+			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webaccount.Handler(path, l.AccountHTTP.Forwarded))))
 			srv.Handle("account", nil, path, handler)
 			redirectToTrailingSlash(srv, "account", path)
 		}
@@ -384,7 +545,7 @@ func Listen() {
 				path = l.AccountHTTPS.Path
 			}
 			srv := ensureServe(true, port, "account-https at "+path)
-			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(accountHandle)))
+			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webaccount.Handler(path, l.AccountHTTPS.Forwarded))))
 			srv.Handle("account", nil, path, handler)
 			redirectToTrailingSlash(srv, "account", path)
 		}
@@ -396,7 +557,7 @@ func Listen() {
 				path = l.AdminHTTP.Path
 			}
 			srv := ensureServe(false, port, "admin-http at "+path)
-			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(adminHandle)))
+			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webadmin.Handler(path, l.AdminHTTP.Forwarded))))
 			srv.Handle("admin", nil, path, handler)
 			redirectToTrailingSlash(srv, "admin", path)
 		}
@@ -407,10 +568,38 @@ func Listen() {
 				path = l.AdminHTTPS.Path
 			}
 			srv := ensureServe(true, port, "admin-https at "+path)
-			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(adminHandle)))
+			handler := safeHeaders(http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webadmin.Handler(path, l.AdminHTTPS.Forwarded))))
 			srv.Handle("admin", nil, path, handler)
 			redirectToTrailingSlash(srv, "admin", path)
 		}
+
+		maxMsgSize := l.SMTPMaxMessageSize
+		if maxMsgSize == 0 {
+			maxMsgSize = config.DefaultMaxMsgSize
+		}
+		if l.WebmailHTTP.Enabled {
+			port := config.Port(l.WebmailHTTP.Port, 80)
+			path := "/webmail/"
+			if l.WebmailHTTP.Path != "" {
+				path = l.WebmailHTTP.Path
+			}
+			srv := ensureServe(false, port, "webmail-http at "+path)
+			handler := http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webmail.Handler(maxMsgSize, path, l.WebmailHTTP.Forwarded)))
+			srv.Handle("webmail", nil, path, handler)
+			redirectToTrailingSlash(srv, "webmail", path)
+		}
+		if l.WebmailHTTPS.Enabled {
+			port := config.Port(l.WebmailHTTPS.Port, 443)
+			path := "/webmail/"
+			if l.WebmailHTTPS.Path != "" {
+				path = l.WebmailHTTPS.Path
+			}
+			srv := ensureServe(true, port, "webmail-https at "+path)
+			handler := http.StripPrefix(path[:len(path)-1], http.HandlerFunc(webmail.Handler(maxMsgSize, path, l.WebmailHTTPS.Forwarded)))
+			srv.Handle("webmail", nil, path, handler)
+			redirectToTrailingSlash(srv, "webmail", path)
+		}
+
 		if l.MetricsHTTP.Enabled {
 			port := config.Port(l.MetricsHTTP.Port, 8010)
 			srv := ensureServe(false, port, "metrics-http")
@@ -424,18 +613,31 @@ func Listen() {
 					return
 				}
 				w.Header().Set("Content-Type", "text/html")
-				fmt.Fprint(w, `<html><body>see <a href="/metrics">/metrics</a></body></html>`)
+				fmt.Fprint(w, `<html><body>see <a href="metrics">metrics</a></body></html>`)
 			})))
 		}
 		if l.AutoconfigHTTPS.Enabled {
 			port := config.Port(l.AutoconfigHTTPS.Port, 443)
 			srv := ensureServe(!l.AutoconfigHTTPS.NonTLS, port, "autoconfig-https")
 			autoconfigMatch := func(dom dns.Domain) bool {
-				// todo: may want to check this against the configured domains, could in theory be just a webserver.
-				return strings.HasPrefix(dom.ASCII, "autoconfig.")
+				// Thunderbird requests an autodiscovery URL at the email address domain name, so
+				// autoconfig prefix is optional.
+				if strings.HasPrefix(dom.ASCII, "autoconfig.") {
+					dom.ASCII = strings.TrimPrefix(dom.ASCII, "autoconfig.")
+					dom.Unicode = strings.TrimPrefix(dom.Unicode, "autoconfig.")
+				}
+				// Autodiscovery uses a SRV record. It shouldn't point to a CNAME. So we directly
+				// use the mail server's host name.
+				if dom == mox.Conf.Static.HostnameDomain || dom == mox.Conf.Static.Listeners["public"].HostnameDomain {
+					return true
+				}
+				dc, ok := mox.Conf.Domain(dom)
+				return ok && !dc.ReportsOnly
 			}
 			srv.Handle("autoconfig", autoconfigMatch, "/mail/config-v1.1.xml", safeHeaders(http.HandlerFunc(autoconfHandle)))
 			srv.Handle("autodiscover", autoconfigMatch, "/autodiscover/autodiscover.xml", safeHeaders(http.HandlerFunc(autodiscoverHandle)))
+			srv.Handle("mobileconfig", autoconfigMatch, "/profile.mobileconfig", safeHeaders(http.HandlerFunc(mobileconfigHandle)))
+			srv.Handle("mobileconfigqrcodepng", autoconfigMatch, "/profile.mobileconfig.qrcode.png", safeHeaders(http.HandlerFunc(mobileconfigQRCodeHandle)))
 		}
 		if l.MTASTSHTTPS.Enabled {
 			port := config.Port(l.MTASTSHTTPS.Port, 443)
@@ -450,7 +652,7 @@ func Listen() {
 			// Importing net/http/pprof registers handlers on the default serve mux.
 			port := config.Port(l.PprofHTTP.Port, 8011)
 			if _, ok := portServe[port]; ok {
-				xlog.Fatal("cannot serve pprof on same endpoint as other http services")
+				pkglog.Fatal("cannot serve pprof on same endpoint as other http services")
 			}
 			srv := &serve{[]string{"pprof-http"}, nil, nil, false}
 			portServe[port] = srv
@@ -483,20 +685,31 @@ func Listen() {
 			if l.HostnameDomain.ASCII != "" {
 				hosts[l.HostnameDomain] = struct{}{}
 			}
-			// All domains are served on all listeners.
+			// All domains are served on all listeners. Gather autoconfig hostnames to ensure
+			// presence of TLS certificates for.
 			for _, name := range mox.Conf.Domains() {
-				dom, err := dns.ParseDomain("autoconfig." + name)
+				if dom, err := dns.ParseDomain(name); err != nil {
+					pkglog.Errorx("parsing domain from config", err)
+				} else if d, _ := mox.Conf.Domain(dom); d.ReportsOnly {
+					// Do not gather autoconfig name if we aren't accepting email for this domain.
+					continue
+				}
+
+				autoconfdom, err := dns.ParseDomain("autoconfig." + name)
 				if err != nil {
-					xlog.Errorx("parsing domain from config for autoconfig", err)
+					pkglog.Errorx("parsing domain from config for autoconfig", err)
 				} else {
-					hosts[dom] = struct{}{}
+					hosts[autoconfdom] = struct{}{}
 				}
 			}
 
 			ensureManagerHosts[m] = hosts
 		}
 
-		for port, srv := range portServe {
+		ports := maps.Keys(portServe)
+		sort.Ints(ports)
+		for _, port := range ports {
+			srv := portServe[port]
 			sort.Slice(srv.PathHandlers, func(i, j int) bool {
 				a := srv.PathHandlers[i].Path
 				b := srv.PathHandlers[j].Path
@@ -534,20 +747,26 @@ func listen1(ip string, port int, tlsConfig *tls.Config, name string, kinds []st
 	if tlsConfig == nil {
 		protocol = "http"
 		if os.Getuid() == 0 {
-			xlog.Print("http listener", mlog.Field("name", name), mlog.Field("kinds", strings.Join(kinds, ",")), mlog.Field("address", addr))
+			pkglog.Print("http listener",
+				slog.String("name", name),
+				slog.String("kinds", strings.Join(kinds, ",")),
+				slog.String("address", addr))
 		}
 		ln, err = mox.Listen(mox.Network(ip), addr)
 		if err != nil {
-			xlog.Fatalx("http: listen", err, mlog.Field("addr", addr))
+			pkglog.Fatalx("http: listen", err, slog.Any("addr", addr))
 		}
 	} else {
 		protocol = "https"
 		if os.Getuid() == 0 {
-			xlog.Print("https listener", mlog.Field("name", name), mlog.Field("kinds", strings.Join(kinds, ",")), mlog.Field("address", addr))
+			pkglog.Print("https listener",
+				slog.String("name", name),
+				slog.String("kinds", strings.Join(kinds, ",")),
+				slog.String("address", addr))
 		}
 		ln, err = mox.Listen(mox.Network(ip), addr)
 		if err != nil {
-			xlog.Fatalx("https: listen", err, mlog.Field("addr", addr))
+			pkglog.Fatalx("https: listen", err, slog.String("addr", addr))
 		}
 		ln = tls.NewListener(ln, tlsConfig)
 	}
@@ -557,19 +776,20 @@ func listen1(ip string, port int, tlsConfig *tls.Config, name string, kinds []st
 		TLSConfig:         tlsConfig,
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       65 * time.Second, // Chrome closes connections after 60 seconds, firefox after 115 seconds.
-		ErrorLog:          golog.New(mlog.ErrWriter(xlog.Fields(mlog.Field("pkg", "net/http")), mlog.LevelInfo, protocol+" error"), "", 0),
+		ErrorLog:          golog.New(mlog.LogWriter(pkglog.With(slog.String("pkg", "net/http")), slog.LevelInfo, protocol+" error"), "", 0),
 	}
 	serve := func() {
 		err := server.Serve(ln)
-		xlog.Fatalx(protocol+": serve", err)
+		pkglog.Fatalx(protocol+": serve", err)
 	}
 	servers = append(servers, serve)
 }
 
 // Serve starts serving on the initialized listeners.
 func Serve() {
-	go manageAuthCache()
-	go importManage()
+	loadStaticGzipCache(mox.DataDirPath("tmp/httpstaticcompresscache"), 512*1024*1024)
+
+	go webaccount.ImportManage()
 
 	for _, serve := range servers {
 		go serve()
@@ -581,6 +801,14 @@ func Serve() {
 		i := 0
 		for m, hosts := range ensureManagerHosts {
 			for host := range hosts {
+				// Check if certificate is already available. If so, we don't print as much after a
+				// restart, and finish more quickly if only a few certificates are missing/old.
+				if avail, err := m.CertAvailable(mox.Shutdown, pkglog, host); err != nil {
+					pkglog.Errorx("checking acme certificate availability", err, slog.Any("host", host))
+				} else if avail {
+					continue
+				}
+
 				if i >= 10 {
 					// Just in case someone adds quite some domains to their config. We don't want to
 					// hit any ACME rate limits.
@@ -602,9 +830,9 @@ func Serve() {
 					SignatureSchemes:  []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
 					SupportedVersions: []uint16{tls.VersionTLS13},
 				}
-				xlog.Print("ensuring certificate availability", mlog.Field("hostname", host))
+				pkglog.Print("ensuring certificate availability", slog.Any("hostname", host))
 				if _, err := m.Manager.GetCertificate(hello); err != nil {
-					xlog.Errorx("requesting automatic certificate", err, mlog.Field("hostname", host))
+					pkglog.Errorx("requesting automatic certificate", err, slog.Any("hostname", host))
 				}
 			}
 		}

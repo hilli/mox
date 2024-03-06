@@ -3,6 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -24,6 +31,7 @@ import (
 	"github.com/mjl-/mox/config"
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/dnsbl"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/store"
@@ -33,11 +41,19 @@ import (
 var moxService string
 
 func pwgen() string {
-	rand := mox.NewRand()
 	chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*-_;:,<.>/"
 	s := ""
+	buf := make([]byte, 1)
 	for i := 0; i < 12; i++ {
-		s += string(chars[rand.Intn(len(chars))])
+		for {
+			cryptorand.Read(buf)
+			i := int(buf[0])
+			if i+len(chars) > 255 {
+				continue // Prevent bias.
+			}
+			s += string(chars[i%len(chars)])
+			break
+		}
 	}
 	return s
 }
@@ -146,81 +162,109 @@ logging in with IMAP.
 	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer resolveCancel()
 
+	fmt.Printf("Checking if DNS resolvers are DNSSEC-verifying...")
+	_, resolverDNSSECResult, err := resolver.LookupNS(resolveCtx, ".")
+	if err != nil {
+		fmt.Println("")
+		fatalf("checking dnssec support in resolver: %v", err)
+	} else if !resolverDNSSECResult.Authentic {
+		fmt.Printf(`
+
+WARNING: It looks like the DNS resolvers configured on your system do not
+verify DNSSEC, or aren't trusted (by having loopback IPs or through "options
+trust-ad" in /etc/resolv.conf).  Without DNSSEC, outbound delivery with SMTP
+used unprotected MX records, and SMTP STARTTLS connections cannot verify the TLS
+certificate with DANE (based on a public key in DNS), and will fallback to
+either MTA-STS for verification, or use "opportunistic TLS" with no certificate
+verification.
+
+Recommended action: Install unbound, a DNSSEC-verifying recursive DNS resolver,
+and enable support for "extended dns errors" (EDE):
+
+cat <<EOF >/etc/unbound/unbound.conf.d/ede.conf
+server:
+    ede: yes
+    val-log-level: 2
+EOF
+
+`)
+	} else {
+		fmt.Println(" OK")
+	}
+
 	// We are going to find the (public) IPs to listen on and possibly the host name.
 
 	// Start with reasonable defaults. We'll replace them specific IPs, if we can find them.
-	publicListenerIPs := []string{"0.0.0.0", "::"}
 	privateListenerIPs := []string{"127.0.0.1", "::1"}
+	publicListenerIPs := []string{"0.0.0.0", "::"}
+	var publicNATIPs []string // Actual public IP, but when it is NATed and machine doesn't have direct access.
+	defaultPublicListenerIPs := true
 
 	// If we find IPs based on network interfaces, {public,private}ListenerIPs are set
 	// based on these values.
-	var privateIPs, publicIPs []string
+	var loopbackIPs, privateIPs, publicIPs []string
+
+	// Gather IP addresses for public and private listeners.
+	// We look at each network interface. If an interface has a private address, we
+	// conservatively assume all addresses on that interface are private.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		fatalf("listing network interfaces: %s", err)
+	}
+	parseAddrIP := func(s string) net.IP {
+		if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+			s = s[1 : len(s)-1]
+		}
+		ip, _, _ := net.ParseCIDR(s)
+		return ip
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			fatalf("listing address for network interface: %s", err)
+		}
+		if len(addrs) == 0 {
+			continue
+		}
+
+		// todo: should we detect temporary/ephemeral ipv6 addresses and not add them?
+		var nonpublic bool
+		for _, addr := range addrs {
+			ip := parseAddrIP(addr.String())
+			if ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
+				continue
+			}
+			if ip.IsLoopback() || ip.IsPrivate() {
+				nonpublic = true
+				break
+			}
+		}
+
+		for _, addr := range addrs {
+			ip := parseAddrIP(addr.String())
+			if ip == nil {
+				continue
+			}
+			if ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
+				continue
+			}
+			if nonpublic {
+				if ip.IsLoopback() {
+					loopbackIPs = append(loopbackIPs, ip.String())
+				} else {
+					privateIPs = append(privateIPs, ip.String())
+				}
+			} else {
+				publicIPs = append(publicIPs, ip.String())
+			}
+		}
+	}
 
 	var dnshostname dns.Domain
 	if hostname == "" {
-		// Gather IP addresses for public and private listeners.
-		// If we cannot find addresses for a category we fallback to all ips or localhost ips.
-		// We look at each network interface. If an interface has a private address, we
-		// conservatively assume all addresses on that interface are private.
-		ifaces, err := net.Interfaces()
-		if err != nil {
-			fatalf("listing network interfaces: %s", err)
-		}
-		parseAddrIP := func(s string) net.IP {
-			if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
-				s = s[1 : len(s)-1]
-			}
-			ip, _, _ := net.ParseCIDR(s)
-			return ip
-		}
-		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				fatalf("listing address for network interface: %s", err)
-			}
-			if len(addrs) == 0 {
-				continue
-			}
-
-			// todo: should we detect temporary/ephemeral ipv6 addresses and not add them?
-			var nonpublic bool
-			for _, addr := range addrs {
-				ip := parseAddrIP(addr.String())
-				if ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
-					continue
-				}
-				if ip.IsLoopback() || ip.IsPrivate() {
-					nonpublic = true
-					break
-				}
-			}
-
-			for _, addr := range addrs {
-				ip := parseAddrIP(addr.String())
-				if ip == nil {
-					continue
-				}
-				if ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
-					continue
-				}
-				if nonpublic {
-					privateIPs = append(privateIPs, ip.String())
-				} else {
-					publicIPs = append(publicIPs, ip.String())
-				}
-			}
-		}
-
-		if len(publicIPs) > 0 {
-			publicListenerIPs = publicIPs
-		}
-		if len(privateIPs) > 0 {
-			privateListenerIPs = privateIPs
-		}
-
 		hostnameStr, err := os.Hostname()
 		if err != nil {
 			fatalf("hostname: %s", err)
@@ -246,7 +290,7 @@ logging in with IMAP.
 			for _, ip := range publicIPs {
 				revctx, revcancel := context.WithTimeout(resolveCtx, 5*time.Second)
 				defer revcancel()
-				l, err := resolver.LookupAddr(revctx, ip)
+				l, _, err := resolver.LookupAddr(revctx, ip)
 				if err != nil {
 					warnf("WARNING: looking up reverse name(s) for %s: %v", ip, err)
 				}
@@ -308,12 +352,16 @@ again with the -hostname flag.
 	fmt.Printf("Looking up IPs for hostname %s...", dnshostname)
 	ipctx, ipcancel := context.WithTimeout(resolveCtx, 5*time.Second)
 	defer ipcancel()
-	ips, err := resolver.LookupIPAddr(ipctx, dnshostname.ASCII+".")
+	ips, domainDNSSECResult, err := resolver.LookupIPAddr(ipctx, dnshostname.ASCII+".")
 	ipcancel()
 	var xips []net.IPAddr
-	var xipstrs []string
+	var hostIPs []string
 	var dnswarned bool
+	hostPrivate := len(ips) > 0
 	for _, ip := range ips {
+		if !ip.IP.IsPrivate() {
+			hostPrivate = false
+		}
 		// During linux install, you may get an alias for you full hostname in /etc/hosts
 		// resolving to 127.0.1.1, which would result in a false positive about the
 		// hostname having a record. Filter it out. It is a bit surprising that hosts don't
@@ -324,17 +372,60 @@ again with the -hostname flag.
 			continue
 		}
 		xips = append(xips, ip)
-		xipstrs = append(xipstrs, ip.String())
+		hostIPs = append(hostIPs, ip.String())
 	}
 	if err == nil && len(xips) == 0 {
 		// todo: possibly check this by trying to resolve without using /etc/hosts?
 		err = errors.New("hostname not in dns, probably only in /etc/hosts")
 	}
 	ips = xips
-	if hostname != "" {
-		// Host name was specified, assume we will run on a machine with those IPs.
-		publicListenerIPs = xipstrs
-		publicIPs = xipstrs
+
+	// We may have found private and public IPs on the machine, and IPs for the host
+	// name we think we should use. They may not match with each other. E.g. the public
+	// IPs on interfaces could be different from the IPs for the host. We don't try to
+	// detect all possible configs, but just generate what makes sense given whether we
+	// found public/private/hostname IPs. If the user is doing sensible things, it
+	// should be correct. But they should be checking the generated config file anyway.
+	// And we do log which host name we are using, and whether we detected a NAT setup.
+	// In the future, we may do an interactive setup that can guide the user better.
+
+	if !hostPrivate && len(publicIPs) == 0 && len(privateIPs) > 0 {
+		// We only have private IPs, assume we are behind a NAT and put the IPs of the host in NATIPs.
+		publicListenerIPs = privateIPs
+		publicNATIPs = hostIPs
+		defaultPublicListenerIPs = false
+		if len(loopbackIPs) > 0 {
+			privateListenerIPs = loopbackIPs
+		}
+	} else {
+		if len(hostIPs) > 0 {
+			publicListenerIPs = hostIPs
+			defaultPublicListenerIPs = false
+
+			// Only keep private IPs that are not in host-based publicListenerIPs. For
+			// internal-only setups, including integration tests.
+			m := map[string]bool{}
+			for _, ip := range hostIPs {
+				m[ip] = true
+			}
+			var npriv []string
+			for _, ip := range privateIPs {
+				if !m[ip] {
+					npriv = append(npriv, ip)
+				}
+			}
+			sort.Strings(npriv)
+			privateIPs = npriv
+		} else if len(publicIPs) > 0 {
+			publicListenerIPs = publicIPs
+			defaultPublicListenerIPs = false
+			hostIPs = publicIPs // For DNSBL check below.
+		}
+		if len(privateIPs) > 0 {
+			privateListenerIPs = append(privateIPs, loopbackIPs...)
+		} else if len(loopbackIPs) > 0 {
+			privateListenerIPs = loopbackIPs
+		}
 	}
 	if err != nil {
 		if !dnswarned {
@@ -358,6 +449,23 @@ This likely means one of two things:
 
 
 `, dnshostname, err)
+	} else if !domainDNSSECResult.Authentic {
+		if !dnswarned {
+			fmt.Printf("\n")
+		}
+		dnswarned = true
+		fmt.Printf(`
+NOTE: It looks like the DNS records of your domain (zone) are not DNSSEC-signed.
+Mail servers that send email to your domain, or receive email from your domain,
+cannot verify that the MX/SPF/DKIM/DMARC/MTA-STS records they receive are
+authentic. DANE, for authenticated delivery without relying on a pool of
+certificate authorities, requires DNSSEC, so will not be configured at this
+time.
+Recommended action: Continue now, but consider enabling DNSSEC for your domain
+later at your DNS operator, and adding DANE records for protecting incoming
+messages over SMTP.
+
+`)
 	}
 
 	if !dnswarned {
@@ -376,7 +484,7 @@ This likely means one of two things:
 			go func() {
 				revctx, revcancel := context.WithTimeout(resolveCtx, 5*time.Second)
 				defer revcancel()
-				addrs, err := resolver.LookupAddr(revctx, s)
+				addrs, _, err := resolver.LookupAddr(revctx, s)
 				results <- result{s, addrs, err}
 			}()
 		}
@@ -422,13 +530,13 @@ This likely means one of two things:
 		{ASCII: "sbl.spamhaus.org"},
 		{ASCII: "bl.spamcop.net"},
 	}
-	if len(publicIPs) > 0 {
-		fmt.Printf("Checking whether your public IPs are listed in popular DNS block lists...")
+	if len(hostIPs) > 0 {
+		fmt.Printf("Checking whether host name IPs are listed in popular DNS block lists...")
 		var listed bool
 		for _, zone := range zones {
-			for _, ip := range publicIPs {
+			for _, ip := range hostIPs {
 				dnsblctx, dnsblcancel := context.WithTimeout(resolveCtx, 5*time.Second)
-				status, expl, err := dnsbl.Lookup(dnsblctx, resolver, zone, net.ParseIP(ip))
+				status, expl, err := dnsbl.Lookup(dnsblctx, c.log.Logger, resolver, zone, net.ParseIP(ip))
 				dnsblcancel()
 				if status == dnsbl.StatusPass {
 					continue
@@ -449,7 +557,7 @@ email. Your IP may be in block lists only temporarily. To see if your IPs are
 listed in more DNS block lists, visit:
 
 `)
-			for _, ip := range publicIPs {
+			for _, ip := range hostIPs {
 				fmt.Printf("- https://multirbl.valli.org/lookup/%s.html\n", url.PathEscape(ip))
 			}
 			fmt.Printf("\n")
@@ -457,6 +565,33 @@ listed in more DNS block lists, visit:
 			fmt.Printf(" OK\n")
 		}
 	}
+
+	if defaultPublicListenerIPs {
+		log.Printf(`
+WARNING: Could not find your public IP address(es). The "public" listener is
+configured to listen on 0.0.0.0 (IPv4) and :: (IPv6). If you don't change these
+to your actual public IP addresses, you will likely get "address in use" errors
+when starting mox because the "internal" listener binds to a specific IP
+address on the same port(s). If you are behind a NAT, instead configure the
+actual public IPs in the listener's "NATIPs" option.
+
+`)
+	}
+	if len(publicNATIPs) > 0 {
+		log.Printf(`
+NOTE: Quickstart used the IPs of the host name of the mail server, but only
+found private IPs on the machine. This indicates this machine is behind a NAT,
+so the host IPs were configured in the NATIPs field of the public listeners. If
+you are behind a NAT that does not preserve the remote IPs of connections, you
+will likely experience problems accepting email due to IP-based policies. For
+example, SPF is a mechanism that checks if an IP address is allowed to send
+email for a domain, and mox uses IP-based (non)junk classification, and IP-based
+rate-limiting both for accepting email and blocking bad actors (such as with too
+many authentication failures).
+
+`)
+	}
+
 	fmt.Printf("\n")
 
 	user := "mox"
@@ -466,7 +601,7 @@ listed in more DNS block lists, visit:
 
 	dc := config.Dynamic{}
 	sc := config.Static{
-		DataDir:           "../data",
+		DataDir:           filepath.FromSlash("../data"),
 		User:              user,
 		LogLevel:          "debug", // Help new users, they'll bring it back to info when it all works.
 		Hostname:          dnshostname.Name(),
@@ -475,8 +610,9 @@ listed in more DNS block lists, visit:
 	if !existingWebserver {
 		sc.ACME = map[string]config.ACME{
 			"letsencrypt": {
-				DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory",
-				ContactEmail: args[0], // todo: let user specify an alternative fallback address?
+				DirectoryURL:     "https://acme-v02.api.letsencrypt.org/directory",
+				ContactEmail:     args[0], // todo: let user specify an alternative fallback address?
+				IssuerDomainName: "letsencrypt.org",
 			},
 		}
 	}
@@ -491,16 +627,17 @@ listed in more DNS block lists, visit:
 	fmt.Printf("Admin password: %s\n", adminpw)
 
 	public := config.Listener{
-		IPs: publicListenerIPs,
+		IPs:    publicListenerIPs,
+		NATIPs: publicNATIPs,
 	}
 	public.SMTP.Enabled = true
 	public.Submissions.Enabled = true
 	public.IMAPS.Enabled = true
 
 	if existingWebserver {
-		hostbase := fmt.Sprintf("path/to/%s", dnshostname.Name())
-		mtastsbase := fmt.Sprintf("path/to/mta-sts.%s", domain.Name())
-		autoconfigbase := fmt.Sprintf("path/to/autoconfig.%s", domain.Name())
+		hostbase := filepath.FromSlash("path/to/" + dnshostname.Name())
+		mtastsbase := filepath.FromSlash("path/to/mta-sts." + domain.Name())
+		autoconfigbase := filepath.FromSlash("path/to/autoconfig." + domain.Name())
 		public.TLS = &config.TLS{
 			KeyCerts: []config.KeyCert{
 				{CertFile: hostbase + "-chain.crt.pem", KeyFile: hostbase + ".key.pem"},
@@ -508,9 +645,57 @@ listed in more DNS block lists, visit:
 				{CertFile: autoconfigbase + "-chain.crt.pem", KeyFile: autoconfigbase + ".key.pem"},
 			},
 		}
+
+		fmt.Println(
+			`Placeholder paths to TLS certificates to be provided by the existing webserver
+have been placed in config/mox.conf and need to be edited.
+
+No private keys for the public listener have been generated for use with DANE.
+To configure DANE (which requires DNSSEC), set config field HostPrivateKeyFiles
+in the "public" Listener to both RSA 2048-bit and ECDSA P-256 private key files
+and check the admin page for the needed DNS records.`)
+
 	} else {
+		// todo: we may want to generate a second set of keys, make the user already add it to the DNS, but keep the private key offline. would require config option to specify a public key only, so the dane records can be generated.
+		hostRSAPrivateKey, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+		if err != nil {
+			fatalf("generating rsa private key for host: %s", err)
+		}
+		hostECDSAPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+		if err != nil {
+			fatalf("generating ecsa private key for host: %s", err)
+		}
+		now := time.Now()
+		timestamp := now.Format("20060102T150405")
+		hostRSAPrivateKeyFile := filepath.Join("hostkeys", fmt.Sprintf("%s.%s.%s.privatekey.pkcs8.pem", dnshostname.Name(), timestamp, "rsa2048"))
+		hostECDSAPrivateKeyFile := filepath.Join("hostkeys", fmt.Sprintf("%s.%s.%s.privatekey.pkcs8.pem", dnshostname.Name(), timestamp, "ecdsap256"))
+		xwritehostkeyfile := func(path string, key crypto.Signer) {
+			buf, err := x509.MarshalPKCS8PrivateKey(key)
+			if err != nil {
+				fatalf("marshaling host private key to pkcs8 for %s: %s", path, err)
+			}
+			var b bytes.Buffer
+			block := pem.Block{
+				Type:  "PRIVATE KEY",
+				Bytes: buf,
+			}
+			err = pem.Encode(&b, &block)
+			if err != nil {
+				fatalf("pem-encoding host private key file for %s: %s", path, err)
+			}
+			xwritefile(path, b.Bytes(), 0600)
+		}
+		xwritehostkeyfile(filepath.Join("config", hostRSAPrivateKeyFile), hostRSAPrivateKey)
+		xwritehostkeyfile(filepath.Join("config", hostECDSAPrivateKeyFile), hostECDSAPrivateKey)
+
 		public.TLS = &config.TLS{
 			ACME: "letsencrypt",
+			HostPrivateKeyFiles: []string{
+				hostRSAPrivateKeyFile,
+				hostECDSAPrivateKeyFile,
+			},
+			HostPrivateRSA2048Keys:   []crypto.Signer{hostRSAPrivateKey},
+			HostPrivateECDSAP256Keys: []crypto.Signer{hostECDSAPrivateKey},
 		}
 		public.AutoconfigHTTPS.Enabled = true
 		public.MTASTSHTTPS.Enabled = true
@@ -529,10 +714,15 @@ listed in more DNS block lists, visit:
 	}
 	internal.AccountHTTP.Enabled = true
 	internal.AdminHTTP.Enabled = true
+	internal.WebmailHTTP.Enabled = true
 	internal.MetricsHTTP.Enabled = true
 	if existingWebserver {
 		internal.AccountHTTP.Port = 1080
+		internal.AccountHTTP.Forwarded = true
 		internal.AdminHTTP.Port = 1080
+		internal.AdminHTTP.Forwarded = true
+		internal.WebmailHTTP.Port = 1080
+		internal.WebmailHTTP.Forwarded = true
 		internal.AutoconfigHTTPS.Enabled = true
 		internal.AutoconfigHTTPS.Port = 81
 		internal.AutoconfigHTTPS.NonTLS = true
@@ -549,9 +739,12 @@ listed in more DNS block lists, visit:
 	}
 	sc.Postmaster.Account = accountName
 	sc.Postmaster.Mailbox = "Postmaster"
+	sc.HostTLSRPT.Account = accountName
+	sc.HostTLSRPT.Localpart = "tls-reports"
+	sc.HostTLSRPT.Mailbox = "TLSRPT"
 
-	mox.ConfigStaticPath = "config/mox.conf"
-	mox.ConfigDynamicPath = "config/domains.conf"
+	mox.ConfigStaticPath = filepath.FromSlash("config/mox.conf")
+	mox.ConfigDynamicPath = filepath.FromSlash("config/domains.conf")
 
 	mox.Conf.DynamicLastCheck = time.Now() // Prevent error logging by Make calls below.
 
@@ -582,7 +775,7 @@ listed in more DNS block lists, visit:
 	for _, bl := range public.SMTP.DNSBLs {
 		confstr = strings.ReplaceAll(confstr, "- "+bl+"\n", "#- "+bl+"\n")
 	}
-	xwritefile("config/mox.conf", []byte(confstr), 0660)
+	xwritefile(filepath.FromSlash("config/mox.conf"), []byte(confstr), 0660)
 
 	// Generate domains config, and add a commented out example for delivery to a mailing list.
 	var db bytes.Buffer
@@ -616,16 +809,16 @@ listed in more DNS block lists, visit:
 	if err := sconf.Describe(&destBuf, destsExample); err != nil {
 		fatalf("describing destination example: %v", err)
 	}
-	ndests := odests + "#\t\t\tIf you receive email from mailing lists, you probably want to configure them like the example below.\n"
+	ndests := odests + "# If you receive email from mailing lists, you may want to configure them like the\n# example below (remove the empty/false SMTPMailRegexp and IsForward).\n# If you are receiving forwarded email, see the IsForwarded option in a Ruleset.\n"
 	for _, line := range strings.Split(destBuf.String(), "\n")[1:] {
 		ndests += "#\t\t" + line + "\n"
 	}
 	dconfstr := strings.ReplaceAll(db.String(), odests, ndests)
-	xwritefile("config/domains.conf", []byte(dconfstr), 0660)
+	xwritefile(filepath.FromSlash("config/domains.conf"), []byte(dconfstr), 0660)
 
 	// Verify config.
-	skipCheckTLSKeyCerts := existingWebserver
-	mc, errs := mox.ParseConfig(context.Background(), "config/mox.conf", true, skipCheckTLSKeyCerts, false)
+	loadTLSKeyCerts := !existingWebserver
+	mc, errs := mox.ParseConfig(context.Background(), c.log, filepath.FromSlash("config/mox.conf"), true, loadTLSKeyCerts, false)
 	if len(errs) > 0 {
 		if len(errs) > 1 {
 			log.Printf("checking generated config, multiple errors:")
@@ -646,16 +839,24 @@ listed in more DNS block lists, visit:
 		fatalf("cannot find domain in new config")
 	}
 
-	acc, _, err := store.OpenEmail(args[0])
+	acc, _, err := store.OpenEmail(c.log, args[0])
 	if err != nil {
 		fatalf("open account: %s", err)
 	}
 	cleanupPaths = append(cleanupPaths, dataDir, filepath.Join(dataDir, "accounts"), filepath.Join(dataDir, "accounts", accountName), filepath.Join(dataDir, "accounts", accountName, "index.db"))
 
 	password := pwgen()
-	if err := acc.SetPassword(password); err != nil {
+
+	// Kludge to cause no logging to be printed about setting a new password.
+	loglevel := mox.Conf.Log[""]
+	mox.Conf.Log[""] = mlog.LevelWarn
+	mlog.SetConfig(mox.Conf.Log)
+	if err := acc.SetPassword(c.log, password); err != nil {
 		fatalf("setting password: %s", err)
 	}
+	mox.Conf.Log[""] = loglevel
+	mlog.SetConfig(mox.Conf.Log)
+
 	if err := acc.Close(); err != nil {
 		fatalf("closing account: %s", err)
 	}
@@ -670,8 +871,9 @@ autoconfig/autodiscover does not work, use these settings:
 Configuration files have been written to config/mox.conf and
 config/domains.conf.
 
-Create the DNS records below. The admin interface can show these same records, and
-has a page to check they have been configured correctly.
+Create the DNS records below, by adding them to your zone file or through the
+web interface of your DNS operator. The admin interface can show these same
+records, and has a page to check they have been configured correctly.
 
 You must configure your existing webserver to forward requests for:
 
@@ -690,14 +892,17 @@ The paths are relative to config/ directory that holds mox.conf! To test if your
 config is valid, run:
 
 	./mox config test
+
+The DNS records to add:
 `, domain.ASCII, domain.ASCII, dnshostname.ASCII)
 	} else {
 		fmt.Printf(`
 Configuration files have been written to config/mox.conf and
-config/domains.conf. You should review them. Then create the DNS records below.
-You can also skip creating the DNS records and start mox immediately. The admin
-interface can show these same records, and has a page to check they have been
-configured correctly.
+config/domains.conf. You should review them. Then create the DNS records below,
+by adding them to your zone file or through the web interface of your DNS
+operator. You can also skip creating the DNS records and start mox immediately.
+The admin interface can show these same records, and has a page to check they
+have been configured correctly. The DNS records to add:
 `)
 	}
 
@@ -705,7 +910,7 @@ configured correctly.
 	// priming dns caches with negative/absent records, causing our "quick setup" to
 	// appear to fail or take longer than "quick".
 
-	records, err := mox.DomainRecords(confDomain, domain)
+	records, err := mox.DomainRecords(confDomain, domain, domainDNSSECResult.Authentic, "letsencrypt.org", "")
 	if err != nil {
 		fatalf("making required DNS records")
 	}
@@ -754,15 +959,13 @@ starting up. On linux, you may want to enable mox as a systemd service.
 	fmt.Printf(`
 After starting mox, the web interfaces are served at:
 
-http://localhost/       - account (email address as username)
-http://localhost/admin/ - admin (empty username)
+http://localhost/         - account (email address as username)
+http://localhost/webmail/ - webmail (email address as username)
+http://localhost/admin/   - admin (empty username)
 
 To access these from your browser, run
 "ssh -L 8080:localhost:80 you@yourmachine" locally and open
 http://localhost:8080/[...].
-
-For secure email exchange you should have a strictly validating DNSSEC
-resolver. An easy and the recommended way is to install unbound.
 
 If you run into problem, have questions/feedback or found a bug, please let us
 know. Mox needs your help!

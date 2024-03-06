@@ -5,18 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-
-	"github.com/mjl-/mox/mlog"
 )
 
 // We start up as root, bind to sockets, open private key/cert files and fork and
@@ -36,7 +32,7 @@ func RestorePassedFiles() {
 		if runtime.GOOS == "linux" {
 			linuxhint = " If you updated from v0.0.1, update the mox.service file to start as root (privileges are dropped): ./mox config printservice >mox.service && sudo systemctl daemon-reload && sudo systemctl restart mox."
 		}
-		xlog.Fatal("mox must be started as root, and will drop privileges after binding required sockets (missing environment variable MOX_SOCKETS)." + linuxhint)
+		pkglog.Fatal("mox must be started as root, and will drop privileges after binding required sockets (missing environment variable MOX_SOCKETS)." + linuxhint)
 	}
 
 	// 0,1,2 are stdin,stdout,stderr, 3 is the first passed fd (first listeners, then files).
@@ -56,68 +52,6 @@ func RestorePassedFiles() {
 	}
 }
 
-// Fork and exec as unprivileged user.
-//
-// We don't use just setuid because it is hard to guarantee that no other
-// privileged go worker processes have been started before we get here. E.g. init
-// functions in packages can start goroutines.
-func ForkExecUnprivileged() {
-	prog, err := os.Executable()
-	if err != nil {
-		xlog.Fatalx("finding executable for exec", err)
-	}
-
-	files := []*os.File{os.Stdin, os.Stdout, os.Stderr}
-	var addrs []string
-	for addr, f := range passedListeners {
-		files = append(files, f)
-		addrs = append(addrs, addr)
-	}
-	var paths []string
-	for path, fl := range passedFiles {
-		for _, f := range fl {
-			files = append(files, f)
-			paths = append(paths, path)
-		}
-	}
-	env := os.Environ()
-	env = append(env, "MOX_SOCKETS="+strings.Join(addrs, ","), "MOX_FILES="+strings.Join(paths, ","))
-
-	p, err := os.StartProcess(prog, os.Args, &os.ProcAttr{
-		Env:   env,
-		Files: files,
-		Sys: &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: Conf.Static.UID,
-				Gid: Conf.Static.GID,
-			},
-		},
-	})
-	if err != nil {
-		xlog.Fatalx("fork and exec", err)
-	}
-	CleanupPassedFiles()
-
-	// If we get a interrupt/terminate signal, pass it on to the child. For interrupt,
-	// the child probably already got it.
-	// todo: see if we tie up child and root process so a kill -9 of the root process
-	// kills the child process too.
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-sigc
-		p.Signal(sig)
-	}()
-
-	st, err := p.Wait()
-	if err != nil {
-		xlog.Fatalx("wait", err)
-	}
-	code := st.ExitCode()
-	xlog.Print("stopping after child exit", mlog.Field("exitcode", code))
-	os.Exit(code)
-}
-
 // CleanupPassedFiles closes the listening socket file descriptors and files passed
 // in by the parent process. To be called by the unprivileged child after listeners
 // have been recreated (they dup the file descriptor), and by the privileged
@@ -125,12 +59,12 @@ func ForkExecUnprivileged() {
 func CleanupPassedFiles() {
 	for _, f := range passedListeners {
 		err := f.Close()
-		xlog.Check(err, "closing listener socket file descriptor")
+		pkglog.Check(err, "closing listener socket file descriptor")
 	}
 	for _, fl := range passedFiles {
 		for _, f := range fl {
 			err := f.Close()
-			xlog.Check(err, "closing path file descriptor")
+			pkglog.Check(err, "closing path file descriptor")
 		}
 	}
 }
@@ -164,15 +98,19 @@ func Listen(network, addr string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	tcpln, ok := ln.(*net.TCPListener)
-	if !ok {
-		return nil, fmt.Errorf("listener not a tcp listener, but %T, for network %s, address %s", ln, network, addr)
+	// On windows, we cannot duplicate a socket. We don't need to for mox localserve
+	// with FilesImmediate.
+	if !FilesImmediate {
+		tcpln, ok := ln.(*net.TCPListener)
+		if !ok {
+			return nil, fmt.Errorf("listener not a tcp listener, but %T, for network %s, address %s", ln, network, addr)
+		}
+		f, err := tcpln.File()
+		if err != nil {
+			return nil, fmt.Errorf("dup listener: %v", err)
+		}
+		passedListeners[addr] = f
 	}
-	f, err := tcpln.File()
-	if err != nil {
-		return nil, fmt.Errorf("dup listener: %v", err)
-	}
-	passedListeners[addr] = f
 	return ln, err
 }
 
@@ -255,7 +193,7 @@ func (c *connections) Register(nc net.Conn, protocol, listener string) {
 	// doesn't hurt to log it.
 	select {
 	case <-Shutdown.Done():
-		xlog.Error("new connection added while shutting down")
+		pkglog.Error("new connection added while shutting down")
 		debug.PrintStack()
 	default:
 	}
@@ -320,7 +258,7 @@ func (c *connections) Shutdown() {
 	defer c.Unlock()
 	for nc := range c.conns {
 		if err := nc.SetDeadline(now); err != nil {
-			xlog.Errorx("setting immediate read/write deadline for shutdown", err)
+			pkglog.Errorx("setting immediate read/write deadline for shutdown", err)
 		}
 	}
 }

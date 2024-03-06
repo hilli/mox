@@ -3,13 +3,14 @@ package http
 import (
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"rsc.io/qr"
 
-	"github.com/mjl-/mox/config"
-	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/smtp"
 )
@@ -36,7 +37,9 @@ var (
 //   - Thunderbird will request an "autoconfig" xml file.
 //   - Microsoft tools will request an "autodiscovery" xml file.
 //   - In my tests on an internal domain, iOS mail only talks to Apple servers, then
-//   does not attempt autoconfiguration. Possibly due to them being private DNS names.
+//     does not attempt autoconfiguration. Possibly due to them being private DNS
+//     names. Apple software can be provisioned with "mobileconfig" profile files,
+//     which users can download after logging in.
 //
 // DNS records seem optional, but autoconfig.<domain> and autodiscover.<domain>
 // (both CNAME or A) are useful, and so is SRV _autodiscovery._tcp.<domain> 0 0 443
@@ -52,7 +55,7 @@ var (
 // User should create a DNS record: autoconfig.<domain> (CNAME or A).
 // See https://wiki.mozilla.org/Thunderbird:Autoconfiguration:ConfigFileFormat
 func autoconfHandle(w http.ResponseWriter, r *http.Request) {
-	log := xlog.WithContext(r.Context())
+	log := pkglog.WithContext(r.Context())
 
 	var addrDom string
 	defer func() {
@@ -60,20 +63,38 @@ func autoconfHandle(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	email := r.FormValue("emailaddress")
-	log.Debug("autoconfig request", mlog.Field("email", email))
+	log.Debug("autoconfig request", slog.String("email", email))
 	addr, err := smtp.ParseAddress(email)
 	if err != nil {
 		http.Error(w, "400 - bad request - invalid parameter emailaddress", http.StatusBadRequest)
 		return
 	}
 
-	if _, ok := mox.Conf.Domain(addr.Domain); !ok {
-		http.Error(w, "400 - bad request - unknown domain", http.StatusBadRequest)
+	socketType := func(tlsMode mox.TLSMode) (string, error) {
+		switch tlsMode {
+		case mox.TLSModeImmediate:
+			return "SSL", nil
+		case mox.TLSModeSTARTTLS:
+			return "STARTTLS", nil
+		case mox.TLSModeNone:
+			return "plain", nil
+		default:
+			return "", fmt.Errorf("unknown tls mode %v", tlsMode)
+		}
+	}
+
+	var imapTLS, submissionTLS string
+	config, err := mox.ClientConfigDomain(addr.Domain)
+	if err == nil {
+		imapTLS, err = socketType(config.IMAP.TLSMode)
+	}
+	if err == nil {
+		submissionTLS, err = socketType(config.Submission.TLSMode)
+	}
+	if err != nil {
+		http.Error(w, "400 - bad request - "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	addrDom = addr.Domain.Name()
-
-	hostname := mox.Conf.Static.HostnameDomain
 
 	// Thunderbird doesn't seem to allow U-labels, always return ASCII names.
 	var resp autoconfigResponse
@@ -83,64 +104,24 @@ func autoconfHandle(w http.ResponseWriter, r *http.Request) {
 	resp.EmailProvider.DisplayName = email
 	resp.EmailProvider.DisplayShortName = addr.Domain.ASCII
 
-	var imapPort int
-	var imapSocket string
-	for _, l := range mox.Conf.Static.Listeners {
-		if l.IMAPS.Enabled {
-			imapSocket = "SSL"
-			imapPort = config.Port(l.IMAPS.Port, 993)
-		} else if l.IMAP.Enabled {
-			if l.TLS != nil && imapSocket != "SSL" {
-				imapSocket = "STARTTLS"
-				imapPort = config.Port(l.IMAP.Port, 143)
-			} else if imapSocket == "" {
-				imapSocket = "plain"
-				imapPort = config.Port(l.IMAP.Port, 143)
-			}
-		}
-	}
-	if imapPort == 0 {
-		log.Error("autoconfig: no imap configured?")
-	}
-
 	// todo: specify SCRAM-SHA-256 once thunderbird and autoconfig supports it. or perhaps that will fall under "password-encrypted" by then.
 
 	resp.EmailProvider.IncomingServer.Type = "imap"
-	resp.EmailProvider.IncomingServer.Hostname = hostname.ASCII
-	resp.EmailProvider.IncomingServer.Port = imapPort
-	resp.EmailProvider.IncomingServer.SocketType = imapSocket
+	resp.EmailProvider.IncomingServer.Hostname = config.IMAP.Host.ASCII
+	resp.EmailProvider.IncomingServer.Port = config.IMAP.Port
+	resp.EmailProvider.IncomingServer.SocketType = imapTLS
 	resp.EmailProvider.IncomingServer.Username = email
 	resp.EmailProvider.IncomingServer.Authentication = "password-encrypted"
 
-	var smtpPort int
-	var smtpSocket string
-	for _, l := range mox.Conf.Static.Listeners {
-		if l.Submissions.Enabled {
-			smtpSocket = "SSL"
-			smtpPort = config.Port(l.Submissions.Port, 465)
-		} else if l.Submission.Enabled {
-			if l.TLS != nil && smtpSocket != "SSL" {
-				smtpSocket = "STARTTLS"
-				smtpPort = config.Port(l.Submission.Port, 587)
-			} else if smtpSocket == "" {
-				smtpSocket = "plain"
-				smtpPort = config.Port(l.Submission.Port, 587)
-			}
-		}
-	}
-	if smtpPort == 0 {
-		log.Error("autoconfig: no smtp submission configured?")
-	}
-
 	resp.EmailProvider.OutgoingServer.Type = "smtp"
-	resp.EmailProvider.OutgoingServer.Hostname = hostname.ASCII
-	resp.EmailProvider.OutgoingServer.Port = smtpPort
-	resp.EmailProvider.OutgoingServer.SocketType = smtpSocket
+	resp.EmailProvider.OutgoingServer.Hostname = config.Submission.Host.ASCII
+	resp.EmailProvider.OutgoingServer.Port = config.Submission.Port
+	resp.EmailProvider.OutgoingServer.SocketType = submissionTLS
 	resp.EmailProvider.OutgoingServer.Username = email
 	resp.EmailProvider.OutgoingServer.Authentication = "password-encrypted"
 
 	// todo: should we put the email address in the URL?
-	resp.ClientConfigUpdate.URL = fmt.Sprintf("https://%s/mail/config-v1.1.xml", hostname.ASCII)
+	resp.ClientConfigUpdate.URL = fmt.Sprintf("https://autoconfig.%s/mail/config-v1.1.xml", addr.Domain.ASCII)
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	enc := xml.NewEncoder(w)
@@ -152,7 +133,7 @@ func autoconfHandle(w http.ResponseWriter, r *http.Request) {
 }
 
 // Autodiscover from Microsoft, also used by Thunderbird.
-// User should create a DNS record: _autodiscover._tcp.<domain> IN SRV 0 0 443 <hostname or autodiscover.<domain>>
+// User should create a DNS record: _autodiscover._tcp.<domain> SRV 0 0 443 <hostname>
 //
 // In practice, autodiscover does not seem to work wit microsoft clients. A
 // connectivity test tool for outlook is available on
@@ -162,7 +143,7 @@ func autoconfHandle(w http.ResponseWriter, r *http.Request) {
 //
 // Thunderbird does understand autodiscover.
 func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
-	log := xlog.WithContext(r.Context())
+	log := pkglog.WithContext(r.Context())
 
 	var addrDom string
 	defer func() {
@@ -180,7 +161,7 @@ func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Debug("autodiscover request", mlog.Field("email", req.Request.EmailAddress))
+	log.Debug("autodiscover request", slog.String("email", req.Request.EmailAddress))
 
 	addr, err := smtp.ParseAddress(req.Request.EmailAddress)
 	if err != nil {
@@ -188,13 +169,33 @@ func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := mox.Conf.Domain(addr.Domain); !ok {
-		http.Error(w, "400 - bad request - unknown domain", http.StatusBadRequest)
+	// tlsmode returns the "ssl" and "encryption" fields.
+	tlsmode := func(tlsMode mox.TLSMode) (string, string, error) {
+		switch tlsMode {
+		case mox.TLSModeImmediate:
+			return "on", "TLS", nil
+		case mox.TLSModeSTARTTLS:
+			return "on", "", nil
+		case mox.TLSModeNone:
+			return "off", "", nil
+		default:
+			return "", "", fmt.Errorf("unknown tls mode %v", tlsMode)
+		}
+	}
+
+	var imapSSL, imapEncryption string
+	var submissionSSL, submissionEncryption string
+	config, err := mox.ClientConfigDomain(addr.Domain)
+	if err == nil {
+		imapSSL, imapEncryption, err = tlsmode(config.IMAP.TLSMode)
+	}
+	if err == nil {
+		submissionSSL, submissionEncryption, err = tlsmode(config.Submission.TLSMode)
+	}
+	if err != nil {
+		http.Error(w, "400 - bad request - "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	addrDom = addr.Domain.Name()
-
-	hostname := mox.Conf.Static.HostnameDomain
 
 	// The docs are generated and fragmented in many tiny pages, hard to follow.
 	// High-level starting point, https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxdscli/78530279-d042-4eb0-a1f4-03b18143cd19
@@ -204,47 +205,6 @@ func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
 	// authentication method, or any authentication method that real clients actually
 	// use. See
 	// https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxdscli/21fd2dd5-c4ee-485b-94fb-e7db5da93726
-
-	var imapPort int
-	imapSSL := "off"
-	var imapEncryption string
-
-	var smtpPort int
-	smtpSSL := "off"
-	var smtpEncryption string
-	for _, l := range mox.Conf.Static.Listeners {
-		if l.IMAPS.Enabled {
-			imapPort = config.Port(l.IMAPS.Port, 993)
-			imapSSL = "on"
-			imapEncryption = "TLS" // Assuming this means direct TLS.
-		} else if l.IMAP.Enabled {
-			if l.TLS != nil && imapEncryption != "TLS" {
-				imapSSL = "on"
-				imapPort = config.Port(l.IMAP.Port, 143)
-			} else if imapSSL == "" {
-				imapPort = config.Port(l.IMAP.Port, 143)
-			}
-		}
-
-		if l.Submissions.Enabled {
-			smtpPort = config.Port(l.Submissions.Port, 465)
-			smtpSSL = "on"
-			smtpEncryption = "TLS" // Assuming this means direct TLS.
-		} else if l.Submission.Enabled {
-			if l.TLS != nil && smtpEncryption != "TLS" {
-				smtpSSL = "on"
-				smtpPort = config.Port(l.Submission.Port, 587)
-			} else if smtpSSL == "" {
-				smtpPort = config.Port(l.Submission.Port, 587)
-			}
-		}
-	}
-	if imapPort == 0 {
-		log.Error("autoconfig: no smtp submission configured?")
-	}
-	if smtpPort == 0 {
-		log.Error("autoconfig: no imap configured?")
-	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 
@@ -259,8 +219,8 @@ func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
 		Protocol: []autodiscoverProtocol{
 			{
 				Type:         "IMAP",
-				Server:       hostname.ASCII,
-				Port:         imapPort,
+				Server:       config.IMAP.Host.ASCII,
+				Port:         config.IMAP.Port,
 				LoginName:    req.Request.EmailAddress,
 				SSL:          imapSSL,
 				Encryption:   imapEncryption,
@@ -269,11 +229,11 @@ func autodiscoverHandle(w http.ResponseWriter, r *http.Request) {
 			},
 			{
 				Type:         "SMTP",
-				Server:       hostname.ASCII,
-				Port:         smtpPort,
+				Server:       config.Submission.Host.ASCII,
+				Port:         config.Submission.Port,
 				LoginName:    req.Request.EmailAddress,
-				SSL:          smtpSSL,
-				Encryption:   smtpEncryption,
+				SSL:          submissionSSL,
+				Encryption:   submissionEncryption,
 				SPA:          "off", // Override default "on", this is Microsofts proprietary authentication protocol.
 				AuthRequired: "on",
 			},
@@ -359,4 +319,67 @@ type autodiscoverProtocol struct {
 	Encryption    string `xml:",omitempty"`
 	SPA           string
 	AuthRequired  string
+}
+
+// Serve a .mobileconfig file. This endpoint is not a standard place where Apple
+// devices look. We point to it from the account page.
+func mobileconfigHandle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "405 - method not allowed - get required", http.StatusMethodNotAllowed)
+		return
+	}
+	addresses := r.FormValue("addresses")
+	fullName := r.FormValue("name")
+	var buf []byte
+	var err error
+	if addresses == "" {
+		err = fmt.Errorf("missing/empty field addresses")
+	}
+	l := strings.Split(addresses, ",")
+	if err == nil {
+		buf, err = MobileConfig(l, fullName)
+	}
+	if err != nil {
+		http.Error(w, "400 - bad request - "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	h := w.Header()
+	filename := l[0]
+	filename = strings.ReplaceAll(filename, ".", "-")
+	filename = strings.ReplaceAll(filename, "@", "-at-")
+	filename = "email-account-" + filename + ".mobileconfig"
+	h.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Write(buf)
+}
+
+// Serve a png file with qrcode with the link to the .mobileconfig file, should be
+// helpful for mobile devices.
+func mobileconfigQRCodeHandle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "405 - method not allowed - get required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !strings.HasSuffix(r.URL.Path, ".qrcode.png") {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Compose URL, scheme and host are not set.
+	u := *r.URL
+	if r.TLS == nil {
+		u.Scheme = "http"
+	} else {
+		u.Scheme = "https"
+	}
+	u.Host = r.Host
+	u.Path = strings.TrimSuffix(u.Path, ".qrcode.png")
+
+	code, err := qr.Encode(u.String(), qr.L)
+	if err != nil {
+		http.Error(w, "500 - internal server error - generating qr-code: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "image/png")
+	w.Write(code.PNG())
 }

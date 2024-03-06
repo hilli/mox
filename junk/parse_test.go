@@ -2,7 +2,10 @@ package junk
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/mjl-/mox/mlog"
 )
 
 func FuzzParseMessage(f *testing.F) {
@@ -14,16 +17,17 @@ func FuzzParseMessage(f *testing.F) {
 		}
 		f.Add(string(buf))
 	}
-	add("../testdata/junk/parse.eml")
-	add("../testdata/junk/parse2.eml")
-	add("../testdata/junk/parse3.eml")
+	add(filepath.FromSlash("../testdata/junk/parse.eml"))
+	add(filepath.FromSlash("../testdata/junk/parse2.eml"))
+	add(filepath.FromSlash("../testdata/junk/parse3.eml"))
 
-	dbPath := "../testdata/junk/parse.db"
-	bloomPath := "../testdata/junk/parse.bloom"
+	dbPath := filepath.FromSlash("../testdata/junk/parse.db")
+	bloomPath := filepath.FromSlash("../testdata/junk/parse.bloom")
 	os.Remove(dbPath)
 	os.Remove(bloomPath)
 	params := Params{Twograms: true}
-	jf, err := NewFilter(ctxbg, xlog, params, dbPath, bloomPath)
+	log := mlog.New("junk", nil)
+	jf, err := NewFilter(ctxbg, log, params, dbPath, bloomPath)
 	if err != nil {
 		f.Fatalf("new filter: %v", err)
 	}

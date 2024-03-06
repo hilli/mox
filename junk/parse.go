@@ -31,7 +31,7 @@ func (f *Filter) tokenizeMail(path string) (bool, map[string]struct{}, error) {
 	if err != nil {
 		return false, nil, err
 	}
-	p, _ := message.EnsurePart(mf, fi.Size())
+	p, _ := message.EnsurePart(f.log.Logger, false, mf, fi.Size())
 	words, err := f.ParseMessage(p)
 	return true, words, err
 }
@@ -87,12 +87,12 @@ func (f *Filter) mailParse(p message.Part, metaWords, textWords, htmlWords map[s
 	ct := p.MediaType + "/" + p.MediaSubType
 
 	if ct == "TEXT/HTML" {
-		err := f.tokenizeHTML(p.Reader(), metaWords, htmlWords)
+		err := f.tokenizeHTML(p.ReaderUTF8OrBinary(), metaWords, htmlWords)
 		// log.Printf("html parsed, words %v", htmlWords)
 		return err
 	}
 	if ct == "" || strings.HasPrefix(ct, "TEXT/") {
-		err := f.tokenizeText(p.Reader(), textWords)
+		err := f.tokenizeText(p.ReaderUTF8OrBinary(), textWords)
 		// log.Printf("text parsed, words %v", textWords)
 		return err
 	}

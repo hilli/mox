@@ -2,9 +2,15 @@ package queue
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/dsn"
@@ -15,7 +21,16 @@ import (
 	"github.com/mjl-/mox/store"
 )
 
-func queueDSNFailure(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string) {
+var (
+	metricDMARCReportFailure = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "mox_queue_dmarcreport_failure_total",
+			Help: "Permanent failures to deliver a DMARC report.",
+		},
+	)
+)
+
+func deliverDSNFailure(ctx context.Context, log mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string, smtpLines []string) {
 	const subject = "mail delivery failed"
 	message := fmt.Sprintf(`
 Delivery has failed permanently for your email to:
@@ -28,11 +43,20 @@ Error during the last delivery attempt:
 
 	%s
 `, m.Recipient().XString(m.SMTPUTF8), errmsg)
+	if len(smtpLines) > 0 {
+		message += "\nFull SMTP response:\n\n\t" + strings.Join(smtpLines, "\n\t") + "\n"
+	}
 
-	queueDSN(log, m, remoteMTA, secodeOpt, errmsg, true, nil, subject, message)
+	deliverDSN(ctx, log, m, remoteMTA, secodeOpt, errmsg, smtpLines, true, nil, subject, message)
 }
 
-func queueDSNDelay(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string, retryUntil time.Time) {
+func deliverDSNDelay(ctx context.Context, log mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string, smtpLines []string, retryUntil time.Time) {
+	// Should not happen, but doesn't hurt to prevent sending delayed delivery
+	// notifications for DMARC reports. We don't want to waste postmaster attention.
+	if m.IsDMARCReport {
+		return
+	}
+
 	const subject = "mail delivery delayed"
 	message := fmt.Sprintf(`
 Delivery has been delayed of your email to:
@@ -46,23 +70,25 @@ Error during the last delivery attempt:
 
 	%s
 `, m.Recipient().XString(false), errmsg)
+	if len(smtpLines) > 0 {
+		message += "\nFull SMTP response:\n\n\t" + strings.Join(smtpLines, "\n\t") + "\n"
+	}
 
-	queueDSN(log, m, remoteMTA, secodeOpt, errmsg, false, &retryUntil, subject, message)
+	deliverDSN(ctx, log, m, remoteMTA, secodeOpt, errmsg, smtpLines, false, &retryUntil, subject, message)
 }
 
 // We only queue DSNs for delivery failures for emails submitted by authenticated
 // users. So we are delivering to local users. ../rfc/5321:1466
 // ../rfc/5321:1494
 // ../rfc/7208:490
-// todo future: when we implement relaying, we should be able to send DSNs to non-local users. and possibly specify a null mailfrom. ../rfc/5321:1503
-func queueDSN(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string, permanent bool, retryUntil *time.Time, subject, textBody string) {
+func deliverDSN(ctx context.Context, log mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg string, smtpLines []string, permanent bool, retryUntil *time.Time, subject, textBody string) {
 	kind := "delayed delivery"
 	if permanent {
 		kind = "failure"
 	}
 
 	qlog := func(text string, err error) {
-		log.Errorx("queue dsn: "+text+": sender will not be informed about dsn", err, mlog.Field("sender", m.Sender().XString(m.SMTPUTF8)), mlog.Field("kind", kind))
+		log.Errorx("queue dsn: "+text+": sender will not be informed about dsn", err, slog.String("sender", m.Sender().XString(m.SMTPUTF8)), slog.String("kind", kind))
 	}
 
 	msgf, err := os.Open(m.MessagePath())
@@ -95,28 +121,34 @@ func queueDSN(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg stri
 	} else {
 		status += "0.0"
 	}
-	diagCode := errmsg
-	if !dsn.HasCode(diagCode) {
-		diagCode = status + " " + errmsg
+
+	// ../rfc/3461:1329
+	var smtpDiag string
+	if len(smtpLines) > 0 {
+		smtpDiag = "smtp; " + strings.Join(smtpLines, " ")
 	}
 
 	dsnMsg := &dsn.Message{
-		SMTPUTF8: m.SMTPUTF8,
-		From:     smtp.Path{Localpart: "postmaster", IPDomain: dns.IPDomain{Domain: mox.Conf.Static.HostnameDomain}},
-		To:       m.Sender(),
-		Subject:  subject,
-		TextBody: textBody,
+		SMTPUTF8:   m.SMTPUTF8,
+		From:       smtp.Path{Localpart: "postmaster", IPDomain: dns.IPDomain{Domain: mox.Conf.Static.HostnameDomain}},
+		To:         m.Sender(),
+		Subject:    subject,
+		MessageID:  mox.MessageIDGen(false),
+		References: m.MessageID,
+		TextBody:   textBody,
 
-		ReportingMTA: mox.Conf.Static.HostnameDomain.ASCII,
-		ArrivalDate:  m.Queued,
+		ReportingMTA:         mox.Conf.Static.HostnameDomain.ASCII,
+		ArrivalDate:          m.Queued,
+		FutureReleaseRequest: m.FutureReleaseRequest,
 
 		Recipients: []dsn.Recipient{
 			{
 				FinalRecipient:  m.Recipient(),
 				Action:          action,
 				Status:          status,
+				StatusComment:   errmsg,
 				RemoteMTA:       remoteMTA,
-				DiagnosticCode:  diagCode,
+				DiagnosticCode:  smtpDiag,
 				LastAttemptDate: *m.LastAttempt,
 				WillRetryUntil:  retryUntil,
 			},
@@ -130,12 +162,18 @@ func queueDSN(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg stri
 		return
 	}
 
-	msgData = append(msgData, []byte("Return-Path: <"+dsnMsg.From.XString(m.SMTPUTF8)+">\r\n")...)
+	prefix := []byte("Return-Path: <" + dsnMsg.From.XString(m.SMTPUTF8) + ">\r\n" + "Delivered-To: " + m.Sender().XString(m.SMTPUTF8) + "\r\n")
+	msgData = append(prefix, msgData...)
 
 	mailbox := "Inbox"
-	acc, err := store.OpenAccount(m.SenderAccount)
+	senderAccount := m.SenderAccount
+	if m.IsDMARCReport {
+		// senderAccount should already by postmaster, but doesn't hurt to ensure it.
+		senderAccount = mox.Conf.Static.Postmaster.Account
+	}
+	acc, err := store.OpenAccount(log, senderAccount)
 	if err != nil {
-		acc, err = store.OpenAccount(mox.Conf.Static.Postmaster.Account)
+		acc, err = store.OpenAccount(log, mox.Conf.Static.Postmaster.Account)
 		if err != nil {
 			qlog("looking up postmaster account after sender account was not found", err)
 			return
@@ -144,24 +182,17 @@ func queueDSN(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg stri
 	}
 	defer func() {
 		err := acc.Close()
-		log.Check(err, "queue dsn: closing account", mlog.Field("sender", m.Sender().XString(m.SMTPUTF8)), mlog.Field("kind", kind))
+		log.Check(err, "queue dsn: closing account", slog.String("sender", m.Sender().XString(m.SMTPUTF8)), slog.String("kind", kind))
 	}()
 
-	msgFile, err := store.CreateMessageTemp("queue-dsn")
+	msgFile, err := store.CreateMessageTemp(log, "queue-dsn")
 	if err != nil {
 		qlog("creating temporary message file", err)
 		return
 	}
-	defer func() {
-		if msgFile != nil {
-			err := os.Remove(msgFile.Name())
-			log.Check(err, "removing message file", mlog.Field("path", msgFile.Name()))
-			err = msgFile.Close()
-			log.Check(err, "closing message file")
-		}
-	}()
+	defer store.CloseRemoveTempFile(log, msgFile, "dsn message")
 
-	msgWriter := &message.Writer{Writer: msgFile}
+	msgWriter := message.NewWriter(msgFile)
 	if _, err := msgWriter.Write(msgData); err != nil {
 		qlog("writing dsn message", err)
 		return
@@ -171,14 +202,23 @@ func queueDSN(log *mlog.Log, m Msg, remoteMTA dsn.NameIP, secodeOpt, errmsg stri
 		Received:  time.Now(),
 		Size:      msgWriter.Size,
 		MsgPrefix: []byte{},
+		DSN:       true,
 	}
+
+	// If this is a DMARC report, deliver it as seen message to a submailbox of the
+	// postmaster mailbox. We mark it as seen so it doesn't waste postmaster attention,
+	// but we deliver them so they can be checked in case of problems.
+	if m.IsDMARCReport {
+		mailbox = fmt.Sprintf("%s/dmarc", mox.Conf.Static.Postmaster.Mailbox)
+		msg.Seen = true
+		metricDMARCReportFailure.Inc()
+		log.Info("delivering dsn for failure to deliver outgoing dmarc report")
+	}
+
 	acc.WithWLock(func() {
-		if err := acc.DeliverMailbox(log, mailbox, msg, msgFile, true); err != nil {
+		if err := acc.DeliverMailbox(log, mailbox, msg, msgFile); err != nil {
 			qlog("delivering dsn to mailbox", err)
 			return
 		}
 	})
-	err = msgFile.Close()
-	log.Check(err, "closing dsn file")
-	msgFile = nil
 }

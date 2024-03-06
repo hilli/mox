@@ -16,32 +16,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/mjl-/adns"
 
 	"github.com/mjl-/mox/dns"
-	"github.com/mjl-/mox/metrics"
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/moxio"
+	"github.com/mjl-/mox/stub"
 )
 
-var xlog = mlog.New("mtasts")
-
 var (
-	metricGet = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "mox_mtasts_get_duration_seconds",
-			Help:    "MTA-STS get of policy, including lookup, duration and result.",
-			Buckets: []float64{0.01, 0.05, 0.100, 0.5, 1, 5, 10, 20},
-		},
-		[]string{
-			"result", // ok, lookuperror, fetcherror
-		},
-	)
+	MetricGet         stub.HistogramVec                                                                                           = stub.HistogramVecIgnore{}
+	HTTPClientObserve func(ctx context.Context, log *slog.Logger, pkg, method string, statusCode int, err error, start time.Time) = stub.HTTPClientObserveIgnore
 )
 
 // Pair is an extension key/value pair in a MTA-STS DNS record or policy.
@@ -81,7 +71,7 @@ type Mode string
 
 const (
 	ModeEnforce Mode = "enforce" // Policy must be followed, i.e. deliveries must fail if a TLS connection cannot be made.
-	ModeTesting Mode = "testing" // In case TLS cannot be negotiated, plain SMTP can be used, but failures must be reported, e.g. with TLS-RPT.
+	ModeTesting Mode = "testing" // In case TLS cannot be negotiated, plain SMTP can be used, but failures must be reported, e.g. with TLSRPT.
 	ModeNone    Mode = "none"    // In case MTA-STS is not or no longer implemented.
 )
 
@@ -153,6 +143,30 @@ func (p *Policy) Matches(host dns.Domain) bool {
 	return false
 }
 
+// TLSReportFailureReason returns a concise error for known error types, or an
+// empty string. For use in TLSRPT.
+func TLSReportFailureReason(err error) string {
+	// If this is a DNSSEC authentication error, we'll collect it for TLS reporting.
+	// We can also use this reason for STS, not only DANE. ../rfc/8460:580
+	var errCode adns.ErrorCode
+	if errors.As(err, &errCode) && errCode.IsAuthentication() {
+		return fmt.Sprintf("dns-extended-error-%d-%s", errCode, strings.ReplaceAll(errCode.String(), " ", "-"))
+	}
+
+	for _, e := range mtastsErrors {
+		if errors.Is(err, e) {
+			s := strings.TrimPrefix(e.Error(), "mtasts: ")
+			return strings.ReplaceAll(s, " ", "-")
+		}
+	}
+	return ""
+}
+
+var mtastsErrors = []error{
+	ErrNoRecord, ErrMultipleRecords, ErrDNS, ErrRecordSyntax, // Lookup
+	ErrNoPolicy, ErrPolicyFetch, ErrPolicySyntax, // Fetch
+}
+
 // Lookup errors.
 var (
 	ErrNoRecord        = errors.New("mtasts: no mta-sts dns txt record") // Domain does not implement MTA-STS. If a cached non-expired policy is available, it should still be used.
@@ -162,45 +176,29 @@ var (
 )
 
 // LookupRecord looks up the MTA-STS TXT DNS record at "_mta-sts.<domain>",
-// following CNAME records, and returns the parsed MTA-STS record, the DNS TXT
-// record and any CNAMEs that were followed.
-func LookupRecord(ctx context.Context, resolver dns.Resolver, domain dns.Domain) (rrecord *Record, rtxt string, rcnames []string, rerr error) {
-	log := xlog.WithContext(ctx)
+// following CNAME records, and returns the parsed MTA-STS record and the DNS TXT
+// record.
+func LookupRecord(ctx context.Context, elog *slog.Logger, resolver dns.Resolver, domain dns.Domain) (rrecord *Record, rtxt string, rerr error) {
+	log := mlog.New("mtasts", elog)
 	start := time.Now()
 	defer func() {
-		log.Debugx("mtasts lookup result", rerr, mlog.Field("domain", domain), mlog.Field("record", rrecord), mlog.Field("cnames", rcnames), mlog.Field("duration", time.Since(start)))
+		log.Debugx("mtasts lookup result", rerr,
+			slog.Any("domain", domain),
+			slog.Any("record", rrecord),
+			slog.Duration("duration", time.Since(start)))
 	}()
 
 	// ../rfc/8461:289
 	// ../rfc/8461:351
-	// We lookup the txt record, but must follow CNAME records when the TXT does not exist.
-	var cnames []string
+	// We lookup the txt record, but must follow CNAME records when the TXT does not
+	// exist. LookupTXT follows CNAMEs.
 	name := "_mta-sts." + domain.ASCII + "."
 	var txts []string
-	for {
-		var err error
-		txts, err = dns.WithPackage(resolver, "mtasts").LookupTXT(ctx, name)
-		if dns.IsNotFound(err) {
-			// DNS has no specified limit on how many CNAMEs to follow. Chains of 10 CNAMEs
-			// have been seen on the internet.
-			if len(cnames) > 16 {
-				return nil, "", cnames, fmt.Errorf("too many cnames")
-			}
-			cname, err := dns.WithPackage(resolver, "mtasts").LookupCNAME(ctx, name)
-			if dns.IsNotFound(err) {
-				return nil, "", cnames, ErrNoRecord
-			}
-			if err != nil {
-				return nil, "", cnames, fmt.Errorf("%w: %s", ErrDNS, err)
-			}
-			cnames = append(cnames, cname)
-			name = cname
-			continue
-		} else if err != nil {
-			return nil, "", cnames, fmt.Errorf("%w: %s", ErrDNS, err)
-		} else {
-			break
-		}
+	txts, _, err := dns.WithPackage(resolver, "mtasts").LookupTXT(ctx, name)
+	if dns.IsNotFound(err) {
+		return nil, "", ErrNoRecord
+	} else if err != nil {
+		return nil, "", fmt.Errorf("%w: %s", ErrDNS, err)
 	}
 
 	var text string
@@ -215,18 +213,18 @@ func LookupRecord(ctx context.Context, resolver dns.Resolver, domain dns.Domain)
 			continue
 		}
 		if err != nil {
-			return nil, "", cnames, err
+			return nil, "", err
 		}
 		if record != nil {
-			return nil, "", cnames, ErrMultipleRecords
+			return nil, "", ErrMultipleRecords
 		}
 		record = r
 		text = txt
 	}
 	if record == nil {
-		return nil, "", cnames, ErrNoRecord
+		return nil, "", ErrNoRecord
 	}
-	return record, text, cnames, nil
+	return record, text, nil
 }
 
 // Policy fetch errors.
@@ -254,11 +252,15 @@ var HTTPClient = &http.Client{
 //
 // If an error is returned, callers should back off for 5 minutes until the next
 // attempt.
-func FetchPolicy(ctx context.Context, domain dns.Domain) (policy *Policy, policyText string, rerr error) {
-	log := xlog.WithContext(ctx)
+func FetchPolicy(ctx context.Context, elog *slog.Logger, domain dns.Domain) (policy *Policy, policyText string, rerr error) {
+	log := mlog.New("mtasts", elog)
 	start := time.Now()
 	defer func() {
-		log.Debugx("mtasts fetch policy result", rerr, mlog.Field("domain", domain), mlog.Field("policy", policy), mlog.Field("policytext", policyText), mlog.Field("duration", time.Since(start)))
+		log.Debugx("mtasts fetch policy result", rerr,
+			slog.Any("domain", domain),
+			slog.Any("policy", policy),
+			slog.String("policytext", policyText),
+			slog.Duration("duration", time.Since(start)))
 	}()
 
 	// Timeout of 1 minute. ../rfc/8461:569
@@ -266,7 +268,7 @@ func FetchPolicy(ctx context.Context, domain dns.Domain) (policy *Policy, policy
 	defer cancel()
 
 	// TLS requirements are what the Go standard library checks: trusted, non-expired,
-	// hostname validated against DNS-ID supporting wildcard. ../rfc/8461:524
+	// hostname verified against DNS-ID supporting wildcard. ../rfc/8461:524
 	url := "https://mta-sts." + domain.Name() + "/.well-known/mta-sts.txt"
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -281,9 +283,10 @@ func FetchPolicy(ctx context.Context, domain dns.Domain) (policy *Policy, policy
 		return nil, "", ErrNoPolicy
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: http get: %s", ErrPolicyFetch, err)
+		// We pass along underlying TLS certificate errors.
+		return nil, "", fmt.Errorf("%w: http get: %w", ErrPolicyFetch, err)
 	}
-	metrics.HTTPClientObserve(ctx, "mtasts", req.Method, resp.StatusCode, err, start)
+	HTTPClientObserve(ctx, log.Logger, "mtasts", req.Method, resp.StatusCode, err, start)
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, "", ErrNoPolicy
@@ -321,26 +324,30 @@ func FetchPolicy(ctx context.Context, domain dns.Domain) (policy *Policy, policy
 // record is still returned.
 //
 // Also see Get in package mtastsdb.
-func Get(ctx context.Context, resolver dns.Resolver, domain dns.Domain) (record *Record, policy *Policy, err error) {
-	log := xlog.WithContext(ctx)
+func Get(ctx context.Context, elog *slog.Logger, resolver dns.Resolver, domain dns.Domain) (record *Record, policy *Policy, policyText string, err error) {
+	log := mlog.New("mtasts", elog)
 	start := time.Now()
 	result := "lookuperror"
 	defer func() {
-		metricGet.WithLabelValues(result).Observe(float64(time.Since(start)) / float64(time.Second))
-		log.Debugx("mtasts get result", err, mlog.Field("domain", domain), mlog.Field("record", record), mlog.Field("policy", policy), mlog.Field("duration", time.Since(start)))
+		MetricGet.ObserveLabels(float64(time.Since(start))/float64(time.Second), result)
+		log.Debugx("mtasts get result", err,
+			slog.Any("domain", domain),
+			slog.Any("record", record),
+			slog.Any("policy", policy),
+			slog.Duration("duration", time.Since(start)))
 	}()
 
-	record, _, _, err = LookupRecord(ctx, resolver, domain)
+	record, _, err = LookupRecord(ctx, log.Logger, resolver, domain)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	result = "fetcherror"
-	policy, _, err = FetchPolicy(ctx, domain)
+	policy, policyText, err = FetchPolicy(ctx, log.Logger, domain)
 	if err != nil {
-		return record, nil, err
+		return record, nil, "", err
 	}
 
 	result = "ok"
-	return record, policy, nil
+	return record, policy, policyText, nil
 }

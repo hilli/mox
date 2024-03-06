@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -82,10 +83,11 @@ type DirArchiver struct {
 }
 
 // Create create name in the file system, in dir.
+// name must always use forwarded slashes.
 func (a DirArchiver) Create(name string, size int64, mtime time.Time) (io.WriteCloser, error) {
 	isdir := strings.HasSuffix(name, "/")
 	name = strings.TrimSuffix(name, "/")
-	p := filepath.Join(a.Dir, name)
+	p := filepath.Join(a.Dir, filepath.FromSlash(name))
 	os.MkdirAll(filepath.Dir(p), 0770)
 	if isdir {
 		return nil, os.Mkdir(p, 0770)
@@ -105,7 +107,7 @@ func (a DirArchiver) Close() error {
 // Some errors are not fatal and result in skipped messages. In that happens, a
 // file "errors.txt" is added to the archive describing the errors. The goal is to
 // let users export (hopefully) most messages even in the face of errors.
-func ExportMessages(ctx context.Context, log *mlog.Log, db *bstore.DB, accountDir string, archiver Archiver, maildir bool, mailboxOpt string) error {
+func ExportMessages(ctx context.Context, log mlog.Log, db *bstore.DB, accountDir string, archiver Archiver, maildir bool, mailboxOpt string) error {
 	// todo optimize: should prepare next file to add to archive (can be an mbox with many messages) while writing a file to the archive (which typically compresses, which takes time).
 
 	// Start transaction without closure, we are going to close it early, but don't
@@ -213,8 +215,7 @@ func ExportMessages(ctx context.Context, log *mlog.Log, db *bstore.DB, accountDi
 	var mboxwriter *bufio.Writer
 	defer func() {
 		if mboxtmp != nil {
-			err := mboxtmp.Close()
-			log.Check(err, "closing mbox temp file")
+			CloseRemoveTempFile(log, mboxtmp, "mbox")
 		}
 	}()
 
@@ -287,8 +288,11 @@ func ExportMessages(ctx context.Context, log *mlog.Log, db *bstore.DB, accountDi
 		if err := w.Close(); err != nil {
 			return fmt.Errorf("closing message file: %v", err)
 		}
+		name := mboxtmp.Name()
 		err = mboxtmp.Close()
 		log.Check(err, "closing temporary mbox file")
+		err = os.Remove(name)
+		log.Check(err, "removing temporary mbox file", slog.String("path", name))
 		mboxwriter = nil
 		mboxtmp = nil
 		return nil
@@ -523,10 +527,6 @@ func ExportMessages(ctx context.Context, log *mlog.Log, db *bstore.DB, accountDi
 				mboxtmp, err = os.CreateTemp("", "mox-mail-export-mbox")
 				if err != nil {
 					return fmt.Errorf("creating temp mbox file: %v", err)
-				}
-				// Remove file immediately, so we are sure we don't leave it around.
-				if err := os.Remove(mboxtmp.Name()); err != nil {
-					return fmt.Errorf("removing temp file just created: %v", err)
 				}
 				mboxwriter = bufio.NewWriter(mboxtmp)
 			}

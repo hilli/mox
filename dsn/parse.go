@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/textproto"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/message"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/smtp"
 )
 
@@ -22,17 +24,19 @@ import (
 // The first return value is the machine-parsed DSN message. The second value is
 // the entire MIME multipart message. Use its Parts field to access the
 // human-readable text and optional original message/headers.
-func Parse(r io.ReaderAt) (*Message, *message.Part, error) {
+func Parse(elog *slog.Logger, r io.ReaderAt) (*Message, *message.Part, error) {
+	log := mlog.New("dsn", elog)
+
 	// DSNs can mix and match subtypes with and without utf-8. ../rfc/6533:441
 
-	part, err := message.Parse(r)
+	part, err := message.Parse(log.Logger, false, r)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing message: %v", err)
 	}
 	if part.MediaType != "MULTIPART" || part.MediaSubType != "REPORT" {
 		return nil, nil, fmt.Errorf(`message has content-type %q, must have "message/report"`, strings.ToLower(part.MediaType+"/"+part.MediaSubType))
 	}
-	err = part.Walk(nil)
+	err = part.Walk(log.Logger, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing message parts: %v", err)
 	}
@@ -76,7 +80,7 @@ func Parse(r io.ReaderAt) (*Message, *message.Part, error) {
 		}
 	}
 	m.Subject = part.Envelope.Subject
-	buf, err := io.ReadAll(p0.Reader())
+	buf, err := io.ReadAll(p0.ReaderUTF8OrBinary())
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading human-readable text part: %v", err)
 	}
@@ -213,6 +217,7 @@ func parseRecipientHeader(mr *textproto.Reader, utf8 bool) (Recipient, error) {
 			for _, x := range actions {
 				if a == x {
 					ok = true
+					r.Action = a
 					break
 				}
 			}
@@ -222,6 +227,13 @@ func parseRecipientHeader(mr *textproto.Reader, utf8 bool) (Recipient, error) {
 		case "Status":
 			// todo: parse the enhanced status code?
 			r.Status = v
+			t := strings.SplitN(v, "(", 2)
+			v = strings.TrimSpace(v)
+			if len(t) == 2 && strings.HasSuffix(v, ")") {
+				r.Status = strings.TrimSpace(t[0])
+				r.StatusComment = strings.TrimSpace(strings.TrimSuffix(t[1], ")"))
+			}
+
 		case "Remote-Mta":
 			r.RemoteMTA = NameIP{Name: v}
 		case "Diagnostic-Code":

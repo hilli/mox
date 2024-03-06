@@ -6,9 +6,10 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mjl-/mox/dns"
-	"github.com/mjl-/mox/moxvar"
+	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/smtp"
 )
 
@@ -137,7 +138,7 @@ func (p *parser) peekchar() rune {
 	return -1
 }
 
-func (p *parser) takefn1(what string, fn func(c rune, i int) bool) string {
+func (p *parser) xtakefn1(what string, fn func(c rune, i int) bool) string {
 	if p.empty() {
 		p.xerrorf("need at least one char for %s", what)
 	}
@@ -152,7 +153,7 @@ func (p *parser) takefn1(what string, fn func(c rune, i int) bool) string {
 	return p.remainder()
 }
 
-func (p *parser) takefn1case(what string, fn func(c rune, i int) bool) string {
+func (p *parser) xtakefn1case(what string, fn func(c rune, i int) bool) string {
 	if p.empty() {
 		p.xerrorf("need at least one char for %s", what)
 	}
@@ -167,7 +168,7 @@ func (p *parser) takefn1case(what string, fn func(c rune, i int) bool) string {
 	return p.remainder()
 }
 
-func (p *parser) takefn(fn func(c rune, i int) bool) string {
+func (p *parser) xtakefn(fn func(c rune, i int) bool) string {
 	for i, c := range p.upper[p.o:] {
 		if !fn(c, i) {
 			return p.xtaken(i)
@@ -183,7 +184,7 @@ func (p *parser) takefn(fn func(c rune, i int) bool) string {
 // ../rfc/5321:2260
 func (p *parser) xrawReversePath() string {
 	p.xtake("<")
-	s := p.takefn(func(c rune, i int) bool {
+	s := p.xtakefn(func(c rune, i int) bool {
 		return c != '>'
 	})
 	p.xtake(">")
@@ -261,7 +262,7 @@ func (p *parser) xdomain() dns.Domain {
 // ../rfc/5321:2303
 // ../rfc/5321:2303 ../rfc/6531:411
 func (p *parser) xsubdomain() string {
-	return p.takefn1("subdomain", func(c rune, i int) bool {
+	return p.xtakefn1("subdomain", func(c rune, i int) bool {
 		return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || i > 0 && c == '-' || c > 0x7f && p.smtputf8
 	})
 }
@@ -270,18 +271,18 @@ func (p *parser) xsubdomain() string {
 func (p *parser) xmailbox() smtp.Path {
 	localpart := p.xlocalpart()
 	p.xtake("@")
-	return smtp.Path{Localpart: localpart, IPDomain: p.xipdomain()}
+	return smtp.Path{Localpart: localpart, IPDomain: p.xipdomain(false)}
 }
 
 // ../rfc/5321:2307
 func (p *parser) xldhstr() string {
-	return p.takefn1("ldh-str", func(c rune, i int) bool {
+	return p.xtakefn1("ldh-str", func(c rune, i int) bool {
 		return c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || i == 0 && c == '-'
 	})
 }
 
 // parse address-literal or domain.
-func (p *parser) xipdomain() dns.IPDomain {
+func (p *parser) xipdomain(isehlo bool) dns.IPDomain {
 	// ../rfc/5321:2309
 	// ../rfc/5321:2397
 	if p.take("[") {
@@ -295,7 +296,7 @@ func (p *parser) xipdomain() dns.IPDomain {
 			}
 			ipv6 = true
 		}
-		ipaddr := p.takefn1("address literal", func(c rune, i int) bool {
+		ipaddr := p.xtakefn1("address literal", func(c rune, i int) bool {
 			return c != ']'
 		})
 		p.take("]")
@@ -304,10 +305,20 @@ func (p *parser) xipdomain() dns.IPDomain {
 			p.xerrorf("invalid ip in address: %q", ipaddr)
 		}
 		isv4 := ip.To4() != nil
+		isAllowedSloppyIPv6Submission := func() bool {
+			// Mail user agents that submit are relatively likely to use IPs in EHLO and forget
+			// that an IPv6 address needs to be tagged as such. We can forgive them. For
+			// SMTP servers we are strict.
+			return isehlo && p.conn.submission && !mox.Pedantic && ip.To16() != nil
+		}
 		if ipv6 && isv4 {
-			p.xerrorf("ip is not ipv6")
-		} else if !ipv6 && !isv4 {
-			p.xerrorf("ip is not ipv4")
+			p.xerrorf("ip address is not ipv6")
+		} else if !ipv6 && !isv4 && !isAllowedSloppyIPv6Submission() {
+			if ip.To16() != nil {
+				p.xerrorf("ip address is ipv6, must use syntax [IPv6:...]")
+			} else {
+				p.xerrorf("ip address is not ipv4")
+			}
 		}
 		return dns.IPDomain{IP: ip}
 	}
@@ -327,7 +338,7 @@ func (p *parser) xlocalpart() smtp.Localpart {
 		}
 	}
 	// In the wild, some services use large localparts for generated (bounce) addresses.
-	if moxvar.Pedantic && len(s) > 64 || len(s) > 128 {
+	if mox.Pedantic && len(s) > 64 || len(s) > 128 {
 		// ../rfc/5321:3486
 		p.xerrorf("localpart longer than 64 octets")
 	}
@@ -392,7 +403,7 @@ func (p *parser) xchar() rune {
 
 // ../rfc/5321:2320 ../rfc/6531:414
 func (p *parser) xatom(islocalpart bool) string {
-	return p.takefn1("atom", func(c rune, i int) bool {
+	return p.xtakefn1("atom", func(c rune, i int) bool {
 		switch c {
 		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '/', '=', '?', '^', '_', '`', '{', '|', '}', '~':
 			return true
@@ -414,23 +425,23 @@ func (p *parser) xstring() string {
 
 // ../rfc/5321:2279
 func (p *parser) xparamKeyword() string {
-	return p.takefn1("parameter keyword", func(c rune, i int) bool {
+	return p.xtakefn1("parameter keyword", func(c rune, i int) bool {
 		return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || (i > 0 && c == '-')
 	})
 }
 
 // ../rfc/5321:2281 ../rfc/6531:422
 func (p *parser) xparamValue() string {
-	return p.takefn1("parameter value", func(c rune, i int) bool {
+	return p.xtakefn1("parameter value", func(c rune, i int) bool {
 		return c > ' ' && c < 0x7f && c != '=' || (c > 0x7f && p.smtputf8)
 	})
 }
 
 // for smtp parameters that take a numeric parameter with specified number of
 // digits, eg SIZE=... for MAIL FROM.
-func (p *parser) xnumber(maxDigits int) int64 {
-	s := p.takefn1("number", func(c rune, i int) bool {
-		return c >= '0' && c <= '9' && i < maxDigits
+func (p *parser) xnumber(maxDigits int, allowZero bool) int64 {
+	s := p.xtakefn1("number", func(c rune, i int) bool {
+		return (c >= '1' && c <= '9' || c == '0' && (i > 0 || allowZero)) && i < maxDigits
 	})
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -439,10 +450,54 @@ func (p *parser) xnumber(maxDigits int) int64 {
 	return v
 }
 
+// parse date-time in UTC form. ../rfc/4865:147 ../rfc/4865-eid2040
+func (p *parser) xdatetimeutc() (time.Time, string) {
+	// ../rfc/3339:422
+	xdash := func() string {
+		p.xtake("-")
+		return "-"
+	}
+	xcolon := func() string {
+		p.xtake(":")
+		return ":"
+	}
+	xdigits := func(n int) string {
+		s := p.xtakefn1("digits", func(c rune, i int) bool {
+			return c >= '0' && c <= '9' && i < n
+		})
+		if len(s) != n {
+			p.xerrorf("parsing date-time: got %d digits, need %d", len(s), n)
+		}
+		return s
+	}
+	s := xdigits(4) + xdash() + xdigits(2) + xdash() + xdigits(2)
+	if !p.hasPrefix("T") {
+		p.xerrorf("expected T for date-time separator")
+	}
+	s += p.xtaken(1) + xdigits(2) + xcolon() + xdigits(2) + xcolon() + xdigits(2)
+	layout := time.RFC3339
+	if p.take(".") {
+		layout = time.RFC3339Nano
+		s += "." + p.xtakefn1("digits", func(c rune, i int) bool {
+			return c >= '0' && c <= '9'
+		})
+	}
+	if !p.hasPrefix("Z") {
+		p.xerrorf("expected Z for date-time utc timezone")
+	}
+	s += p.xtaken(1)
+
+	t, err := time.Parse(layout, s)
+	if err != nil {
+		p.xerrorf("bad utc date-time %q: %s", s, err)
+	}
+	return t, s
+}
+
 // sasl mechanism, for AUTH command.
 // ../rfc/4422:436
 func (p *parser) xsaslMech() string {
-	return p.takefn1case("sasl-mech", func(c rune, i int) bool {
+	return p.xtakefn1case("sasl-mech", func(c rune, i int) bool {
 		return i < 20 && (c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_')
 	})
 }

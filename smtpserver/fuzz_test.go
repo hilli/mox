@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/queue"
 	"github.com/mjl-/mox/store"
@@ -29,22 +31,22 @@ func FuzzServer(f *testing.F) {
 	f.Add("NOOP")
 	f.Add("QUIT")
 
+	log := mlog.New("smtpserver", nil)
 	mox.Context = ctxbg
-	mox.ConfigStaticPath = "../testdata/smtpserverfuzz/mox.conf"
+	mox.ConfigStaticPath = filepath.FromSlash("../testdata/smtpserverfuzz/mox.conf")
 	mox.MustLoadConfig(true, false)
 	dataDir := mox.ConfigDirPath(mox.Conf.Static.DataDir)
 	os.RemoveAll(dataDir)
-	acc, err := store.OpenAccount("mjl")
+	acc, err := store.OpenAccount(log, "mjl")
 	if err != nil {
 		f.Fatalf("open account: %v", err)
 	}
 	defer acc.Close()
-	err = acc.SetPassword("testtest")
+	err = acc.SetPassword(log, "testtest")
 	if err != nil {
 		f.Fatalf("set password: %v", err)
 	}
-	done := store.Switchboard()
-	defer close(done)
+	defer store.Switchboard()()
 	err = queue.Init()
 	if err != nil {
 		f.Fatalf("queue init: %v", err)
@@ -100,7 +102,7 @@ func FuzzServer(f *testing.F) {
 			const submission = false
 			err := serverConn.SetDeadline(time.Now().Add(time.Second))
 			flog(err, "set server deadline")
-			serve("test", cid, dns.Domain{ASCII: "mox.example"}, nil, serverConn, resolver, submission, false, 100<<10, false, false, nil, 0)
+			serve("test", cid, dns.Domain{ASCII: "mox.example"}, nil, serverConn, resolver, submission, false, 100<<10, false, false, false, nil, 0)
 			cid++
 		}
 

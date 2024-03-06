@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -46,6 +47,12 @@ possibly making them potentially no longer readable by the previous version.
 `
 	var fix bool
 	c.flag.BoolVar(&fix, "fix", false, "fix fixable problems, such as moving away message files not referenced by their database")
+
+	// To prevent aborting the upgrade test with v0.0.[45] that had a message with
+	// incorrect Size.
+	var skipSizeCheck bool
+	c.flag.BoolVar(&skipSizeCheck, "skip-size-check", false, "skip the check for message size")
+
 	args := c.Parse()
 	if len(args) != 1 {
 		c.Usage()
@@ -89,9 +96,12 @@ possibly making them potentially no longer readable by the previous version.
 
 	// Check a database file by opening it with BoltDB and bstore and lightly checking
 	// its contents.
-	checkDB := func(path string, types []any) {
+	checkDB := func(required bool, path string, types []any) {
 		_, err := os.Stat(path)
-		checkf(err, path, "checking if file exists")
+		if !required && err != nil && errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		checkf(err, path, "checking if database file exists")
 		if err != nil {
 			return
 		}
@@ -137,14 +147,18 @@ possibly making them potentially no longer readable by the previous version.
 		checkf(err, path, "checking database file")
 	}
 
-	checkFile := func(path string) {
-		_, err := os.Stat(path)
+	checkFile := func(dbpath, path string, prefixSize int, size int64) {
+		st, err := os.Stat(path)
 		checkf(err, path, "checking if file exists")
+		if !skipSizeCheck && err == nil && int64(prefixSize)+st.Size() != size {
+			filesize := st.Size()
+			checkf(fmt.Errorf("%s: message size is %d, should be %d (length of MsgPrefix %d + file size %d), see \"mox fixmsgsize\"", path, size, int64(prefixSize)+st.Size(), prefixSize, filesize), dbpath, "checking message size")
+		}
 	}
 
 	checkQueue := func() {
 		dbpath := filepath.Join(dataDir, "queue/index.db")
-		checkDB(dbpath, queue.DBTypes)
+		checkDB(true, dbpath, queue.DBTypes)
 
 		// Check that all messages present in the database also exist on disk.
 		seen := map[string]struct{}{}
@@ -155,7 +169,7 @@ possibly making them potentially no longer readable by the previous version.
 				mp := store.MessagePath(m.ID)
 				seen[mp] = struct{}{}
 				p := filepath.Join(dataDir, "queue", mp)
-				checkFile(p)
+				checkFile(dbpath, p, len(m.MsgPrefix), m.Size)
 				return nil
 			})
 			checkf(err, dbpath, "reading messages in queue database to check files")
@@ -210,12 +224,12 @@ possibly making them potentially no longer readable by the previous version.
 	// Check an account, with its database file and messages.
 	checkAccount := func(name string) {
 		accdir := filepath.Join(dataDir, "accounts", name)
-		checkDB(filepath.Join(accdir, "index.db"), store.DBTypes)
+		checkDB(true, filepath.Join(accdir, "index.db"), store.DBTypes)
 
 		jfdbpath := filepath.Join(accdir, "junkfilter.db")
 		jfbloompath := filepath.Join(accdir, "junkfilter.bloom")
 		if exists(jfdbpath) || exists(jfbloompath) {
-			checkDB(jfdbpath, junk.DBTypes)
+			checkDB(true, jfdbpath, junk.DBTypes)
 		}
 		// todo: add some kind of check for the bloom filter?
 
@@ -231,28 +245,101 @@ possibly making them potentially no longer readable by the previous version.
 				checkf(err, dbpath, "missing nextuidvalidity")
 			}
 
-			mailboxUIDNexts := map[int64]store.UID{}
+			up := store.Upgrade{ID: 1}
+			if err := db.Get(ctxbg, &up); err != nil {
+				log.Printf("warning: %s: getting upgrade record (continuing, but not checking message threading): %v", dbpath, err)
+			} else if up.Threads != 2 {
+				log.Printf("warning: %s: no message threading in database, skipping checks for threading consistency", dbpath)
+			}
+
+			mailboxes := map[int64]store.Mailbox{}
 			err := bstore.QueryDB[store.Mailbox](ctxbg, db).ForEach(func(mb store.Mailbox) error {
-				mailboxUIDNexts[mb.ID] = mb.UIDNext
+				mailboxes[mb.ID] = mb
 
 				if mb.UIDValidity >= uidvalidity.Next {
-					checkf(errors.New(`inconsistent uidvalidity for mailbox/account, see "mox fixuidmeta"`), dbpath, "mailbox id %d has uidvalidity %d >= account nextuidvalidity %d", mb.ID, mb.UIDValidity, uidvalidity.Next)
+					checkf(errors.New(`inconsistent uidvalidity for mailbox/account, see "mox fixuidmeta"`), dbpath, "mailbox %q (id %d) has uidvalidity %d >= account nextuidvalidity %d", mb.Name, mb.ID, mb.UIDValidity, uidvalidity.Next)
 				}
 				return nil
 			})
 			checkf(err, dbpath, "reading mailboxes to check uidnext consistency")
 
+			mbCounts := map[int64]store.MailboxCounts{}
+			var totalSize int64
 			err = bstore.QueryDB[store.Message](ctxbg, db).ForEach(func(m store.Message) error {
-				if uidnext := mailboxUIDNexts[m.MailboxID]; m.UID >= uidnext {
-					checkf(errors.New(`inconsistent uidnext for message/mailbox, see "mox fixuidmeta"`), dbpath, "message id %d in mailbox id %d has uid %d >= mailbox uidnext %d", m.ID, m.MailboxID, m.UID, uidnext)
+				mb := mailboxes[m.MailboxID]
+				if m.UID >= mb.UIDNext {
+					checkf(errors.New(`inconsistent uidnext for message/mailbox, see "mox fixuidmeta"`), dbpath, "message id %d in mailbox %q (id %d) has uid %d >= mailbox uidnext %d", m.ID, mb.Name, mb.ID, m.UID, mb.UIDNext)
 				}
+
+				if m.ModSeq < m.CreateSeq {
+					checkf(errors.New(`inconsistent modseq/createseq for message`), dbpath, "message id %d in mailbox %q (id %d) has modseq %d < createseq %d", m.ID, mb.Name, mb.ID, m.ModSeq, m.CreateSeq)
+				}
+
+				mc := mbCounts[mb.ID]
+				mc.Add(m.MailboxCounts())
+				mbCounts[mb.ID] = mc
+
+				if m.Expunged {
+					return nil
+				}
+				totalSize += m.Size
+
 				mp := store.MessagePath(m.ID)
 				seen[mp] = struct{}{}
 				p := filepath.Join(accdir, "msg", mp)
-				checkFile(p)
+				checkFile(dbpath, p, len(m.MsgPrefix), m.Size)
+
+				if up.Threads != 2 {
+					return nil
+				}
+
+				if m.ThreadID <= 0 {
+					checkf(errors.New(`see "mox reassignthreads"`), dbpath, "message id %d, thread %d in mailbox %q (id %d) has bad threadid", m.ID, m.ThreadID, mb.Name, mb.ID)
+				}
+				if len(m.ThreadParentIDs) == 0 {
+					return nil
+				}
+				if slices.Contains(m.ThreadParentIDs, m.ID) {
+					checkf(errors.New(`see "mox reassignthreads"`), dbpath, "message id %d, thread %d in mailbox %q (id %d) has itself as thread parent", m.ID, m.ThreadID, mb.Name, mb.ID)
+				}
+				for i, pid := range m.ThreadParentIDs {
+					am := store.Message{ID: pid}
+					if err := db.Get(ctxbg, &am); err == bstore.ErrAbsent {
+						continue
+					} else if err != nil {
+						return fmt.Errorf("get ancestor message: %v", err)
+					} else if !slices.Equal(m.ThreadParentIDs[i+1:], am.ThreadParentIDs) {
+						checkf(errors.New(`see "mox reassignthreads"`), dbpath, "message %d, thread %d has ancestor ids %v, and ancestor at index %d with id %d should have the same tail but has %v", m.ID, m.ThreadID, m.ThreadParentIDs, i, am.ID, am.ThreadParentIDs)
+					} else {
+						break
+					}
+				}
 				return nil
 			})
 			checkf(err, dbpath, "reading messages in account database to check files")
+
+			haveCounts := true
+			for _, mb := range mailboxes {
+				// We only check if database doesn't have zero values, i.e. not yet set.
+				if !mb.HaveCounts {
+					haveCounts = false
+				}
+				if mb.HaveCounts && mb.MailboxCounts != mbCounts[mb.ID] {
+					checkf(errors.New(`wrong mailbox counts, see "mox recalculatemailboxcounts"`), dbpath, "mailbox %q (id %d) has wrong counts %s, should be %s", mb.Name, mb.ID, mb.MailboxCounts, mbCounts[mb.ID])
+				}
+			}
+
+			if haveCounts {
+				du := store.DiskUsage{ID: 1}
+				err := db.Get(ctxbg, &du)
+				if err == nil {
+					if du.MessageSize != totalSize {
+						checkf(errors.New(`wrong total message size, see mox recalculatemailboxcounts"`), dbpath, "account has wrong total message size %d, should be %d", du.MessageSize, totalSize)
+					}
+				} else if err != nil && !errors.Is(err, bstore.ErrAbsent) {
+					checkf(err, dbpath, "get disk usage")
+				}
+			}
 		}
 
 		// Walk through all files in the msg directory. Warn about files that weren't in
@@ -332,7 +419,7 @@ possibly making them potentially no longer readable by the previous version.
 				p = p[len(dataDir)+1:]
 			}
 			switch p {
-			case "dmarcrpt.db", "mtasts.db", "tlsrpt.db", "receivedid.key", "lastknownversion":
+			case "dmarcrpt.db", "dmarceval.db", "mtasts.db", "tlsrpt.db", "tlsrptresult.db", "receivedid.key", "lastknownversion":
 				return nil
 			case "acme", "queue", "accounts", "tmp", "moved":
 				return fs.SkipDir
@@ -350,9 +437,11 @@ possibly making them potentially no longer readable by the previous version.
 		checkf(err, dataDir, "walking data directory")
 	}
 
-	checkDB(filepath.Join(dataDir, "dmarcrpt.db"), dmarcdb.DBTypes)
-	checkDB(filepath.Join(dataDir, "mtasts.db"), mtastsdb.DBTypes)
-	checkDB(filepath.Join(dataDir, "tlsrpt.db"), tlsrptdb.DBTypes)
+	checkDB(true, filepath.Join(dataDir, "dmarcrpt.db"), dmarcdb.ReportsDBTypes)
+	checkDB(false, filepath.Join(dataDir, "dmarceval.db"), dmarcdb.EvalDBTypes) // After v0.0.7.
+	checkDB(true, filepath.Join(dataDir, "mtasts.db"), mtastsdb.DBTypes)
+	checkDB(true, filepath.Join(dataDir, "tlsrpt.db"), tlsrptdb.ReportDBTypes)
+	checkDB(false, filepath.Join(dataDir, "tlsrptresult.db"), tlsrptdb.ResultDBTypes) // After v0.0.7.
 	checkQueue()
 	checkAccounts()
 	checkOther()

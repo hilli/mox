@@ -3,6 +3,7 @@ package smtpserver
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/mjl-/bstore"
@@ -35,22 +36,23 @@ const (
 //
 // The decision is made based on historic messages delivered to the same
 // destination mailbox, MailboxOrigID. Because each mailbox may have a different
-// accept policy, for example mailing lists with an SPF mailfrom allow. We only use
-// messages that have been marked as read. We expect users to mark junk messages as
-// such when they read it. And to keep it in their inbox, regular trash or archive
-// if it is not.
+// accept policy. We only use messages that have been marked as either junk or
+// non-junk. We help users by automatically marking them as non-junk when moving to
+// certain folders in the default config (e.g. the archive folder). We expect users
+// to mark junk messages as such when they read it. And to keep it in their inbox,
+// regular trash or archive if it is not.
 //
 // The basic idea is to keep accepting messages that were accepted in the past, and
 // keep rejecting those that were rejected. This is relatively easy to check if
 // mail passes SPF and/or DKIM with Message-From alignment. Regular email from
-// known people will be let in. But spammers are trickier. They will use new
+// known people will be let in. But spammers are trickier. They will use new IPs,
 // (sub)domains, no or newly created SPF and/or DKIM identifiers, new localparts,
 // etc. This function likely ends up returning "inconclusive" for such emails. The
 // junkfilter will have to take care of a final decision.
 //
 // In case of doubt, it doesn't hurt much to accept another mail that a user has
 // communicated successfully with in the past. If the most recent message is marked
-// as junk that could have happened accidental. If another message is let in, and
+// as junk that could have happened accidentally. If another message is let in, and
 // it is again junk, future messages will be rejected.
 //
 // Actual spammers will probably try to use identifiers, i.e. (sub)domain, dkim/spf
@@ -59,34 +61,35 @@ const (
 //
 // Some profiles of first-time senders:
 //
-// - Individuals. They can typically get past the junkfilter if needed.
-// - Transaction emails. They should get past the junkfilter. If they use one of
-// the larger email service providers, their reputation could help. If the
-// junkfilter rejects the message, users can recover the message from the Rejects
-// mailbox. The first message is typically initiated by a user, e.g. by registering.
-// - Desired commercial email will have to get past the junkfilter based on its
-// content. There will typically be earlier communication with the (organizational)
-// domain that would let the message through.
-// - Mailing list. May get past the junkfilter. If delivery is to a separate
-// mailbox, the junkfilter will let it in because of little history. Long enough to
-// build reputation based on DKIM/SPF signals.
+//   - Individuals. They can typically get past the junkfilter if needed.
+//   - Transactional emails. They should get past the junkfilter. If they use one of
+//     the larger email service providers, their reputation could help. If the
+//     junkfilter rejects the message, users can recover the message from the Rejects
+//     mailbox. The first message is typically initiated by a user, e.g. by registering.
+//   - Desired commercial email will have to get past the junkfilter based on its
+//     content. There will typically be earlier communication with the (organizational)
+//     domain that would let the message through.
+//   - Mailing list. May get past the junkfilter. If delivery is to a separate
+//     mailbox, the junkfilter will let it in because of little history. Long enough to
+//     build reputation based on DKIM/SPF signals. Users are best off to
+//     configure accept rules for messages from mailing lists.
 //
 // The decision-making process looks at historic messages. The following properties
 // are checked until matching messages are found. If they are found, a decision is
 // returned, which may be inconclusive. The next property on the list is only
 // checked if a step did not match any messages.
 //
-// - Messages matching full "message from" address, either with strict/relaxed
-// dkim/spf-verification, or without.
-// - Messages the user sent to the "message from" address.
-// - Messages matching only the domain of the "message from" address (different
-// localpart), again with verification or without.
-// - Messages sent to an address in the domain of the "message from" address.
-// - The previous two checks again, but now checking against the organizational
-// domain instead of the exact domain.
-// - Matching DKIM domains and a matching SPF mailfrom, or mailfrom domain, or ehlo
-// domain.
-// - "Exact" IP, or nearby IPs (/24 or /48).
+//   - Messages matching full "message from" address, either with strict/relaxed
+//     dkim/spf-verification, or without.
+//   - Messages the user sent to the "message from" address.
+//   - Messages matching only the domain of the "message from" address (different
+//     localpart), again with verification or without.
+//   - Messages sent to an address in the domain of the "message from" address.
+//   - The previous two checks again, but now checking against the organizational
+//     domain instead of the exact domain.
+//   - Matching DKIM domains and a matching SPF mailfrom, or mailfrom domain, or ehlo
+//     domain.
+//   - "Exact" IP, or nearby IPs.
 //
 // References:
 // ../rfc/5863
@@ -94,7 +97,7 @@ const (
 // ../rfc/6376:1915
 // ../rfc/6376:3716
 // ../rfc/7208:2167
-func reputation(tx *bstore.Tx, log *mlog.Log, m *store.Message) (rjunk *bool, rconclusive bool, rmethod reputationMethod, rerr error) {
+func reputation(tx *bstore.Tx, log mlog.Log, m *store.Message) (rjunk *bool, rconclusive bool, rmethod reputationMethod, rerr error) {
 	boolptr := func(v bool) *bool {
 		return &v
 	}
@@ -122,6 +125,7 @@ func reputation(tx *bstore.Tx, log *mlog.Log, m *store.Message) (rjunk *bool, rc
 	messageQuery := func(fm *store.Message, maxAge time.Duration, maxCount int) *bstore.Query[store.Message] {
 		q := bstore.QueryTx[store.Message](tx)
 		q.FilterEqual("MailboxOrigID", m.MailboxID)
+		q.FilterEqual("Expunged", false)
 		q.FilterFn(func(m store.Message) bool {
 			return m.Junk || m.Notjunk
 		})
@@ -138,7 +142,10 @@ func reputation(tx *bstore.Tx, log *mlog.Log, m *store.Message) (rjunk *bool, rc
 	xmessageList := func(q *bstore.Query[store.Message], descr string) []store.Message {
 		t0 := time.Now()
 		l, err := q.List()
-		log.Debugx("querying messages for reputation", err, mlog.Field("msgs", len(l)), mlog.Field("descr", descr), mlog.Field("queryduration", time.Since(t0)))
+		log.Debugx("querying messages for reputation", err,
+			slog.Int("msgs", len(l)),
+			slog.String("descr", descr),
+			slog.Duration("queryduration", time.Since(t0)))
 		if err != nil {
 			panic(queryError(fmt.Sprintf("listing messages: %v", err)))
 		}
@@ -335,17 +342,22 @@ func reputation(tx *bstore.Tx, log *mlog.Log, m *store.Message) (rjunk *bool, rc
 
 	// IP-based. A wider mask needs more messages to be conclusive.
 	// We require the resulting signal to be strong, i.e. likely ham or likely spam.
-	q := messageQuery(&store.Message{RemoteIPMasked1: m.RemoteIPMasked1}, year/4, 50)
-	msgs := xmessageList(q, "ip1")
-	need := 2
-	method := methodIP1
-	if len(msgs) == 0 {
+	var msgs []store.Message
+	var need int
+	var method reputationMethod
+	if m.RemoteIPMasked1 != "" {
+		q := messageQuery(&store.Message{RemoteIPMasked1: m.RemoteIPMasked1}, year/4, 50)
+		msgs = xmessageList(q, "ip1")
+		need = 2
+		method = methodIP1
+	}
+	if len(msgs) == 0 && m.RemoteIPMasked2 != "" {
 		q := messageQuery(&store.Message{RemoteIPMasked2: m.RemoteIPMasked2}, year/4, 50)
 		msgs = xmessageList(q, "ip2")
 		need = 5
 		method = methodIP2
 	}
-	if len(msgs) == 0 {
+	if len(msgs) == 0 && m.RemoteIPMasked3 != "" {
 		q := messageQuery(&store.Message{RemoteIPMasked3: m.RemoteIPMasked3}, year/4, 50)
 		msgs = xmessageList(q, "ip3")
 		need = 10

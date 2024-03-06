@@ -8,7 +8,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
-	"log"
+	golog "log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -18,10 +19,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mjl-/adns"
+
 	"github.com/mjl-/mox/dns"
+	"github.com/mjl-/mox/mlog"
 )
 
 func TestLookup(t *testing.T) {
+	mlog.SetConfig(map[string]slog.Level{"": mlog.LevelDebug})
+	log := mlog.New("mtasts", nil)
+
 	resolver := dns.MockResolver{
 		TXT: map[string][]string{
 			"_mta-sts.a.example.":         {"v=STSv1; id=1"},
@@ -35,39 +42,37 @@ func TestLookup(t *testing.T) {
 		CNAME: map[string]string{
 			"_mta-sts.a.cnames.example.":        "_mta-sts.b.cnames.example.",
 			"_mta-sts.b.cnames.example.":        "_mta-sts.c.cnames.example.",
-			"_mta-sts.followtemperror.example.": "_mta-sts.cnametemperror.example.",
+			"_mta-sts.followtemperror.example.": "_mta-sts.temperror.example.",
 		},
-		Fail: map[dns.Mockreq]struct{}{
-			{Type: "txt", Name: "_mta-sts.temperror.example."}:        {},
-			{Type: "cname", Name: "_mta-sts.cnametemperror.example."}: {},
+		Fail: []string{
+			"txt _mta-sts.temperror.example.",
 		},
 	}
 
-	test := func(host string, expRecord *Record, expCNAMEs []string, expErr error) {
+	test := func(host string, expRecord *Record, expErr error) {
 		t.Helper()
 
-		record, _, cnames, err := LookupRecord(context.Background(), resolver, dns.Domain{ASCII: host})
+		record, _, err := LookupRecord(context.Background(), log.Logger, resolver, dns.Domain{ASCII: host})
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) {
 			t.Fatalf("lookup: got err %#v, expected %#v", err, expErr)
 		}
 		if err != nil {
 			return
 		}
-		if !reflect.DeepEqual(record, expRecord) || !reflect.DeepEqual(cnames, expCNAMEs) {
-			t.Fatalf("lookup: got record %#v, cnames %#v, expected %#v %#v", record, cnames, expRecord, expCNAMEs)
+		if !reflect.DeepEqual(record, expRecord) {
+			t.Fatalf("lookup: got record %#v, expected %#v", record, expRecord)
 		}
 	}
 
-	test("absent.example", nil, nil, ErrNoRecord)
-	test("other.example", nil, nil, ErrNoRecord)
-	test("a.example", &Record{Version: "STSv1", ID: "1"}, nil, nil)
-	test("one.example", &Record{Version: "STSv1", ID: "1"}, nil, nil)
-	test("bad.example", nil, nil, ErrRecordSyntax)
-	test("multiple.example", nil, nil, ErrMultipleRecords)
-	test("a.cnames.example", &Record{Version: "STSv1", ID: "1"}, []string{"_mta-sts.b.cnames.example.", "_mta-sts.c.cnames.example."}, nil)
-	test("temperror.example", nil, nil, ErrDNS)
-	test("cnametemperror.example", nil, nil, ErrDNS)
-	test("followtemperror.example", nil, nil, ErrDNS)
+	test("absent.example", nil, ErrNoRecord)
+	test("other.example", nil, ErrNoRecord)
+	test("a.example", &Record{Version: "STSv1", ID: "1"}, nil)
+	test("one.example", &Record{Version: "STSv1", ID: "1"}, nil)
+	test("bad.example", nil, ErrRecordSyntax)
+	test("multiple.example", nil, ErrMultipleRecords)
+	test("a.cnames.example", &Record{Version: "STSv1", ID: "1"}, nil)
+	test("temperror.example", nil, ErrDNS)
+	test("followtemperror.example", nil, ErrDNS)
 }
 
 func TestMatches(t *testing.T) {
@@ -181,6 +186,8 @@ func fakeCert(t *testing.T, expired bool) tls.Certificate {
 }
 
 func TestFetch(t *testing.T) {
+	log := mlog.New("mtasts", nil)
+
 	certok := fakeCert(t, false)
 	certbad := fakeCert(t, true)
 
@@ -215,7 +222,7 @@ func TestFetch(t *testing.T) {
 				TLSConfig: &tls.Config{
 					Certificates: []tls.Certificate{cert},
 				},
-				ErrorLog: log.New(io.Discard, "", 0),
+				ErrorLog: golog.New(io.Discard, "", 0),
 			}
 			s.ServeTLS(l, "", "")
 		}()
@@ -223,7 +230,7 @@ func TestFetch(t *testing.T) {
 		HTTPClient.Transport = &http.Transport{
 			Dial: func(network, addr string) (net.Conn, error) {
 				if strings.HasPrefix(addr, "mta-sts.doesnotexist.example") {
-					return nil, &net.DNSError{IsNotFound: true}
+					return nil, &adns.DNSError{IsNotFound: true}
 				}
 				return l.Dial()
 			},
@@ -232,7 +239,7 @@ func TestFetch(t *testing.T) {
 			},
 		}
 
-		p, _, err := FetchPolicy(context.Background(), dns.Domain{ASCII: domain})
+		p, _, err := FetchPolicy(context.Background(), log.Logger, dns.Domain{ASCII: domain})
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) {
 			t.Fatalf("policy: got err %#v, expected %#v", err, expErr)
 		}
@@ -244,7 +251,7 @@ func TestFetch(t *testing.T) {
 			expErr = ErrNoRecord
 		}
 
-		_, p, err = Get(context.Background(), resolver, dns.Domain{ASCII: domain})
+		_, p, _, err = Get(context.Background(), log.Logger, resolver, dns.Domain{ASCII: domain})
 		if (err == nil) != (expErr == nil) || err != nil && !errors.Is(err, expErr) {
 			t.Fatalf("get: got err %#v, expected %#v", err, expErr)
 		}

@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"hash"
 	"strings"
@@ -12,16 +13,28 @@ import (
 	"github.com/mjl-/mox/scram"
 )
 
-// Client is a SASL client
+// Client is a SASL client.
+//
+// A SASL client can be used for authentication in IMAP, SMTP and other protocols.
+// A client and server exchange messages in step lock. In IMAP and SMTP, these
+// messages are encoded with base64. Each SASL mechanism has predefined steps, but
+// the transaction can be aborted by either side at any time. An IMAP or SMTP
+// client must choose a SASL mechanism, instantiate a SASL client, and call Next
+// with a nil parameter. The resulting data must be written to the server, properly
+// encoded. The client must then read the response from the server and feed it to
+// the SASL client, which will return more data to send, or an error.
 type Client interface {
-	// Name as used in SMTP AUTH, e.g. PLAIN, CRAM-MD5, SCRAM-SHA-256.
-	// cleartextCredentials indicates if credentials are exchanged in clear text, which influences whether they are logged.
+	// Name as used in SMTP or IMAP authentication, e.g. PLAIN, CRAM-MD5,
+	// SCRAM-SHA-256. cleartextCredentials indicates if credentials are exchanged in
+	// clear text, which can be used to decide if the exchange is logged.
 	Info() (name string, cleartextCredentials bool)
 
-	// Next is called for each step of the SASL communication. The first call has a nil
-	// fromServer and serves to get a possible "initial response" from the client. If
-	// the client sends its final message it indicates so with last. Returning an error
-	// aborts the authentication attempt.
+	// Next must be called for each step of the SASL transaction. The first call has a
+	// nil fromServer and serves to get a possible "initial response" from the client
+	// to the server. When last is true, the message from client to server is the last
+	// one, and the server must send a verdict. If err is set, the transaction must be
+	// aborted.
+	//
 	// For the first toServer ("initial response"), a nil toServer indicates there is
 	// no data, which is different from a non-nil zero-length toServer.
 	Next(fromServer []byte) (toServer []byte, last bool, err error)
@@ -35,6 +48,9 @@ type clientPlain struct {
 var _ Client = (*clientPlain)(nil)
 
 // NewClientPlain returns a client for SASL PLAIN authentication.
+//
+// PLAIN is specified in RFC 4616, The PLAIN Simple Authentication and Security
+// Layer (SASL) Mechanism.
 func NewClientPlain(username, password string) Client {
 	return &clientPlain{username, password, 0}
 }
@@ -53,6 +69,36 @@ func (a *clientPlain) Next(fromServer []byte) (toServer []byte, last bool, rerr 
 	}
 }
 
+type clientLogin struct {
+	Username, Password string
+	step               int
+}
+
+var _ Client = (*clientLogin)(nil)
+
+// NewClientLogin returns a client for the obsolete SASL LOGIN authentication.
+//
+// See https://datatracker.ietf.org/doc/html/draft-murchison-sasl-login-00
+func NewClientLogin(username, password string) Client {
+	return &clientLogin{username, password, 0}
+}
+
+func (a *clientLogin) Info() (name string, hasCleartextCredentials bool) {
+	return "LOGIN", true
+}
+
+func (a *clientLogin) Next(fromServer []byte) (toServer []byte, last bool, rerr error) {
+	defer func() { a.step++ }()
+	switch a.step {
+	case 0:
+		return []byte(a.Username), false, nil
+	case 1:
+		return []byte(a.Password), true, nil
+	default:
+		return nil, false, fmt.Errorf("invalid step %d", a.step)
+	}
+}
+
 type clientCRAMMD5 struct {
 	Username, Password string
 	step               int
@@ -61,6 +107,9 @@ type clientCRAMMD5 struct {
 var _ Client = (*clientCRAMMD5)(nil)
 
 // NewClientCRAMMD5 returns a client for SASL CRAM-MD5 authentication.
+//
+// CRAM-MD5 is specified in RFC 2195, IMAP/POP AUTHorize Extension for Simple
+// Challenge/Response.
 func NewClientCRAMMD5(username, password string) Client {
 	return &clientCRAMMD5{username, password, 0}
 }
@@ -123,6 +172,15 @@ func (a *clientCRAMMD5) Next(fromServer []byte) (toServer []byte, last bool, rer
 type clientSCRAMSHA struct {
 	Username, Password string
 
+	hash func() hash.Hash
+
+	plus bool
+	cs   tls.ConnectionState
+
+	// When not doing PLUS variant, this field indicates whether that is because the
+	// server doesn't support the PLUS variant. Used for detecting MitM attempts.
+	noServerPlus bool
+
 	name  string
 	step  int
 	scram *scram.Client
@@ -131,13 +189,53 @@ type clientSCRAMSHA struct {
 var _ Client = (*clientSCRAMSHA)(nil)
 
 // NewClientSCRAMSHA1 returns a client for SASL SCRAM-SHA-1 authentication.
-func NewClientSCRAMSHA1(username, password string) Client {
-	return &clientSCRAMSHA{username, password, "SCRAM-SHA-1", 0, nil}
+//
+// Clients should prefer using the PLUS-variant with TLS channel binding, if
+// supported by a server. If noServerPlus is set, this mechanism was chosen because
+// the PLUS-variant was not supported by the server. If the server actually does
+// implement the PLUS variant, this can indicate a MitM attempt, which is detected
+// by the server and causes the authentication attempt to be aborted.
+//
+// SCRAM-SHA-1 is specified in RFC 5802, "Salted Challenge Response Authentication
+// Mechanism (SCRAM) SASL and GSS-API Mechanisms".
+func NewClientSCRAMSHA1(username, password string, noServerPlus bool) Client {
+	return &clientSCRAMSHA{username, password, sha1.New, false, tls.ConnectionState{}, noServerPlus, "SCRAM-SHA-1", 0, nil}
+}
+
+// NewClientSCRAMSHA1PLUS returns a client for SASL SCRAM-SHA-1-PLUS authentication.
+//
+// The PLUS-variant binds the authentication exchange to the TLS connection,
+// detecting any MitM attempt.
+//
+// SCRAM-SHA-1-PLUS is specified in RFC 5802, "Salted Challenge Response
+// Authentication Mechanism (SCRAM) SASL and GSS-API Mechanisms".
+func NewClientSCRAMSHA1PLUS(username, password string, cs tls.ConnectionState) Client {
+	return &clientSCRAMSHA{username, password, sha1.New, true, cs, false, "SCRAM-SHA-1-PLUS", 0, nil}
 }
 
 // NewClientSCRAMSHA256 returns a client for SASL SCRAM-SHA-256 authentication.
-func NewClientSCRAMSHA256(username, password string) Client {
-	return &clientSCRAMSHA{username, password, "SCRAM-SHA-256", 0, nil}
+//
+// Clients should prefer using the PLUS-variant with TLS channel binding, if
+// supported by a server. If noServerPlus is set, this mechanism was chosen because
+// the PLUS-variant was not supported by the server. If the server actually does
+// implement the PLUS variant, this can indicate a MitM attempt, which is detected
+// by the server and causes the authentication attempt to be aborted.
+//
+// SCRAM-SHA-256 is specified in RFC 7677, "SCRAM-SHA-256 and SCRAM-SHA-256-PLUS
+// Simple Authentication and Security Layer (SASL) Mechanisms".
+func NewClientSCRAMSHA256(username, password string, noServerPlus bool) Client {
+	return &clientSCRAMSHA{username, password, sha256.New, false, tls.ConnectionState{}, noServerPlus, "SCRAM-SHA-256", 0, nil}
+}
+
+// NewClientSCRAMSHA256PLUS returns a client for SASL SCRAM-SHA-256-PLUS authentication.
+//
+// The PLUS-variant binds the authentication exchange to the TLS connection,
+// detecting any MitM attempt.
+//
+// SCRAM-SHA-256-PLUS is specified in RFC 7677, "SCRAM-SHA-256 and SCRAM-SHA-256-PLUS
+// Simple Authentication and Security Layer (SASL) Mechanisms".
+func NewClientSCRAMSHA256PLUS(username, password string, cs tls.ConnectionState) Client {
+	return &clientSCRAMSHA{username, password, sha256.New, true, cs, false, "SCRAM-SHA-256-PLUS", 0, nil}
 }
 
 func (a *clientSCRAMSHA) Info() (name string, hasCleartextCredentials bool) {
@@ -148,17 +246,11 @@ func (a *clientSCRAMSHA) Next(fromServer []byte) (toServer []byte, last bool, re
 	defer func() { a.step++ }()
 	switch a.step {
 	case 0:
-		var h func() hash.Hash
-		switch a.name {
-		case "SCRAM-SHA-1":
-			h = sha1.New
-		case "SCRAM-SHA-256":
-			h = sha256.New
-		default:
-			return nil, false, fmt.Errorf("invalid SCRAM-SHA variant %q", a.name)
+		var cs *tls.ConnectionState
+		if a.plus {
+			cs = &a.cs
 		}
-
-		a.scram = scram.NewClient(h, a.Username, "")
+		a.scram = scram.NewClient(a.hash, a.Username, "", a.noServerPlus, cs)
 		toserver, err := a.scram.ClientFirst()
 		return []byte(toserver), false, err
 

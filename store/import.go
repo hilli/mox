@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,25 +26,25 @@ type MsgSource interface {
 
 // MboxReader reads messages from an mbox file, implementing MsgSource.
 type MboxReader struct {
-	createTemp func(pattern string) (*os.File, error)
+	log        mlog.Log
+	createTemp func(log mlog.Log, pattern string) (*os.File, error)
 	path       string
 	line       int
 	r          *bufio.Reader
 	prevempty  bool
 	nonfirst   bool
-	log        *mlog.Log
 	eof        bool
 	fromLine   string // "From "-line for this message.
 	header     bool   // Now in header section.
 }
 
-func NewMboxReader(createTemp func(pattern string) (*os.File, error), filename string, r io.Reader, log *mlog.Log) *MboxReader {
+func NewMboxReader(log mlog.Log, createTemp func(log mlog.Log, pattern string) (*os.File, error), filename string, r io.Reader) *MboxReader {
 	return &MboxReader{
+		log:        log,
 		createTemp: createTemp,
 		path:       filename,
 		line:       1,
 		r:          bufio.NewReader(r),
-		log:        log,
 	}
 }
 
@@ -78,16 +79,13 @@ func (mr *MboxReader) Next() (*Message, *os.File, string, error) {
 		mr.fromLine = strings.TrimSpace(string(line))
 	}
 
-	f, err := mr.createTemp("mboxreader")
+	f, err := mr.createTemp(mr.log, "mboxreader")
 	if err != nil {
 		return nil, nil, mr.Position(), err
 	}
 	defer func() {
 		if f != nil {
-			err := os.Remove(f.Name())
-			mr.log.Check(err, "removing temporary message file after mbox read error", mlog.Field("path", f.Name()))
-			err = f.Close()
-			mr.log.Check(err, "closing temporary message file after mbox read error")
+			CloseRemoveTempFile(mr.log, f, "message after mbox read error")
 		}
 	}()
 
@@ -148,7 +146,7 @@ func (mr *MboxReader) Next() (*Message, *os.File, string, error) {
 						case "mdnsent", "$mdnsent":
 							flags.MDNSent = true
 						default:
-							if ValidLowercaseKeyword(word) {
+							if err := CheckKeyword(word); err == nil {
 								keywords[word] = true
 							}
 						}
@@ -205,28 +203,28 @@ func (mr *MboxReader) Next() (*Message, *os.File, string, error) {
 }
 
 type MaildirReader struct {
-	createTemp      func(pattern string) (*os.File, error)
-	newf, curf      *os.File
-	f               *os.File // File we are currently reading from. We first read newf, then curf.
-	dir             string   // Name of directory for f. Can be empty on first call.
-	entries         []os.DirEntry
-	dovecotKeywords []string
-	log             *mlog.Log
+	log          mlog.Log
+	createTemp   func(log mlog.Log, pattern string) (*os.File, error)
+	newf, curf   *os.File
+	f            *os.File // File we are currently reading from. We first read newf, then curf.
+	dir          string   // Name of directory for f. Can be empty on first call.
+	entries      []os.DirEntry
+	dovecotFlags []string // Lower-case flags/keywords.
 }
 
-func NewMaildirReader(createTemp func(pattern string) (*os.File, error), newf, curf *os.File, log *mlog.Log) *MaildirReader {
+func NewMaildirReader(log mlog.Log, createTemp func(log mlog.Log, pattern string) (*os.File, error), newf, curf *os.File) *MaildirReader {
 	mr := &MaildirReader{
+		log:        log,
 		createTemp: createTemp,
 		newf:       newf,
 		curf:       curf,
 		f:          newf,
-		log:        log,
 	}
 
 	// Best-effort parsing of dovecot keywords.
 	kf, err := os.Open(filepath.Join(filepath.Dir(newf.Name()), "dovecot-keywords"))
 	if err == nil {
-		mr.dovecotKeywords, err = ParseDovecotKeywords(kf, log)
+		mr.dovecotFlags, err = ParseDovecotKeywordsFlags(kf, log)
 		log.Check(err, "parsing dovecot keywords file")
 		err = kf.Close()
 		log.Check(err, "closing dovecot-keywords file")
@@ -266,16 +264,17 @@ func (mr *MaildirReader) Next() (*Message, *os.File, string, error) {
 		err := sf.Close()
 		mr.log.Check(err, "closing message file after error")
 	}()
-	f, err := mr.createTemp("maildirreader")
+	f, err := mr.createTemp(mr.log, "maildirreader")
 	if err != nil {
 		return nil, nil, p, err
 	}
 	defer func() {
 		if f != nil {
-			err := os.Remove(f.Name())
-			mr.log.Check(err, "removing temporary message file after maildir read error", mlog.Field("path", f.Name()))
-			err = f.Close()
+			name := f.Name()
+			err := f.Close()
 			mr.log.Check(err, "closing temporary message file after maildir read error")
+			err = os.Remove(name)
+			mr.log.Check(err, "removing temporary message file after maildir read error", slog.String("path", name))
 		}
 	}()
 
@@ -336,10 +335,10 @@ func (mr *MaildirReader) Next() (*Message, *os.File, string, error) {
 			default:
 				if c >= 'a' && c <= 'z' {
 					index := int(c - 'a')
-					if index >= len(mr.dovecotKeywords) {
+					if index >= len(mr.dovecotFlags) {
 						continue
 					}
-					kw := strings.ToLower(mr.dovecotKeywords[index])
+					kw := mr.dovecotFlags[index]
 					switch kw {
 					case "$forwarded", "forwarded":
 						flags.Forwarded = true
@@ -352,9 +351,7 @@ func (mr *MaildirReader) Next() (*Message, *os.File, string, error) {
 					case "$phishing", "phishing":
 						flags.Phishing = true
 					default:
-						if ValidLowercaseKeyword(kw) {
-							keywords[kw] = true
-						}
+						keywords[kw] = true
 					}
 				}
 			}
@@ -370,7 +367,11 @@ func (mr *MaildirReader) Next() (*Message, *os.File, string, error) {
 	return m, mf, p, nil
 }
 
-func ParseDovecotKeywords(r io.Reader, log *mlog.Log) ([]string, error) {
+// ParseDovecotKeywordsFlags attempts to parse a dovecot-keywords file. It only
+// returns valid flags/keywords, as lower-case. If an error is encountered and
+// returned, any keywords that were found are still returned. The returned list has
+// both system/well-known flags and custom keywords.
+func ParseDovecotKeywordsFlags(r io.Reader, log mlog.Log) ([]string, error) {
 	/*
 		If the dovecot-keywords file is present, we parse its additional flags, see
 		https://doc.dovecot.org/admin_manual/mailbox_formats/maildir/
@@ -406,7 +407,14 @@ func ParseDovecotKeywords(r io.Reader, log *mlog.Log) ([]string, error) {
 			errs = append(errs, fmt.Sprintf("duplicate dovecot keyword: %q", s))
 			continue
 		}
-		keywords[index] = t[1]
+		kw := strings.ToLower(t[1])
+		if !systemWellKnownFlags[kw] {
+			if err := CheckKeyword(kw); err != nil {
+				errs = append(errs, fmt.Sprintf("invalid keyword %q", kw))
+				continue
+			}
+		}
+		keywords[index] = kw
 		if index >= end {
 			end = index + 1
 		}

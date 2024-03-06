@@ -3,11 +3,14 @@ package queue
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/mjl-/mox/config"
@@ -16,6 +19,7 @@ import (
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/sasl"
+	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/smtpclient"
 	"github.com/mjl-/mox/store"
 )
@@ -24,7 +28,7 @@ import (
 
 // deliver via another SMTP server, e.g. relaying to a smart host, possibly
 // with authentication (submission).
-func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer contextDialer, m Msg, backoff time.Duration, transportName string, transport *config.TransportSMTP, dialTLS bool, defaultPort int) {
+func deliverSubmit(qlog mlog.Log, resolver dns.Resolver, dialer smtpclient.Dialer, m Msg, backoff time.Duration, transportName string, transport *config.TransportSMTP, dialTLS bool, defaultPort int) {
 	// todo: configurable timeouts
 
 	port := transport.Port
@@ -32,13 +36,16 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 		port = defaultPort
 	}
 
-	tlsMode := smtpclient.TLSStrictStartTLS
+	tlsMode := smtpclient.TLSRequiredStartTLS
+	tlsPKIX := true
 	if dialTLS {
-		tlsMode = smtpclient.TLSStrictImmediate
+		tlsMode = smtpclient.TLSImmediate
 	} else if transport.STARTTLSInsecureSkipVerify {
-		tlsMode = smtpclient.TLSOpportunistic
+		tlsMode = smtpclient.TLSRequiredStartTLS
+		tlsPKIX = false
 	} else if transport.NoSTARTTLS {
 		tlsMode = smtpclient.TLSSkip
+		tlsPKIX = false
 	}
 	start := time.Now()
 	var deliveryResult string
@@ -48,13 +55,47 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 	var success bool
 	defer func() {
 		metricDelivery.WithLabelValues(fmt.Sprintf("%d", m.Attempts), transportName, string(tlsMode), deliveryResult).Observe(float64(time.Since(start)) / float64(time.Second))
-		qlog.Debug("queue deliversubmit result", mlog.Field("host", transport.DNSHost), mlog.Field("port", port), mlog.Field("attempt", m.Attempts), mlog.Field("permanent", permanent), mlog.Field("secodeopt", secodeOpt), mlog.Field("errmsg", errmsg), mlog.Field("ok", success), mlog.Field("duration", time.Since(start)))
+		qlog.Debug("queue deliversubmit result",
+			slog.Any("host", transport.DNSHost),
+			slog.Int("port", port),
+			slog.Int("attempt", m.Attempts),
+			slog.Bool("permanent", permanent),
+			slog.String("secodeopt", secodeOpt),
+			slog.String("errmsg", errmsg),
+			slog.Bool("ok", success),
+			slog.Duration("duration", time.Since(start)))
 	}()
 
-	dialctx, dialcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// todo: SMTP-DANE should be used when relaying on port 25.
+	// ../rfc/7672:1261
+
+	// todo: for submission, understand SRV records, and even DANE.
+
+	ctx := mox.Shutdown
+
+	// If submit was done with REQUIRETLS extension for SMTP, we must verify TLS
+	// certificates. If our submission connection is not configured that way, abort.
+	requireTLS := m.RequireTLS != nil && *m.RequireTLS
+	if requireTLS && (tlsMode != smtpclient.TLSRequiredStartTLS && tlsMode != smtpclient.TLSImmediate || !tlsPKIX) {
+		errmsg = fmt.Sprintf("transport %s: message requires verified tls but transport does not verify tls", transportName)
+		fail(ctx, qlog, m, backoff, true, dsn.NameIP{}, smtp.SePol7MissingReqTLS, errmsg, "", nil)
+		return
+	}
+
+	dialctx, dialcancel := context.WithTimeout(ctx, 30*time.Second)
 	defer dialcancel()
+	if m.DialedIPs == nil {
+		m.DialedIPs = map[string][]net.IP{}
+	}
+	_, _, _, ips, _, err := smtpclient.GatherIPs(dialctx, qlog.Logger, resolver, dns.IPDomain{Domain: transport.DNSHost}, m.DialedIPs)
+	var conn net.Conn
+	if err == nil {
+		if m.DialedIPs == nil {
+			m.DialedIPs = map[string][]net.IP{}
+		}
+		conn, _, err = smtpclient.Dial(dialctx, qlog.Logger, dialer, dns.IPDomain{Domain: transport.DNSHost}, ips, port, m.DialedIPs, mox.Conf.Static.SpecifiedSMTPListenIPs)
+	}
 	addr := net.JoinHostPort(transport.Host, fmt.Sprintf("%d", port))
-	conn, _, _, err := dialHost(dialctx, qlog, resolver, dialer, dns.IPDomain{Domain: transport.DNSHost}, port, &m)
 	var result string
 	switch {
 	case err == nil:
@@ -72,48 +113,65 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 			err := conn.Close()
 			qlog.Check(err, "closing connection")
 		}
-		qlog.Errorx("dialing for submission", err, mlog.Field("remote", addr))
+		qlog.Errorx("dialing for submission", err, slog.String("remote", addr))
 		errmsg = fmt.Sprintf("transport %s: dialing %s for submission: %v", transportName, addr, err)
-		fail(qlog, m, backoff, false, dsn.NameIP{}, "", errmsg)
+		fail(ctx, qlog, m, backoff, false, dsn.NameIP{}, "", errmsg, "", nil)
 		return
 	}
 	dialcancel()
 
-	var auth []sasl.Client
+	var auth func(mechanisms []string, cs *tls.ConnectionState) (sasl.Client, error)
 	if transport.Auth != nil {
 		a := transport.Auth
-		for _, mech := range a.EffectiveMechanisms {
-			switch mech {
-			case "PLAIN":
-				auth = append(auth, sasl.NewClientPlain(a.Username, a.Password))
-			case "CRAM-MD5":
-				auth = append(auth, sasl.NewClientCRAMMD5(a.Username, a.Password))
-			case "SCRAM-SHA-1":
-				auth = append(auth, sasl.NewClientSCRAMSHA1(a.Username, a.Password))
-			case "SCRAM-SHA-256":
-				auth = append(auth, sasl.NewClientSCRAMSHA256(a.Username, a.Password))
-			default:
-				// Should not happen.
-				qlog.Error("missing smtp authentication mechanisms implementation", mlog.Field("mechanism", mech))
-				errmsg = fmt.Sprintf("transport %s: authentication mechanisms %q not implemented", transportName, mech)
-				fail(qlog, m, backoff, false, dsn.NameIP{}, "", errmsg)
-				return
+		auth = func(mechanisms []string, cs *tls.ConnectionState) (sasl.Client, error) {
+			var supportsscramsha1plus, supportsscramsha256plus bool
+			for _, mech := range a.EffectiveMechanisms {
+				if !slices.Contains(mechanisms, mech) {
+					switch mech {
+					case "SCRAM-SHA-1-PLUS":
+						supportsscramsha1plus = cs != nil
+					case "SCRAM-SHA-256-PLUS":
+						supportsscramsha256plus = cs != nil
+					}
+					continue
+				}
+				if mech == "SCRAM-SHA-256-PLUS" && cs != nil {
+					return sasl.NewClientSCRAMSHA256PLUS(a.Username, a.Password, *cs), nil
+				} else if mech == "SCRAM-SHA-256" {
+					return sasl.NewClientSCRAMSHA256(a.Username, a.Password, supportsscramsha256plus), nil
+				} else if mech == "SCRAM-SHA-1-PLUS" && cs != nil {
+					return sasl.NewClientSCRAMSHA1PLUS(a.Username, a.Password, *cs), nil
+				} else if mech == "SCRAM-SHA-1" {
+					return sasl.NewClientSCRAMSHA1(a.Username, a.Password, supportsscramsha1plus), nil
+				} else if mech == "CRAM-MD5" {
+					return sasl.NewClientCRAMMD5(a.Username, a.Password), nil
+				} else if mech == "PLAIN" {
+					return sasl.NewClientPlain(a.Username, a.Password), nil
+				}
+				return nil, fmt.Errorf("internal error: unrecognized authentication mechanism %q for transport %s", mech, transportName)
 			}
+
+			// No mutually supported algorithm.
+			return nil, nil
 		}
 	}
 	clientctx, clientcancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer clientcancel()
-	client, err := smtpclient.New(clientctx, qlog, conn, tlsMode, mox.Conf.Static.HostnameDomain, transport.DNSHost, auth)
+	opts := smtpclient.Opts{
+		Auth:    auth,
+		RootCAs: mox.Conf.Static.TLS.CertPool,
+	}
+	client, err := smtpclient.New(clientctx, qlog.Logger, conn, tlsMode, tlsPKIX, mox.Conf.Static.HostnameDomain, transport.DNSHost, opts)
 	if err != nil {
 		smtperr, ok := err.(smtpclient.Error)
 		var remoteMTA dsn.NameIP
 		if ok {
 			remoteMTA.Name = transport.Host
 		}
-		qlog.Errorx("establishing smtp session for submission", err, mlog.Field("remote", addr))
+		qlog.Errorx("establishing smtp session for submission", err, slog.String("remote", addr))
 		errmsg = fmt.Sprintf("transport %s: establishing smtp session with %s for submission: %v", transportName, addr, err)
 		secodeOpt = smtperr.Secode
-		fail(qlog, m, backoff, false, remoteMTA, secodeOpt, errmsg)
+		fail(ctx, qlog, m, backoff, false, remoteMTA, secodeOpt, errmsg, smtperr.Line, smtperr.MoreLines)
 		return
 	}
 	defer func() {
@@ -136,9 +194,9 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 		p := m.MessagePath()
 		f, err := os.Open(p)
 		if err != nil {
-			qlog.Errorx("opening message for delivery", err, mlog.Field("remote", addr), mlog.Field("path", p))
+			qlog.Errorx("opening message for delivery", err, slog.String("remote", addr), slog.String("path", p))
 			errmsg = fmt.Sprintf("transport %s: opening message file for submission: %v", transportName, err)
-			fail(qlog, m, backoff, false, dsn.NameIP{}, "", errmsg)
+			fail(ctx, qlog, m, backoff, false, dsn.NameIP{}, "", errmsg, "", nil)
 			return
 		}
 		msgr = store.FileMsgReader(m.MsgPrefix, f)
@@ -150,7 +208,7 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 
 	deliverctx, delivercancel := context.WithTimeout(context.Background(), time.Duration(60+size/(1024*1024))*time.Second)
 	defer delivercancel()
-	err = client.Deliver(deliverctx, m.Sender().String(), m.Recipient().String(), size, msgr, req8bit, reqsmtputf8)
+	err = client.Deliver(deliverctx, m.Sender().String(), m.Recipient().String(), size, msgr, req8bit, reqsmtputf8, requireTLS)
 	if err != nil {
 		qlog.Infox("delivery failed", err)
 	}
@@ -177,11 +235,11 @@ func deliverSubmit(cid int64, qlog *mlog.Log, resolver dns.Resolver, dialer cont
 		if ok {
 			remoteMTA.Name = transport.Host
 		}
-		qlog.Errorx("submitting email", err, mlog.Field("remote", addr))
+		qlog.Errorx("submitting email", err, slog.String("remote", addr))
 		permanent = smtperr.Permanent
 		secodeOpt = smtperr.Secode
 		errmsg = fmt.Sprintf("transport %s: submitting email to %s: %v", transportName, addr, err)
-		fail(qlog, m, backoff, permanent, remoteMTA, secodeOpt, errmsg)
+		fail(ctx, qlog, m, backoff, permanent, remoteMTA, secodeOpt, errmsg, smtperr.Line, smtperr.MoreLines)
 		return
 	}
 	qlog.Info("delivered from queue with transport")

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,30 +12,40 @@ import (
 	"net/mail"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/mjl-/sconf"
 
 	"github.com/mjl-/mox/dns"
-	"github.com/mjl-/mox/mlog"
+	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/sasl"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/smtpclient"
 )
 
 var submitconf struct {
-	LocalHostname      string `sconf-doc:"Hosts don't always have an FQDN, set it explicitly, for EHLO."`
-	Host               string `sconf-doc:"Host to dial for delivery, e.g. mail.<domain>."`
-	Port               int    `sconf-doc:"Port to dial for delivery, e.g. 465 for submissions, 587 for submission, or perhaps 25 for smtp."`
-	TLS                bool   `sconf-doc:"Connect with TLS. Usually for connections to port 465."`
-	STARTTLS           bool   `sconf-doc:"After starting in plain text, use STARTTLS to enable TLS. For port 587 and 25."`
-	Username           string `sconf-doc:"For SMTP authentication."`
-	Password           string `sconf-doc:"For password-based SMTP authentication, e.g. SCRAM-SHA-256, SCRAM-SHA-1, CRAM-MD5, PLAIN."`
-	AuthMethod         string `sconf-doc:"If set, only attempt this authentication mechanism. E.g. SCRAM-SHA-256. If not set, any mutually supported algorithm can be used, in order of most to least secure."`
-	From               string `sconf-doc:"Address for MAIL FROM in SMTP and From-header in message."`
-	DefaultDestination string `sconf:"optional" sconf-doc:"Used when specified address does not contain an @ and may be a local user (eg root)."`
+	LocalHostname      string           `sconf-doc:"Hosts don't always have an FQDN, set it explicitly, for EHLO."`
+	Host               string           `sconf-doc:"Host to dial for delivery, e.g. mail.<domain>."`
+	Port               int              `sconf-doc:"Port to dial for delivery, e.g. 465 for submissions, 587 for submission, or perhaps 25 for smtp."`
+	TLS                bool             `sconf-doc:"Connect with TLS. Usually for connections to port 465."`
+	STARTTLS           bool             `sconf-doc:"After starting in plain text, use STARTTLS to enable TLS. For port 587 and 25."`
+	Username           string           `sconf-doc:"For SMTP authentication."`
+	Password           string           `sconf-doc:"For password-based SMTP authentication, e.g. SCRAM-SHA-256-PLUS, CRAM-MD5, PLAIN."`
+	AuthMethod         string           `sconf-doc:"If set, only attempt this authentication mechanism. E.g. SCRAM-SHA-256-PLUS, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-1, CRAM-MD5, PLAIN. If not set, any mutually supported algorithm can be used, in order listed, from most to least secure. It is recommended to specify the strongest authentication mechanism known to be implemented by the server, to prevent mechanism downgrade attacks."`
+	From               string           `sconf-doc:"Address for MAIL FROM in SMTP and From-header in message."`
+	DefaultDestination string           `sconf:"optional" sconf-doc:"Used when specified address does not contain an @ and may be a local user (eg root)."`
+	RequireTLS         RequireTLSOption `sconf:"optional" sconf-doc:"If yes, submission server must implement SMTP REQUIRETLS extension, and connection to submission server must use verified TLS. If no, a TLS-Required header with value no is added to the message, allowing fallback to unverified TLS or plain text delivery despite recpient domain policies. By default, the submission server will follow the policies of the recipient domain (MTA-STS and/or DANE), and apply unverified opportunistic TLS with STARTTLS."`
 }
+
+type RequireTLSOption string
+
+const (
+	RequireTLSDefault RequireTLSOption = ""
+	RequireTLSYes     RequireTLSOption = "yes"
+	RequireTLSNo      RequireTLSOption = "no"
+)
 
 func cmdConfigDescribeSendmail(c *cmd) {
 	c.params = ">/etc/moxsubmit.conf"
@@ -157,6 +169,9 @@ binary should be setgid that group:
 				if !haveTo {
 					line = fmt.Sprintf("To: <%s>\r\n", recipient) + line
 				}
+				if submitconf.RequireTLS == RequireTLSNo {
+					line = "TLS-Required: No\r\n" + line
+				}
 				header = false
 			} else if header {
 				t := strings.SplitN(line, ":", 2)
@@ -199,6 +214,9 @@ binary should be setgid that group:
 			break
 		}
 	}
+	if header && submitconf.RequireTLS == RequireTLSNo {
+		sb.WriteString("TLS-Required: No\r\n")
+	}
 	msg := sb.String()
 
 	if recipient == "" {
@@ -207,8 +225,9 @@ binary should be setgid that group:
 
 	// Message seems acceptable. We'll try to deliver it from here. If that fails, we
 	// store the message in the users home directory.
+	// Must only use xsavecheckf for error checking in the code below.
 
-	xcheckf := func(err error, format string, args ...any) {
+	xsavecheckf := func(err error, format string, args ...any) {
 		if err == nil {
 			return
 		}
@@ -219,13 +238,7 @@ binary should be setgid that group:
 		os.Mkdir(maildir, 0700)
 		f, err := os.CreateTemp(maildir, "newmsg.")
 		xcheckf(err, "creating temp file for storing message after failed delivery")
-		defer func() {
-			if f != nil {
-				if err := os.Remove(f.Name()); err != nil {
-					log.Printf("removing temp file after failure storing failed delivery: %v", err)
-				}
-			}
-		}()
+		// note: not removing the partial file if writing/closing below fails.
 		_, err = f.Write([]byte(msg))
 		xcheckf(err, "writing message to temp file after failed delivery")
 		name := f.Name()
@@ -239,50 +252,82 @@ binary should be setgid that group:
 	addr := net.JoinHostPort(submitconf.Host, fmt.Sprintf("%d", submitconf.Port))
 	d := net.Dialer{Timeout: 30 * time.Second}
 	conn, err := d.Dial("tcp", addr)
-	xcheckf(err, "dial submit server")
+	xsavecheckf(err, "dial submit server")
 
-	var auth []sasl.Client
-	switch submitconf.AuthMethod {
-	case "SCRAM-SHA-256":
-		auth = []sasl.Client{sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password)}
-	case "SCRAM-SHA-1":
-		auth = []sasl.Client{sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password)}
-	case "CRAM-MD5":
-		auth = []sasl.Client{sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password)}
-	case "PLAIN":
-		auth = []sasl.Client{sasl.NewClientPlain(submitconf.Username, submitconf.Password)}
-	default:
-		auth = []sasl.Client{
-			sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password),
-			sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password),
-			sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password),
-			sasl.NewClientPlain(submitconf.Username, submitconf.Password),
+	auth := func(mechanisms []string, cs *tls.ConnectionState) (sasl.Client, error) {
+		// Check explicitly configured mechanisms.
+		switch submitconf.AuthMethod {
+		case "SCRAM-SHA-256-PLUS":
+			if cs == nil {
+				return nil, fmt.Errorf("scram plus authentication mechanism requires tls")
+			}
+			return sasl.NewClientSCRAMSHA256PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		case "SCRAM-SHA-256":
+			return sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password, false), nil
+		case "SCRAM-SHA-1-PLUS":
+			if cs == nil {
+				return nil, fmt.Errorf("scram plus authentication mechanism requires tls")
+			}
+			return sasl.NewClientSCRAMSHA1PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		case "SCRAM-SHA-1":
+			return sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password, false), nil
+		case "CRAM-MD5":
+			return sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password), nil
+		case "PLAIN":
+			return sasl.NewClientPlain(submitconf.Username, submitconf.Password), nil
 		}
+
+		// Try the defaults, from more to less secure.
+		if cs != nil && slices.Contains(mechanisms, "SCRAM-SHA-256-PLUS") {
+			return sasl.NewClientSCRAMSHA256PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		} else if slices.Contains(mechanisms, "SCRAM-SHA-256") {
+			return sasl.NewClientSCRAMSHA256(submitconf.Username, submitconf.Password, true), nil
+		} else if cs != nil && slices.Contains(mechanisms, "SCRAM-SHA-1-PLUS") {
+			return sasl.NewClientSCRAMSHA1PLUS(submitconf.Username, submitconf.Password, *cs), nil
+		} else if slices.Contains(mechanisms, "SCRAM-SHA-1") {
+			return sasl.NewClientSCRAMSHA1(submitconf.Username, submitconf.Password, true), nil
+		} else if slices.Contains(mechanisms, "CRAM-MD5") {
+			return sasl.NewClientCRAMMD5(submitconf.Username, submitconf.Password), nil
+		} else if slices.Contains(mechanisms, "PLAIN") {
+			return sasl.NewClientPlain(submitconf.Username, submitconf.Password), nil
+		}
+		// No mutually supported mechanism.
+		return nil, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	tlsMode := smtpclient.TLSSkip
+	tlsPKIX := false
 	if submitconf.TLS {
-		tlsMode = smtpclient.TLSStrictImmediate
+		tlsMode = smtpclient.TLSImmediate
+		tlsPKIX = true
 	} else if submitconf.STARTTLS {
-		tlsMode = smtpclient.TLSStrictStartTLS
+		tlsMode = smtpclient.TLSRequiredStartTLS
+		tlsPKIX = true
+	} else if submitconf.RequireTLS == RequireTLSYes {
+		xsavecheckf(errors.New("cannot submit with requiretls enabled without tls to submission server"), "checking tls configuration")
 	}
 
 	ourHostname, err := dns.ParseDomain(submitconf.LocalHostname)
-	xcheckf(err, "parsing our local hostname")
+	xsavecheckf(err, "parsing our local hostname")
 
 	var remoteHostname dns.Domain
-	if net.ParseIP(submitconf.Host) != nil {
+	if net.ParseIP(submitconf.Host) == nil {
 		remoteHostname, err = dns.ParseDomain(submitconf.Host)
-		xcheckf(err, "parsing remote hostname")
+		xsavecheckf(err, "parsing remote hostname")
 	}
 
-	client, err := smtpclient.New(ctx, mlog.New("sendmail"), conn, tlsMode, ourHostname, remoteHostname, auth)
-	xcheckf(err, "open smtp session")
+	// todo: implement SRV and DANE, allowing for a simpler config file (just the email address & password)
+	opts := smtpclient.Opts{
+		Auth:    auth,
+		RootCAs: mox.Conf.Static.TLS.CertPool,
+	}
+	client, err := smtpclient.New(ctx, c.log.Logger, conn, tlsMode, tlsPKIX, ourHostname, remoteHostname, opts)
+	xsavecheckf(err, "open smtp session")
 
-	err = client.Deliver(ctx, submitconf.From, recipient, int64(len(msg)), strings.NewReader(msg), true, false)
-	xcheckf(err, "submit message")
+	err = client.Deliver(ctx, submitconf.From, recipient, int64(len(msg)), strings.NewReader(msg), true, false, submitconf.RequireTLS == RequireTLSYes)
+	xsavecheckf(err, "submit message")
 
 	if err := client.Close(); err != nil {
 		log.Printf("closing smtp session after message was sent: %v", err)

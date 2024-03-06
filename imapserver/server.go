@@ -13,26 +13,22 @@ LIST-EXTENDED, SPECIAL-USE, MOVE, UTF8=ONLY.
 
 We take a liberty with UTF8=ONLY. We are supposed to wait for ENABLE of
 UTF8=ACCEPT or IMAP4rev2 before we respond with quoted strings that contain
-non-ASCII UTF-8. But we will unconditionally accept UTF-8 at the moment. See
+non-ASCII UTF-8. Until that's enabled, we do use UTF-7 for mailbox names. See
 ../rfc/6855:251
-
-We always respond with utf8 mailbox names. We do parse utf7 (only in IMAP4rev1,
-not in IMAP4rev2). ../rfc/3501:964
 
 - We never execute multiple commands at the same time for a connection. We expect a client to open multiple connections instead. ../rfc/9051:1110
 - Do not write output on a connection with an account lock held. Writing can block, a slow client could block account operations.
 - When handling commands that modify the selected mailbox, always check that the mailbox is not opened readonly. And always revalidate the selected mailbox, another session may have deleted the mailbox.
 - After making changes to an account/mailbox/message, you must broadcast changes. You must do this with the account lock held. Otherwise, other later changes (e.g. message deliveries) may be made and broadcast before changes that were made earlier. Make sure to commit changes in the database first, because the commit may fail.
 - Mailbox hierarchies are slash separated, no leading slash. We keep the case, except INBOX is renamed to Inbox, also for submailboxes in INBOX. We don't allow existence of a child where its parent does not exist. We have no \NoInferiors or \NoSelect. Newly created mailboxes are automatically subscribed.
+- For CONDSTORE and QRESYNC support, we set "modseq" for each change/expunge. Once expunged, a modseq doesn't change anymore. We don't yet remove old expunged records. The records aren't too big. Next step may be to let an admin reclaim space manually.
 */
 
 /*
 - todo: do not return binary data for a fetch body. at least not for imap4rev1. we should be encoding it as base64?
 - todo: on expunge we currently remove the message even if other sessions still have a reference to the uid. if they try to query the uid, they'll get an error. we could be nicer and only actually remove the message when the last reference has gone. we could add a new flag to store.Message marking the message as expunged, not give new session access to such messages, and make store remove them at startup, and clean them when the last session referencing the session goes. however, it will get much more complicated. renaming messages would need special handling. and should we do the same for removed mailboxes?
-- todo: CONDSTORE, QRESYNC. Add fields modseq on mailbox and each message. Keep (log of) deleted messages and their modseqs.
 - todo: try to recover from syntax errors when the last command line ends with a }, i.e. a literal. we currently abort the entire connection. we may want to read some amount of literal data and continue with a next command.
-- future: more extensions: STATUS=SIZE, OBJECTID, MULTISEARCH, REPLACE, NOTIFY, CATENATE, MULTIAPPEND, SORT, THREAD, CREATE-SPECIAL-USE.
-- future: implement user-defined keyword flags? ../rfc/9051:566
+- todo future: more extensions: OBJECTID, MULTISEARCH, REPLACE, NOTIFY, CATENATE, MULTIAPPEND, SORT, THREAD, CREATE-SPECIAL-USE.
 */
 
 import (
@@ -48,19 +44,24 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/exp/maps"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"golang.org/x/text/unicode/norm"
 
 	"github.com/mjl-/bstore"
 
@@ -75,10 +76,6 @@ import (
 	"github.com/mjl-/mox/scram"
 	"github.com/mjl-/mox/store"
 )
-
-// Most logging should be done through conn.log* functions.
-// Only use imaplog in contexts without connection.
-var xlog = mlog.New("imapserver")
 
 var (
 	metricIMAPConnection = promauto.NewCounterVec(
@@ -150,11 +147,19 @@ var authFailDelay = time.Second  // After authentication failure.
 // SPECIAL-USE: ../rfc/6154
 // LIST-STATUS: ../rfc/5819
 // ID: ../rfc/2971
-// AUTH=SCRAM-SHA-256: ../rfc/7677 ../rfc/5802
-// AUTH=SCRAM-SHA-1: ../rfc/5802
+// AUTH=SCRAM-SHA-256-PLUS and AUTH=SCRAM-SHA-256: ../rfc/7677 ../rfc/5802
+// AUTH=SCRAM-SHA-1-PLUS and AUTH=SCRAM-SHA-1: ../rfc/5802
 // AUTH=CRAM-MD5: ../rfc/2195
 // APPENDLIMIT, we support the max possible size, 1<<63 - 1: ../rfc/7889:129
-const serverCapabilities = "IMAP4rev2 IMAP4rev1 ENABLE LITERAL+ IDLE SASL-IR BINARY UNSELECT UIDPLUS ESEARCH SEARCHRES MOVE UTF8=ONLY LIST-EXTENDED SPECIAL-USE LIST-STATUS AUTH=SCRAM-SHA-256 AUTH=SCRAM-SHA-1 AUTH=CRAM-MD5 ID APPENDLIMIT=9223372036854775807"
+// CONDSTORE: ../rfc/7162:411
+// QRESYNC: ../rfc/7162:1323
+// STATUS=SIZE: ../rfc/8438 ../rfc/9051:8024
+//
+// We always announce support for SCRAM PLUS-variants, also on connections without
+// TLS. The client should not be selecting PLUS variants on non-TLS connections,
+// instead opting to do the bare SCRAM variant without indicating the server claims
+// to support the PLUS variant (skipping the server downgrade detection check).
+const serverCapabilities = "IMAP4rev2 IMAP4rev1 ENABLE LITERAL+ IDLE SASL-IR BINARY UNSELECT UIDPLUS ESEARCH SEARCHRES MOVE UTF8=ACCEPT LIST-EXTENDED SPECIAL-USE LIST-STATUS AUTH=SCRAM-SHA-256-PLUS AUTH=SCRAM-SHA-256 AUTH=SCRAM-SHA-1-PLUS AUTH=SCRAM-SHA-1 AUTH=CRAM-MD5 ID APPENDLIMIT=9223372036854775807 CONDSTORE QRESYNC STATUS=SIZE"
 
 type conn struct {
 	cid               int64
@@ -176,7 +181,7 @@ type conn struct {
 	cmdMetric         string // Currently executing, for metrics.
 	cmdStart          time.Time
 	ncmds             int // Number of commands processed. Used to abort connection when first incoming command is unknown/invalid.
-	log               *mlog.Log
+	log               mlog.Log
 	enabled           map[capability]bool // All upper-case.
 
 	// Set by SEARCH with SAVE. Can be used by commands accepting a sequence-set with
@@ -206,6 +211,8 @@ type capability string
 const (
 	capIMAP4rev2  capability = "IMAP4REV2"
 	capUTF8Accept capability = "UTF8=ACCEPT"
+	capCondstore  capability = "CONDSTORE"
+	capQresync    capability = "QRESYNC"
 )
 
 type lineErr struct {
@@ -282,8 +289,8 @@ var commands = map[string]func(c *conn, tag, cmd string, p *parser){
 	"uid move":    (*conn).cmdUIDMove,
 }
 
-var errIO = errors.New("fatal io error")             // For read/write errors and errors that should close the connection.
-var errProtocol = errors.New("fatal protocol error") // For protocol errors for which a stack trace should be printed.
+var errIO = errors.New("io error")             // For read/write errors and errors that should close the connection.
+var errProtocol = errors.New("protocol error") // For protocol errors for which a stack trace should be printed.
 
 var sanityChecks bool
 
@@ -303,7 +310,11 @@ type msgseq uint32
 
 // Listen initializes all imap listeners for the configuration, and stores them for Serve to start them.
 func Listen() {
-	for name, listener := range mox.Conf.Static.Listeners {
+	names := maps.Keys(mox.Conf.Static.Listeners)
+	sort.Strings(names)
+	for _, name := range names {
+		listener := mox.Conf.Static.Listeners[name]
+
 		var tlsConfig *tls.Config
 		if listener.TLS != nil {
 			tlsConfig = listener.TLS.Config
@@ -328,14 +339,18 @@ func Listen() {
 var servers []func()
 
 func listen1(protocol, listenerName, ip string, port int, tlsConfig *tls.Config, xtls, noRequireSTARTTLS bool) {
+	log := mlog.New("imapserver", nil)
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 	if os.Getuid() == 0 {
-		xlog.Print("listening for imap", mlog.Field("listener", listenerName), mlog.Field("addr", addr), mlog.Field("protocol", protocol))
+		log.Print("listening for imap",
+			slog.String("listener", listenerName),
+			slog.String("addr", addr),
+			slog.String("protocol", protocol))
 	}
 	network := mox.Network(ip)
 	ln, err := mox.Listen(network, addr)
 	if err != nil {
-		xlog.Fatalx("imap: listen for imap", err, mlog.Field("protocol", protocol), mlog.Field("listener", listenerName))
+		log.Fatalx("imap: listen for imap", err, slog.String("protocol", protocol), slog.String("listener", listenerName))
 	}
 	if xtls {
 		ln = tls.NewListener(ln, tlsConfig)
@@ -345,7 +360,7 @@ func listen1(protocol, listenerName, ip string, port int, tlsConfig *tls.Config,
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				xlog.Infox("imap: accept", err, mlog.Field("protocol", protocol), mlog.Field("listener", listenerName))
+				log.Infox("imap: accept", err, slog.String("protocol", protocol), slog.String("listener", listenerName))
 				continue
 			}
 
@@ -368,6 +383,13 @@ func Serve() {
 // returns whether this connection accepts utf-8 in strings.
 func (c *conn) utf8strings() bool {
 	return c.enabled[capIMAP4rev2] || c.enabled[capUTF8Accept]
+}
+
+func (c *conn) encodeMailbox(s string) string {
+	if c.utf8strings() {
+		return s
+	}
+	return utf7encode(s)
 }
 
 func (c *conn) xdbwrite(fn func(tx *bstore.Tx)) {
@@ -431,7 +453,7 @@ func (c *conn) Write(buf []byte) (int, error) {
 	return n, nil
 }
 
-func (c *conn) xtrace(level mlog.Level) func() {
+func (c *conn) xtrace(level slog.Level) func() {
 	c.xflush()
 	c.tr.SetTrace(level)
 	c.tw.SetTrace(level)
@@ -443,6 +465,7 @@ func (c *conn) xtrace(level mlog.Level) func() {
 }
 
 // Cache of line buffers for reading commands.
+// QRESYNC recommends 8k max line lengths. ../rfc/7162:2159
 var bufpool = moxio.NewBufpool(8, 16*1024)
 
 // read line from connection, not going through line channel.
@@ -458,7 +481,7 @@ func (c *conn) readline0() (string, error) {
 	err := c.conn.SetReadDeadline(time.Now().Add(d))
 	c.log.Check(err, "setting read deadline")
 
-	line, err := bufpool.Readline(c.br)
+	line, err := bufpool.Readline(c.log, c.br)
 	if err != nil && errors.Is(err, moxio.ErrLineTooLong) {
 		return "", fmt.Errorf("%s (%w)", err, errProtocol)
 	} else if err != nil {
@@ -523,11 +546,11 @@ func (c *conn) writeresultf(format string, args ...any) {
 	c.xflush()
 }
 
-// write buffered taggedcommand response, but first write pending changes.
+// write buffered tagged command response, but first write pending changes.
 func (c *conn) bwriteresultf(format string, args ...any) {
 	switch c.cmd {
 	case "fetch", "store", "search":
-		// ../rfc/9051:5862
+		// ../rfc/9051:5862 ../rfc/7162:2033
 	default:
 		if c.comm != nil {
 			c.applyChanges(c.comm.Get(), false)
@@ -565,7 +588,7 @@ func (c *conn) readCommand(tag *string) (cmd string, p *parser) {
 
 func (c *conn) xreadliteral(size int64, sync bool) string {
 	if sync {
-		c.writelinef("+")
+		c.writelinef("+ ")
 	}
 	buf := make([]byte, size)
 	if size > 0 {
@@ -580,6 +603,19 @@ func (c *conn) xreadliteral(size int64, sync bool) string {
 		}
 	}
 	return string(buf)
+}
+
+func (c *conn) xhighestModSeq(tx *bstore.Tx, mailboxID int64) store.ModSeq {
+	qms := bstore.QueryTx[store.Message](tx)
+	qms.FilterNonzero(store.Message{MailboxID: mailboxID})
+	qms.SortDesc("ModSeq")
+	qms.Limit(1)
+	m, err := qms.Get()
+	if err == bstore.ErrAbsent {
+		return store.ModSeq(0)
+	}
+	xcheckf(err, "looking up highest modseq for mailbox")
+	return m.ModSeq
 }
 
 var cleanClose struct{} // Sentinel value for panic/recover indicating clean close of connection.
@@ -605,15 +641,18 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		cmd:               "(greeting)",
 		cmdStart:          time.Now(),
 	}
-	c.log = xlog.MoreFields(func() []mlog.Pair {
+	var logmutex sync.Mutex
+	c.log = mlog.New("imapserver", nil).WithFunc(func() []slog.Attr {
+		logmutex.Lock()
+		defer logmutex.Unlock()
 		now := time.Now()
-		l := []mlog.Pair{
-			mlog.Field("cid", c.cid),
-			mlog.Field("delta", now.Sub(c.lastlog)),
+		l := []slog.Attr{
+			slog.Int64("cid", c.cid),
+			slog.Duration("delta", now.Sub(c.lastlog)),
 		}
 		c.lastlog = now
 		if c.username != "" {
-			l = append(l, mlog.Field("username", c.username))
+			l = append(l, slog.String("username", c.username))
 		}
 		return l
 	})
@@ -638,7 +677,11 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		}
 	}
 
-	c.log.Info("new connection", mlog.Field("remote", c.conn.RemoteAddr()), mlog.Field("local", c.conn.LocalAddr()), mlog.Field("tls", xtls), mlog.Field("listener", listenerName))
+	c.log.Info("new connection",
+		slog.Any("remote", c.conn.RemoteAddr()),
+		slog.Any("local", c.conn.LocalAddr()),
+		slog.Bool("tls", xtls),
+		slog.String("listener", listenerName))
 
 	defer func() {
 		c.conn.Close()
@@ -657,9 +700,9 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 		} else if err, ok := x.(error); ok && isClosed(err) {
 			c.log.Infox("connection closed", err)
 		} else {
-			c.log.Error("unhandled panic", mlog.Field("err", x))
+			c.log.Error("unhandled panic", slog.Any("err", x))
 			debug.PrintStack()
-			metrics.PanicInc("imapserver")
+			metrics.PanicInc(metrics.Imapserver)
 		}
 	}()
 
@@ -679,13 +722,13 @@ func serve(listenerName string, cid int64, tlsConfig *tls.Config, nc net.Conn, x
 	// If remote IP/network resulted in too many authentication failures, refuse to serve.
 	if !mox.LimiterFailedAuth.CanAdd(c.remoteIP, time.Now(), 1) {
 		metrics.AuthenticationRatelimitedInc("imap")
-		c.log.Debug("refusing connection due to many auth failures", mlog.Field("remoteip", c.remoteIP))
+		c.log.Debug("refusing connection due to many auth failures", slog.Any("remoteip", c.remoteIP))
 		c.writelinef("* BYE too many auth failures")
 		return
 	}
 
 	if !limiterConnections.Add(c.remoteIP, time.Now(), 1) {
-		c.log.Debug("refusing connection due to many open connections", mlog.Field("remoteip", c.remoteIP))
+		c.log.Debug("refusing connection due to many open connections", slog.Any("remoteip", c.remoteIP))
 		c.writelinef("* BYE too many open connections from your ip or network")
 		return
 	}
@@ -720,9 +763,9 @@ func (c *conn) command() {
 			metricIMAPCommands.WithLabelValues(c.cmdMetric, result).Observe(float64(time.Since(c.cmdStart)) / float64(time.Second))
 		}()
 
-		logFields := []mlog.Pair{
-			mlog.Field("cmd", c.cmd),
-			mlog.Field("duration", time.Since(c.cmdStart)),
+		logFields := []slog.Attr{
+			slog.String("cmd", c.cmd),
+			slog.Duration("duration", time.Since(c.cmdStart)),
 		}
 		c.cmd = ""
 
@@ -737,7 +780,7 @@ func (c *conn) command() {
 		}
 		err, ok := x.(error)
 		if !ok {
-			c.log.Error("imap command panic", append([]mlog.Pair{mlog.Field("panic", x)}, logFields...)...)
+			c.log.Error("imap command panic", append([]slog.Attr{slog.Any("panic", x)}, logFields...)...)
 			result = "panic"
 			panic(x)
 		}
@@ -762,7 +805,7 @@ func (c *conn) command() {
 				panic(errIO)
 			}
 			c.log.Debugx("imap command syntax error", sxerr.err, logFields...)
-			c.log.Info("imap syntax error", mlog.Field("lastline", c.lastLine))
+			c.log.Info("imap syntax error", slog.String("lastline", c.lastLine))
 			fatal := strings.HasSuffix(c.lastLine, "+}")
 			if fatal {
 				err := c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -841,7 +884,7 @@ func (c *conn) broadcast(changes []store.Change) {
 	if len(changes) == 0 {
 		return
 	}
-	c.log.Debug("broadcast changes", mlog.Field("changes", changes))
+	c.log.Debug("broadcast changes", slog.Any("changes", changes))
 	c.comm.Broadcast(changes)
 }
 
@@ -872,7 +915,7 @@ func xmailboxPatternMatcher(ref string, patterns []string) matchStringer {
 
 		s := pat
 		if ref != "" {
-			s = filepath.Join(ref, pat)
+			s = path.Join(ref, pat)
 		}
 
 		// Fix casing for all Inbox paths.
@@ -1113,33 +1156,11 @@ func (c *conn) ok(tag, cmd string) {
 // Name is invalid if it contains leading/trailing/double slashes, or when it isn't
 // unicode-normalized, or when empty or has special characters.
 func xcheckmailboxname(name string, allowInbox bool) string {
-	first := strings.SplitN(name, "/", 2)[0]
-	if strings.EqualFold(first, "inbox") {
-		if len(name) == len("inbox") && !allowInbox {
-			xuserErrorf("special mailbox name Inbox not allowed")
-		}
-		name = "Inbox" + name[len("Inbox"):]
-	}
-
-	if norm.NFC.String(name) != name {
-		xusercodeErrorf("CANNOT", "non-unicode-normalized mailbox names not allowed")
-	}
-
-	if name == "" {
-		xusercodeErrorf("CANNOT", "empty mailbox name")
-	}
-	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.Contains(name, "//") {
-		xusercodeErrorf("CANNOT", "bad slashes in mailbox name")
-	}
-	for _, c := range name {
-		switch c {
-		case '%', '*', '#', '&':
-			xusercodeErrorf("CANNOT", "character %c not allowed in mailbox name", c)
-		}
-		// ../rfc/6855:192
-		if c <= 0x1f || c >= 0x7f && c <= 0x9f || c == 0x2028 || c == 0x2029 {
-			xusercodeErrorf("CANNOT", "control characters not allowed in mailbox name")
-		}
+	name, isinbox, err := store.CheckMailboxName(name, allowInbox)
+	if isinbox {
+		xuserErrorf("special mailboxname Inbox not allowed")
+	} else if err != nil {
+		xusercodeErrorf("CANNOT", "%s", err)
 	}
 	return name
 }
@@ -1182,7 +1203,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 	err := c.conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 	c.log.Check(err, "setting write deadline")
 
-	c.log.Debug("applying changes", mlog.Field("changes", changes))
+	c.log.Debug("applying changes", slog.Any("changes", changes))
 
 	// Only keep changes for the selected mailbox, and changes that are always relevant.
 	var n []store.Change
@@ -1198,6 +1219,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 		case store.ChangeRemoveMailbox, store.ChangeAddMailbox, store.ChangeRenameMailbox, store.ChangeAddSubscription:
 			n = append(n, change)
 			continue
+		case store.ChangeMailboxCounts, store.ChangeMailboxSpecialUse, store.ChangeMailboxKeywords, store.ChangeThread:
 		default:
 			panic(fmt.Errorf("missing case for %#v", change))
 		}
@@ -1206,6 +1228,9 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 		}
 	}
 	changes = n
+
+	qresync := c.enabled[capQresync]
+	condstore := c.enabled[capCondstore]
 
 	i := 0
 	for i < len(changes) {
@@ -1233,7 +1258,11 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 			c.bwritelinef("* %d EXISTS", len(c.uids))
 			for _, add := range adds {
 				seq := c.xsequence(add.UID)
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, add.UID, flaglist(add.Flags, add.Keywords).pack(c))
+				var modseqStr string
+				if condstore {
+					modseqStr = fmt.Sprintf(" MODSEQ (%d)", add.ModSeq.Client())
+				}
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s%s)", seq, add.UID, flaglist(add.Flags, add.Keywords).pack(c), modseqStr)
 			}
 			continue
 		}
@@ -1243,6 +1272,7 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 
 		switch ch := change.(type) {
 		case store.ChangeRemoveUIDs:
+			var vanishedUIDs numSet
 			for _, uid := range ch.UIDs {
 				var seq msgseq
 				if initial {
@@ -1255,7 +1285,17 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 				}
 				c.sequenceRemove(seq, uid)
 				if !initial {
-					c.bwritelinef("* %d EXPUNGE", seq)
+					if qresync {
+						vanishedUIDs.append(uint32(uid))
+					} else {
+						c.bwritelinef("* %d EXPUNGE", seq)
+					}
+				}
+			}
+			if qresync {
+				// VANISHED without EARLIER. ../rfc/7162:2004
+				for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+					c.bwritelinef("* VANISHED %s", s)
 				}
 			}
 		case store.ChangeFlags:
@@ -1265,21 +1305,30 @@ func (c *conn) applyChanges(changes []store.Change, initial bool) {
 				continue
 			}
 			if !initial {
-				c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", seq, ch.UID, flaglist(ch.Flags, ch.Keywords).pack(c))
+				var modseqStr string
+				if condstore {
+					modseqStr = fmt.Sprintf(" MODSEQ (%d)", ch.ModSeq.Client())
+				}
+				c.bwritelinef("* %d FETCH (UID %d FLAGS %s%s)", seq, ch.UID, flaglist(ch.Flags, ch.Keywords).pack(c), modseqStr)
 			}
 		case store.ChangeRemoveMailbox:
 			// Only announce \NonExistent to modern clients, otherwise they may ignore the
 			// unrecognized \NonExistent and interpret this as a newly created mailbox, while
 			// the goal was to remove it...
 			if c.enabled[capIMAP4rev2] {
-				c.bwritelinef(`* LIST (\NonExistent) "/" %s`, astring(ch.Name).pack(c))
+				c.bwritelinef(`* LIST (\NonExistent) "/" %s`, astring(c.encodeMailbox(ch.Name)).pack(c))
 			}
 		case store.ChangeAddMailbox:
-			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(ch.Flags, " "), astring(ch.Name).pack(c))
+			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(ch.Flags, " "), astring(c.encodeMailbox(ch.Mailbox.Name)).pack(c))
 		case store.ChangeRenameMailbox:
-			c.bwritelinef(`* LIST (%s) "/" %s ("OLDNAME" (%s))`, strings.Join(ch.Flags, " "), astring(ch.NewName).pack(c), string0(ch.OldName).pack(c))
+			// OLDNAME only with IMAP4rev2 or NOTIFY ../rfc/9051:2726 ../rfc/5465:628
+			var oldname string
+			if c.enabled[capIMAP4rev2] {
+				oldname = fmt.Sprintf(` ("OLDNAME" (%s))`, string0(c.encodeMailbox(ch.OldName)).pack(c))
+			}
+			c.bwritelinef(`* LIST (%s) "/" %s%s`, strings.Join(ch.Flags, " "), astring(c.encodeMailbox(ch.NewName)).pack(c), oldname)
 		case store.ChangeAddSubscription:
-			c.bwritelinef(`* LIST (\Subscribed) "/" %s`, astring(ch.Name).pack(c))
+			c.bwritelinef(`* LIST (%s) "/" %s`, strings.Join(append([]string{`\Subscribed`}, ch.Flags...), " "), astring(c.encodeMailbox(ch.Name)).pack(c))
 		default:
 			panic(fmt.Sprintf("internal error, missing case for %#v", change))
 		}
@@ -1379,7 +1428,7 @@ func (c *conn) cmdID(tag, cmd string, p *parser) {
 	p.xempty()
 
 	// We just log the client id.
-	c.log.Info("client id", mlog.Field("params", params))
+	c.log.Info("client id", slog.Any("params", params))
 
 	// Response syntax: ../rfc/2971:243
 	// We send our name and version. ../rfc/2971:193
@@ -1410,7 +1459,8 @@ func (c *conn) cmdStarttls(tag, cmd string, p *parser) {
 		xcheckf(err, "reading buffered data for tls handshake")
 		conn = &prefixConn{buf, conn}
 	}
-	c.ok(tag, cmd)
+	// We add the cid to facilitate debugging in case of TLS connection failure.
+	c.ok(tag, cmd+" ("+mox.ReceivedID(c.cid)+")")
 
 	cidctx := context.WithValue(mox.Context, mlog.CidKey, c.cid)
 	ctx, cancel := context.WithTimeout(cidctx, time.Minute)
@@ -1421,8 +1471,8 @@ func (c *conn) cmdStarttls(tag, cmd string, p *parser) {
 		panic(fmt.Errorf("starttls handshake: %s (%w)", err, errIO))
 	}
 	cancel()
-	tlsversion, ciphersuite := mox.TLSInfo(tlsConn)
-	c.log.Debug("tls server handshake done", mlog.Field("tls", tlsversion), mlog.Field("ciphersuite", ciphersuite))
+	tlsversion, ciphersuite := moxio.TLSInfo(tlsConn)
+	c.log.Debug("tls server handshake done", slog.String("tls", tlsversion), slog.String("ciphersuite", ciphersuite))
 
 	c.conn = tlsConn
 	c.tr = moxio.NewTraceReader(c.log, "C: ", c.conn)
@@ -1445,8 +1495,17 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 	if c.authFailed > 3 && authFailDelay > 0 {
 		mox.Sleep(mox.Context, time.Duration(c.authFailed-3)*authFailDelay)
 	}
+
+	// If authentication fails due to missing derived secrets, we don't hold it against
+	// the connection. There is no way to indicate server support for an authentication
+	// mechanism, but that a mechanism won't work for an account.
+	var missingDerivedSecrets bool
+
 	c.authFailed++ // Compensated on success.
 	defer func() {
+		if missingDerivedSecrets {
+			c.authFailed--
+		}
 		// On the 3rd failed authentication, start responding slowly. Successful auth will
 		// cause fast responses again.
 		if c.authFailed >= 3 {
@@ -1458,10 +1517,9 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 	authResult := "error"
 	defer func() {
 		metrics.AuthenticationInc("imap", authVariant, authResult)
-		switch authResult {
-		case "ok":
+		if authResult == "ok" {
 			mox.LimiterFailedAuth.Reset(c.remoteIP, time.Now())
-		default:
+		} else if !missingDerivedSecrets {
 			mox.LimiterFailedAuth.Add(c.remoteIP, time.Now(), 1)
 		}
 	}()
@@ -1534,11 +1592,11 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			xusercodeErrorf("AUTHORIZATIONFAILED", "cannot assume role")
 		}
 
-		acc, err := store.OpenEmailAuth(authc, password)
+		acc, err := store.OpenEmailAuth(c.log, authc, password)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
 				authResult = "badcreds"
-				c.log.Info("authentication failed", mlog.Field("username", authc))
+				c.log.Info("authentication failed", slog.String("username", authc))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xusercodeErrorf("", "error")
@@ -1562,11 +1620,11 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			xsyntaxErrorf("malformed cram-md5 response")
 		}
 		addr := t[0]
-		c.log.Debug("cram-md5 auth", mlog.Field("address", addr))
-		acc, _, err := store.OpenEmail(addr)
+		c.log.Debug("cram-md5 auth", slog.String("address", addr))
+		acc, _, err := store.OpenEmail(c.log, addr)
 		if err != nil {
 			if errors.Is(err, store.ErrUnknownCredentials) {
-				c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
+				c.log.Info("failed authentication attempt", slog.String("username", addr), slog.Any("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xserverErrorf("looking up address: %v", err)
@@ -1582,7 +1640,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
 				if err == bstore.ErrAbsent {
-					c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
+					c.log.Info("failed authentication attempt", slog.String("username", addr), slog.Any("remote", c.remoteIP))
 					xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 				}
 				if err != nil {
@@ -1596,8 +1654,9 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			xcheckf(err, "tx read")
 		})
 		if ipadhash == nil || opadhash == nil {
-			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", mlog.Field("username", addr))
-			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
+			c.log.Info("cram-md5 auth attempt without derived secrets set, save password again to store secrets", slog.String("username", addr))
+			c.log.Info("failed authentication attempt", slog.String("username", addr), slog.Any("remote", c.remoteIP))
+			missingDerivedSecrets = true
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
@@ -1606,7 +1665,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		opadhash.Write(ipadhash.Sum(nil))
 		digest := fmt.Sprintf("%x", opadhash.Sum(nil))
 		if digest != t[1] {
-			c.log.Info("failed authentication attempt", mlog.Field("username", addr), mlog.Field("remote", c.remoteIP))
+			c.log.Info("failed authentication attempt", slog.String("username", addr), slog.Any("remote", c.remoteIP))
 			xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 		}
 
@@ -1614,27 +1673,39 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		acc = nil // Cancel cleanup.
 		c.username = addr
 
-	case "SCRAM-SHA-1", "SCRAM-SHA-256":
+	case "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-1":
 		// todo: improve handling of errors during scram. e.g. invalid parameters. should we abort the imap command, or continue until the end and respond with a scram-level error?
 		// todo: use single implementation between ../imapserver/server.go and ../smtpserver/server.go
 
-		authVariant = strings.ToLower(authType)
-		var h func() hash.Hash
-		if authVariant == "scram-sha-1" {
-			h = sha1.New
-		} else {
-			h = sha256.New
-		}
-
 		// No plaintext credentials, we can log these normally.
 
+		authVariant = strings.ToLower(authType)
+		var h func() hash.Hash
+		switch authVariant {
+		case "scram-sha-1", "scram-sha-1-plus":
+			h = sha1.New
+		case "scram-sha-256", "scram-sha-256-plus":
+			h = sha256.New
+		default:
+			xserverErrorf("missing case for scram variant")
+		}
+
+		var cs *tls.ConnectionState
+		requireChannelBinding := strings.HasSuffix(authVariant, "-plus")
+		if requireChannelBinding && !c.tls {
+			xuserErrorf("cannot use plus variant with tls channel binding without tls")
+		}
+		if c.tls {
+			xcs := c.conn.(*tls.Conn).ConnectionState()
+			cs = &xcs
+		}
 		c0 := xreadInitial()
-		ss, err := scram.NewServer(h, c0)
+		ss, err := scram.NewServer(h, c0, cs, requireChannelBinding)
 		if err != nil {
 			xsyntaxErrorf("starting scram: %s", err)
 		}
-		c.log.Debug("scram auth", mlog.Field("authentication", ss.Authentication))
-		acc, _, err := store.OpenEmail(ss.Authentication)
+		c.log.Debug("scram auth", slog.String("authentication", ss.Authentication))
+		acc, _, err := store.OpenEmail(c.log, ss.Authentication)
 		if err != nil {
 			// todo: we could continue scram with a generated salt, deterministically generated
 			// from the username. that way we don't have to store anything but attackers cannot
@@ -1654,17 +1725,25 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 		acc.WithRLock(func() {
 			err := acc.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
 				password, err := bstore.QueryTx[store.Password](tx).Get()
-				if authVariant == "scram-sha-1" {
-					xscram = password.SCRAMSHA1
-				} else {
-					xscram = password.SCRAMSHA256
-				}
-				if err == bstore.ErrAbsent || err == nil && (len(xscram.Salt) == 0 || xscram.Iterations == 0 || len(xscram.SaltedPassword) == 0) {
-					c.log.Info("scram auth attempt without derived secrets set, save password again to store secrets", mlog.Field("address", ss.Authentication))
-					xuserErrorf("scram not possible")
+				if err == bstore.ErrAbsent {
+					c.log.Info("failed authentication attempt", slog.String("username", ss.Authentication), slog.Any("remote", c.remoteIP))
+					xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 				}
 				xcheckf(err, "fetching credentials")
-				return err
+				switch authVariant {
+				case "scram-sha-1", "scram-sha-1-plus":
+					xscram = password.SCRAMSHA1
+				case "scram-sha-256", "scram-sha-256-plus":
+					xscram = password.SCRAMSHA256
+				default:
+					xserverErrorf("missing case for scram credentials")
+				}
+				if len(xscram.Salt) == 0 || xscram.Iterations == 0 || len(xscram.SaltedPassword) == 0 {
+					missingDerivedSecrets = true
+					c.log.Info("scram auth attempt without derived secrets set, save password again to store secrets", slog.String("address", ss.Authentication))
+					xuserErrorf("scram not possible")
+				}
+				return nil
 			})
 			xcheckf(err, "read tx")
 		})
@@ -1680,7 +1759,7 @@ func (c *conn) cmdAuthenticate(tag, cmd string, p *parser) {
 			c.readline(false) // Should be "*" for cancellation.
 			if errors.Is(err, scram.ErrInvalidProof) {
 				authResult = "badcreds"
-				c.log.Info("failed authentication attempt", mlog.Field("username", ss.Authentication), mlog.Field("remote", c.remoteIP))
+				c.log.Info("failed authentication attempt", slog.String("username", ss.Authentication), slog.Any("remote", c.remoteIP))
 				xusercodeErrorf("AUTHENTICATIONFAILED", "bad credentials")
 			}
 			xuserErrorf("server final: %w", err)
@@ -1744,13 +1823,13 @@ func (c *conn) cmdLogin(tag, cmd string, p *parser) {
 		}
 	}()
 
-	acc, err := store.OpenEmailAuth(userid, password)
+	acc, err := store.OpenEmailAuth(c.log, userid, password)
 	if err != nil {
 		authResult = "badcreds"
 		var code string
 		if errors.Is(err, store.ErrUnknownCredentials) {
 			code = "AUTHENTICATIONFAILED"
-			c.log.Info("failed authentication attempt", mlog.Field("username", userid), mlog.Field("remote", c.remoteIP))
+			c.log.Info("failed authentication attempt", slog.String("username", userid), slog.Any("remote", c.remoteIP))
 		}
 		xusercodeErrorf(code, "login failed")
 	}
@@ -1785,18 +1864,54 @@ func (c *conn) cmdEnable(tag, cmd string, p *parser) {
 	// Clients should only send capabilities that need enabling.
 	// We should only echo that we recognize as needing enabling.
 	var enabled string
+	var qresync bool
 	for _, s := range caps {
 		cap := capability(strings.ToUpper(s))
 		switch cap {
-		case capIMAP4rev2, capUTF8Accept:
+		case capIMAP4rev2,
+			capUTF8Accept,
+			capCondstore: // ../rfc/7162:384
 			c.enabled[cap] = true
 			enabled += " " + s
+		case capQresync:
+			c.enabled[cap] = true
+			enabled += " " + s
+			qresync = true
 		}
+	}
+	// QRESYNC enabled CONDSTORE too ../rfc/7162:1391
+	if qresync && !c.enabled[capCondstore] {
+		c.xensureCondstore(nil)
+		enabled += " CONDSTORE"
 	}
 
 	// Response syntax: ../rfc/9051:6520 ../rfc/5161:211
 	c.bwritelinef("* ENABLED%s", enabled)
 	c.ok(tag, cmd)
+}
+
+// The CONDSTORE extension can be enabled in many different ways. ../rfc/7162:368
+// If a mailbox is selected, an untagged OK with HIGHESTMODSEQ is written to the
+// client. If tx is non-nil, it is used to read the HIGHESTMODSEQ from the
+// database. Otherwise a new read-only transaction is created.
+func (c *conn) xensureCondstore(tx *bstore.Tx) {
+	if !c.enabled[capCondstore] {
+		c.enabled[capCondstore] = true
+		// todo spec: can we send an untagged enabled response?
+		// ../rfc/7162:603
+		if c.mailboxID <= 0 {
+			return
+		}
+		var modseq store.ModSeq
+		if tx != nil {
+			modseq = c.xhighestModSeq(tx, c.mailboxID)
+		} else {
+			c.xdbread(func(tx *bstore.Tx) {
+				modseq = c.xhighestModSeq(tx, c.mailboxID)
+			})
+		}
+		c.bwritelinef("* OK [HIGHESTMODSEQ %d] after condstore-enabling command", modseq.Client())
+	}
 }
 
 // State: Authenticated and selected.
@@ -1814,27 +1929,82 @@ func (c *conn) cmdExamine(tag, cmd string, p *parser) {
 //
 // State: Authenticated and selected.
 func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
-	// Select command: ../rfc/9051:1754 ../rfc/3501:1743
+	// Select command: ../rfc/9051:1754 ../rfc/3501:1743 ../rfc/7162:1146 ../rfc/7162:1432
 	// Examine command: ../rfc/9051:1868 ../rfc/3501:1855
-	// Select examples: ../rfc/9051:1831 ../rfc/3501:1826
+	// Select examples: ../rfc/9051:1831 ../rfc/3501:1826 ../rfc/7162:1159 ../rfc/7162:1479
 
-	// Select request syntax: ../rfc/9051:7005 ../rfc/3501:4996
+	// Select request syntax: ../rfc/9051:7005 ../rfc/3501:4996 ../rfc/4466:652 ../rfc/7162:2559 ../rfc/7162:2598
 	// Examine request syntax: ../rfc/9051:6551 ../rfc/3501:4746
 	p.xspace()
 	name := p.xmailbox()
+
+	var qruidvalidity uint32
+	var qrmodseq int64                                    // QRESYNC required parameters.
+	var qrknownUIDs, qrknownSeqSet, qrknownUIDSet *numSet // QRESYNC optional parameters.
+	if p.space() {
+		seen := map[string]bool{}
+		p.xtake("(")
+		for len(seen) == 0 || !p.take(")") {
+			w := p.xtakelist("CONDSTORE", "QRESYNC")
+			if seen[w] {
+				xsyntaxErrorf("duplicate select parameter %s", w)
+			}
+			seen[w] = true
+
+			switch w {
+			case "CONDSTORE":
+				// ../rfc/7162:363
+				c.xensureCondstore(nil) // ../rfc/7162:373
+			case "QRESYNC":
+				// ../rfc/7162:2598
+				// Note: unlike with CONDSTORE, there are no QRESYNC-related commands/parameters
+				// that enable capabilities.
+				if !c.enabled[capQresync] {
+					// ../rfc/7162:1446
+					xsyntaxErrorf("QRESYNC must first be enabled")
+				}
+				p.xspace()
+				p.xtake("(")
+				qruidvalidity = p.xnznumber() // ../rfc/7162:2606
+				p.xspace()
+				qrmodseq = p.xnznumber64()
+				if p.take(" ") {
+					seqMatchData := p.take("(")
+					if !seqMatchData {
+						ss := p.xnumSet0(false, false) // ../rfc/7162:2608
+						qrknownUIDs = &ss
+						seqMatchData = p.take(" (")
+					}
+					if seqMatchData {
+						ss0 := p.xnumSet0(false, false)
+						qrknownSeqSet = &ss0
+						p.xspace()
+						ss1 := p.xnumSet0(false, false)
+						qrknownUIDSet = &ss1
+						p.xtake(")")
+					}
+				}
+				p.xtake(")")
+			default:
+				panic("missing case for select param " + w)
+			}
+		}
+	}
 	p.xempty()
 
 	// Deselect before attempting the new select. This means we will deselect when an
 	// error occurs during select.
 	// ../rfc/9051:1809
 	if c.state == stateSelected {
-		// ../rfc/9051:1812
+		// ../rfc/9051:1812 ../rfc/7162:2111
 		c.bwritelinef("* OK [CLOSED] x")
 		c.unselect()
 	}
 
 	name = xcheckmailboxname(name, true)
 
+	var highestModSeq store.ModSeq
+	var highDeletedModSeq store.ModSeq
 	var firstUnseen msgseq = 0
 	var mb store.Mailbox
 	c.account.WithRLock(func() {
@@ -1843,6 +2013,7 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: mb.ID})
+			q.FilterEqual("Expunged", false)
 			q.SortAsc("UID")
 			c.uids = []store.UID{}
 			var seq msgseq = 1
@@ -1858,6 +2029,17 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 				checkUIDs(c.uids)
 			}
 			xcheckf(err, "fetching uids")
+
+			// Condstore extension, find the highest modseq.
+			if c.enabled[capCondstore] {
+				highestModSeq = c.xhighestModSeq(tx, mb.ID)
+			}
+			// For QRESYNC, we need to know the highest modset of deleted expunged records to
+			// maintain synchronization.
+			if c.enabled[capQresync] {
+				highDeletedModSeq, err = c.account.HighestDeletedModSeq(tx)
+				xcheckf(err, "getting highest deleted modseq")
+			}
 		})
 	})
 	c.applyChanges(c.comm.Get(), true)
@@ -1878,7 +2060,152 @@ func (c *conn) cmdSelectExamine(isselect bool, tag, cmd string, p *parser) {
 	}
 	c.bwritelinef(`* OK [UIDVALIDITY %d] x`, mb.UIDValidity)
 	c.bwritelinef(`* OK [UIDNEXT %d] x`, mb.UIDNext)
-	c.bwritelinef(`* LIST () "/" %s`, astring(mb.Name).pack(c))
+	c.bwritelinef(`* LIST () "/" %s`, astring(c.encodeMailbox(mb.Name)).pack(c))
+	if c.enabled[capCondstore] {
+		// ../rfc/7162:417
+		// ../rfc/7162-eid5055 ../rfc/7162:484 ../rfc/7162:1167
+		c.bwritelinef(`* OK [HIGHESTMODSEQ %d] x`, highestModSeq.Client())
+	}
+
+	// If QRESYNC uidvalidity matches, we send any changes. ../rfc/7162:1509
+	if qruidvalidity == mb.UIDValidity {
+		// We send the vanished UIDs at the end, so we can easily combine the modseq
+		// changes and vanished UIDs that result from that, with the vanished UIDs from the
+		// case where we don't store enough history.
+		vanishedUIDs := map[store.UID]struct{}{}
+
+		var preVanished store.UID
+		var oldClientUID store.UID
+		// If samples of known msgseq and uid pairs are given (they must be in order), we
+		// use them to determine the earliest UID for which we send VANISHED responses.
+		// ../rfc/7162:1579
+		if qrknownSeqSet != nil {
+			if !qrknownSeqSet.isBasicIncreasing() {
+				xuserErrorf("QRESYNC known message sequence set must be numeric and strictly increasing")
+			}
+			if !qrknownUIDSet.isBasicIncreasing() {
+				xuserErrorf("QRESYNC known uid set must be numeric and strictly increasing")
+			}
+			seqiter := qrknownSeqSet.newIter()
+			uiditer := qrknownUIDSet.newIter()
+			for {
+				msgseq, ok0 := seqiter.Next()
+				uid, ok1 := uiditer.Next()
+				if !ok0 && !ok1 {
+					break
+				} else if !ok0 || !ok1 {
+					xsyntaxErrorf("invalid combination of known sequence set and uid set, must be of equal length")
+				}
+				i := int(msgseq - 1)
+				if i < 0 || i >= len(c.uids) || c.uids[i] != store.UID(uid) {
+					if uidSearch(c.uids, store.UID(uid)) <= 0 {
+						// We will check this old client UID for consistency below.
+						oldClientUID = store.UID(uid)
+					}
+					break
+				}
+				preVanished = store.UID(uid + 1)
+			}
+		}
+
+		// We gather vanished UIDs and report them at the end. This seems OK because we
+		// already sent HIGHESTMODSEQ, and a client should know not to commit that value
+		// until after it has seen the tagged OK of this command. The RFC has a remark
+		// about ordering of some untagged responses, it's not immediately clear what it
+		// means, but given the examples appears to allude to servers that decide to not
+		// send expunge/vanished before the tagged OK.
+		// ../rfc/7162:1340
+
+		// We are reading without account lock. Similar to when we process FETCH/SEARCH
+		// requests. We don't have to reverify existence of the mailbox, so we don't
+		// rlock, even briefly.
+		c.xdbread(func(tx *bstore.Tx) {
+			if oldClientUID > 0 {
+				// The client sent a UID that is now removed. This is typically fine. But we check
+				// that it is consistent with the modseq the client sent. If the UID already didn't
+				// exist at that modseq, the client may be missing some information.
+				q := bstore.QueryTx[store.Message](tx)
+				q.FilterNonzero(store.Message{MailboxID: mb.ID, UID: oldClientUID})
+				m, err := q.Get()
+				if err == nil {
+					// If client claims to be up to date up to and including qrmodseq, and the message
+					// was deleted at or before that time, we send changes from just before that
+					// modseq, and we send vanished for all UIDs.
+					if m.Expunged && qrmodseq >= m.ModSeq.Client() {
+						qrmodseq = m.ModSeq.Client() - 1
+						preVanished = 0
+						qrknownUIDs = nil
+						c.bwritelinef("* OK [ALERT] Synchronization inconsistency in client detected. Client tried to sync with a UID that was removed at or after the MODSEQ it sent in the request. Sending all historic message removals for selected mailbox. Full synchronization recommended.")
+					}
+				} else if err != bstore.ErrAbsent {
+					xcheckf(err, "checking old client uid")
+				}
+			}
+
+			q := bstore.QueryTx[store.Message](tx)
+			q.FilterNonzero(store.Message{MailboxID: mb.ID})
+			// Note: we don't filter by Expunged.
+			q.FilterGreater("ModSeq", store.ModSeqFromClient(qrmodseq))
+			q.FilterLessEqual("ModSeq", highestModSeq)
+			q.SortAsc("ModSeq")
+			err := q.ForEach(func(m store.Message) error {
+				if m.Expunged && m.UID < preVanished {
+					return nil
+				}
+				// If known UIDs was specified, we only report about those UIDs. ../rfc/7162:1523
+				if qrknownUIDs != nil && !qrknownUIDs.contains(uint32(m.UID)) {
+					return nil
+				}
+				if m.Expunged {
+					vanishedUIDs[m.UID] = struct{}{}
+					return nil
+				}
+				msgseq := c.sequence(m.UID)
+				if msgseq > 0 {
+					c.bwritelinef("* %d FETCH (UID %d FLAGS %s MODSEQ (%d))", msgseq, m.UID, flaglist(m.Flags, m.Keywords).pack(c), m.ModSeq.Client())
+				}
+				return nil
+			})
+			xcheckf(err, "listing changed messages")
+		})
+
+		// Add UIDs from client's known UID set to vanished list if we don't have enough history.
+		if qrmodseq < highDeletedModSeq.Client() {
+			// If no known uid set was in the request, we substitute 1:max or the empty set.
+			// ../rfc/7162:1524
+			if qrknownUIDs == nil {
+				if len(c.uids) > 0 {
+					qrknownUIDs = &numSet{ranges: []numRange{{first: setNumber{number: 1}, last: &setNumber{number: uint32(c.uids[len(c.uids)-1])}}}}
+				} else {
+					qrknownUIDs = &numSet{}
+				}
+			}
+
+			iter := qrknownUIDs.newIter()
+			for {
+				v, ok := iter.Next()
+				if !ok {
+					break
+				}
+				if c.sequence(store.UID(v)) <= 0 {
+					vanishedUIDs[store.UID(v)] = struct{}{}
+				}
+			}
+		}
+
+		// Now that we have all vanished UIDs, send them over compactly.
+		if len(vanishedUIDs) > 0 {
+			l := maps.Keys(vanishedUIDs)
+			sort.Slice(l, func(i, j int) bool {
+				return l[i] < l[j]
+			})
+			// ../rfc/7162:1985
+			for _, s := range compactUIDSet(l).Strings(4*1024 - 32) {
+				c.bwritelinef("* VANISHED (EARLIER) %s", s)
+			}
+		}
+	}
+
 	if isselect {
 		c.bwriteresultf("%s OK [READ-WRITE] x", tag)
 		c.readonly = false
@@ -1914,38 +2241,26 @@ func (c *conn) cmdCreate(tag, cmd string, p *parser) {
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
-			elems := strings.Split(name, "/")
-			var p string
-			for i, elem := range elems {
-				if i > 0 {
-					p += "/"
-				}
-				p += elem
-				exists, err := c.account.MailboxExists(tx, p)
-				xcheckf(err, "checking if mailbox exists")
-				if exists {
-					if i == len(elems)-1 {
-						// ../rfc/9051:1914
-						xuserErrorf("mailbox already exists")
-					}
-					continue
-				}
-				_, nchanges, err := c.account.MailboxEnsure(tx, p, true)
-				xcheckf(err, "ensuring mailbox exists")
-				changes = append(changes, nchanges...)
-				created = append(created, p)
+			var exists bool
+			var err error
+			changes, created, exists, err = c.account.MailboxCreate(tx, name)
+			if exists {
+				// ../rfc/9051:1914
+				xuserErrorf("mailbox already exists")
 			}
+			xcheckf(err, "creating mailbox")
 		})
 
 		c.broadcast(changes)
 	})
 
 	for _, n := range created {
-		var more string
-		if n == name && name != origName && !(name == "Inbox" || strings.HasPrefix(name, "Inbox/")) {
-			more = fmt.Sprintf(` ("OLDNAME" (%s))`, string0(origName).pack(c))
+		var oldname string
+		// OLDNAME only with IMAP4rev2 or NOTIFY ../rfc/9051:2726 ../rfc/5465:628
+		if c.enabled[capIMAP4rev2] && n == name && name != origName && !(name == "Inbox" || strings.HasPrefix(name, "Inbox/")) {
+			oldname = fmt.Sprintf(` ("OLDNAME" (%s))`, string0(c.encodeMailbox(origName)).pack(c))
 		}
-		c.bwritelinef(`* LIST (\Subscribed) "/" %s%s`, astring(n).pack(c), more)
+		c.bwritelinef(`* LIST (\Subscribed) "/" %s%s`, astring(c.encodeMailbox(n)).pack(c), oldname)
 	}
 	c.ok(tag, cmd)
 }
@@ -1966,67 +2281,31 @@ func (c *conn) cmdDelete(tag, cmd string, p *parser) {
 	name = xcheckmailboxname(name, false)
 
 	// Messages to remove after having broadcasted the removal of messages.
-	var remove []store.Message
+	var removeMessageIDs []int64
 
 	c.account.WithWLock(func() {
 		var mb store.Mailbox
+		var changes []store.Change
 
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mb = c.xmailbox(tx, name, "NONEXISTENT")
 
-			// Look for existence of child mailboxes. There is a lot of text in the RFCs about
-			// NoInferior and NoSelect. We just require only leaf mailboxes are deleted.
-			qmb := bstore.QueryTx[store.Mailbox](tx)
-			mbprefix := name + "/"
-			qmb.FilterFn(func(mb store.Mailbox) bool {
-				return strings.HasPrefix(mb.Name, mbprefix)
-			})
-			childExists, err := qmb.Exists()
-			xcheckf(err, "checking child existence")
-			if childExists {
+			var hasChildren bool
+			var err error
+			changes, removeMessageIDs, hasChildren, err = c.account.MailboxDelete(context.TODO(), c.log, tx, mb)
+			if hasChildren {
 				xusercodeErrorf("HASCHILDREN", "mailbox has a child, only leaf mailboxes can be deleted")
 			}
-
-			qm := bstore.QueryTx[store.Message](tx)
-			qm.FilterNonzero(store.Message{MailboxID: mb.ID})
-			remove, err = qm.List()
-			xcheckf(err, "listing messages to remove")
-
-			if len(remove) > 0 {
-				removeIDs := make([]any, len(remove))
-				for i, m := range remove {
-					removeIDs[i] = m.ID
-				}
-				qmr := bstore.QueryTx[store.Recipient](tx)
-				qmr.FilterEqual("MessageID", removeIDs...)
-				_, err = qmr.Delete()
-				xcheckf(err, "removing message recipients for messages")
-
-				qm = bstore.QueryTx[store.Message](tx)
-				qm.FilterNonzero(store.Message{MailboxID: mb.ID})
-				_, err = qm.Delete()
-				xcheckf(err, "removing messages")
-
-				// Mark messages as not needing training. Then retrain them, so that are untrained if they were.
-				for i := range remove {
-					remove[i].Junk = false
-					remove[i].Notjunk = false
-				}
-				err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
-				xcheckf(err, "untraining deleted messages")
-			}
-
-			err = tx.Delete(&store.Mailbox{ID: mb.ID})
-			xcheckf(err, "removing mailbox")
+			xcheckf(err, "deleting mailbox")
 		})
 
-		c.broadcast([]store.Change{store.ChangeRemoveMailbox{Name: name}})
+		c.broadcast(changes)
 	})
 
-	for _, m := range remove {
-		p := c.account.MessagePath(m.ID)
+	for _, mID := range removeMessageIDs {
+		p := c.account.MessagePath(mID)
 		err := os.Remove(p)
-		c.log.Check(err, "removing message file for mailbox delete", mlog.Field("path", p))
+		c.log.Check(err, "removing message file for mailbox delete", slog.String("path", p))
 	}
 
 	c.ok(tag, cmd)
@@ -2057,8 +2336,7 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 		var changes []store.Change
 
 		c.xdbwrite(func(tx *bstore.Tx) {
-			uidval, err := c.account.NextUIDValidity(tx)
-			xcheckf(err, "next uid validity")
+			srcMB := c.xmailbox(tx, src, "NONEXISTENT")
 
 			// Inbox is very special. Unlike other mailboxes, its children are not moved. And
 			// unlike a regular move, its messages are moved to a newly created mailbox. We do
@@ -2070,144 +2348,92 @@ func (c *conn) cmdRename(tag, cmd string, p *parser) {
 				if exists {
 					xusercodeErrorf("ALREADYEXISTS", "destination mailbox %q already exists", dst)
 				}
-				srcMB, err := c.account.MailboxFind(tx, src)
-				xcheckf(err, "finding source mailbox")
-				if srcMB == nil {
-					xserverErrorf("inbox not found")
-				}
 				if dst == src {
 					xuserErrorf("cannot move inbox to itself")
 				}
+
+				uidval, err := c.account.NextUIDValidity(tx)
+				xcheckf(err, "next uid validity")
 
 				dstMB := store.Mailbox{
 					Name:        dst,
 					UIDValidity: uidval,
 					UIDNext:     1,
+					Keywords:    srcMB.Keywords,
+					HaveCounts:  true,
 				}
 				err = tx.Insert(&dstMB)
 				xcheckf(err, "create new destination mailbox")
 
+				modseq, err := c.account.NextModSeq(tx)
+				xcheckf(err, "assigning next modseq")
+
+				changes = make([]store.Change, 2) // Placeholders filled in below.
+
 				// Move existing messages, with their ID's and on-disk files intact, to the new
-				// mailbox.
+				// mailbox. We keep the expunged messages, the destination mailbox doesn't care
+				// about them.
 				var oldUIDs []store.UID
 				q := bstore.QueryTx[store.Message](tx)
 				q.FilterNonzero(store.Message{MailboxID: srcMB.ID})
+				q.FilterEqual("Expunged", false)
 				q.SortAsc("UID")
 				err = q.ForEach(func(m store.Message) error {
-					oldUIDs = append(oldUIDs, m.UID)
+					om := m
+					om.ID = 0
+					om.ModSeq = modseq
+					om.PrepareExpunge()
+					oldUIDs = append(oldUIDs, om.UID)
+
+					mc := m.MailboxCounts()
+					srcMB.Sub(mc)
+					dstMB.Add(mc)
+
 					m.MailboxID = dstMB.ID
 					m.UID = dstMB.UIDNext
 					dstMB.UIDNext++
+					m.CreateSeq = modseq
+					m.ModSeq = modseq
 					if err := tx.Update(&m); err != nil {
 						return fmt.Errorf("updating message to move to new mailbox: %w", err)
+					}
+
+					changes = append(changes, m.ChangeAddUID())
+
+					if err := tx.Insert(&om); err != nil {
+						return fmt.Errorf("adding empty expunge message record to inbox: %w", err)
 					}
 					return nil
 				})
 				xcheckf(err, "moving messages from inbox to destination mailbox")
 
 				err = tx.Update(&dstMB)
-				xcheckf(err, "updating uidnext in destination mailbox")
+				xcheckf(err, "updating uidnext and counts in destination mailbox")
+
+				err = tx.Update(&srcMB)
+				xcheckf(err, "updating counts for inbox")
 
 				var dstFlags []string
 				if tx.Get(&store.Subscription{Name: dstMB.Name}) == nil {
 					dstFlags = []string{`\Subscribed`}
 				}
-				changes = []store.Change{
-					store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: oldUIDs},
-					store.ChangeAddMailbox{Name: dstMB.Name, Flags: dstFlags},
-					// todo: in future, we could announce all messages. no one is listening now though.
-				}
+				changes[0] = store.ChangeRemoveUIDs{MailboxID: srcMB.ID, UIDs: oldUIDs, ModSeq: modseq}
+				changes[1] = store.ChangeAddMailbox{Mailbox: dstMB, Flags: dstFlags}
+				// changes[2:...] are ChangeAddUIDs
+				changes = append(changes, srcMB.ChangeCounts(), dstMB.ChangeCounts())
 				return
 			}
 
-			// We gather existing mailboxes that we need for deciding what to create/delete/update.
-			q := bstore.QueryTx[store.Mailbox](tx)
-			srcPrefix := src + "/"
-			dstRoot := strings.SplitN(dst, "/", 2)[0]
-			dstRootPrefix := dstRoot + "/"
-			q.FilterFn(func(mb store.Mailbox) bool {
-				return mb.Name == src || strings.HasPrefix(mb.Name, srcPrefix) || mb.Name == dstRoot || strings.HasPrefix(mb.Name, dstRootPrefix)
-			})
-			q.SortAsc("Name") // We'll rename the parents before children.
-			l, err := q.List()
-			xcheckf(err, "listing relevant mailboxes")
-
-			mailboxes := map[string]store.Mailbox{}
-			for _, mb := range l {
-				mailboxes[mb.Name] = mb
-			}
-
-			if _, ok := mailboxes[src]; !ok {
+			var notExists, alreadyExists bool
+			var err error
+			changes, _, notExists, alreadyExists, err = c.account.MailboxRename(tx, srcMB, dst)
+			if notExists {
 				// ../rfc/9051:5140
-				xusercodeErrorf("NONEXISTENT", "mailbox does not exist")
+				xusercodeErrorf("NONEXISTENT", "%s", err)
+			} else if alreadyExists {
+				xusercodeErrorf("ALREADYEXISTS", "%s", err)
 			}
-
-			// Ensure parent mailboxes for the destination paths exist.
-			var parent string
-			dstElems := strings.Split(dst, "/")
-			for i, elem := range dstElems[:len(dstElems)-1] {
-				if i > 0 {
-					parent += "/"
-				}
-				parent += elem
-
-				mb, ok := mailboxes[parent]
-				if ok {
-					continue
-				}
-				omb := mb
-				mb = store.Mailbox{
-					ID:          omb.ID,
-					Name:        parent,
-					UIDValidity: uidval,
-					UIDNext:     1,
-				}
-				err = tx.Insert(&mb)
-				xcheckf(err, "creating parent mailbox")
-				err = tx.Insert(&store.Subscription{Name: parent})
-				if err != nil && !errors.Is(err, bstore.ErrUnique) {
-					xcheckf(err, "creating subscription")
-				}
-				changes = append(changes, store.ChangeAddMailbox{Name: parent, Flags: []string{`\Subscribed`}})
-			}
-
-			// Process src mailboxes, renaming them to dst.
-			for _, srcmb := range l {
-				if srcmb.Name != src && !strings.HasPrefix(srcmb.Name, srcPrefix) {
-					continue
-				}
-				srcName := srcmb.Name
-				dstName := dst + srcmb.Name[len(src):]
-				if _, ok := mailboxes[dstName]; ok {
-					xusercodeErrorf("ALREADYEXISTS", "destination mailbox %q already exists", dstName)
-				}
-
-				srcmb.Name = dstName
-				srcmb.UIDValidity = uidval
-				err = tx.Update(&srcmb)
-				xcheckf(err, "renaming mailbox")
-
-				// Renaming Inbox is special, it leaves an empty inbox instead of removing it.
-				var dstFlags []string
-				if tx.Get(&store.Subscription{Name: dstName}) == nil {
-					dstFlags = []string{`\Subscribed`}
-				}
-				changes = append(changes, store.ChangeRenameMailbox{OldName: srcName, NewName: dstName, Flags: dstFlags})
-			}
-
-			// If we renamed e.g. a/b to a/b/c/d, and a/b/c to a/b/c/d/c, we'll have to recreate a/b and a/b/c.
-			srcElems := strings.Split(src, "/")
-			xsrc := src
-			for i := 0; i < len(dstElems) && strings.HasPrefix(dst, xsrc+"/"); i++ {
-				mb := store.Mailbox{
-					UIDValidity: uidval,
-					UIDNext:     1,
-					Name:        xsrc,
-				}
-				err = tx.Insert(&mb)
-				xcheckf(err, "creating mailbox at old path")
-				xsrc += "/" + dstElems[len(srcElems)+i]
-			}
+			xcheckf(err, "renaming mailbox")
 		})
 		c.broadcast(changes)
 	})
@@ -2311,7 +2537,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 		for _, sub := range subscriptions {
 			name := sub.Name
 			if ispercent {
-				for p := filepath.Dir(name); p != "."; p = filepath.Dir(p) {
+				for p := path.Dir(name); p != "."; p = path.Dir(p) {
 					subscribedKids[p] = true
 				}
 			}
@@ -2319,7 +2545,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 				continue
 			}
 			have[name] = true
-			line := fmt.Sprintf(`* LSUB () "/" %s`, astring(name).pack(c))
+			line := fmt.Sprintf(`* LSUB () "/" %s`, astring(c.encodeMailbox(name)).pack(c))
 			lines = append(lines, line)
 
 		}
@@ -2334,7 +2560,7 @@ func (c *conn) cmdLsub(tag, cmd string, p *parser) {
 			if have[mb.Name] || !subscribedKids[mb.Name] || !re.MatchString(mb.Name) {
 				return nil
 			}
-			line := fmt.Sprintf(`* LSUB (\NoSelect) "/" %s`, astring(mb.Name).pack(c))
+			line := fmt.Sprintf(`* LSUB (\NoSelect) "/" %s`, astring(c.encodeMailbox(mb.Name)).pack(c))
 			lines = append(lines, line)
 			return nil
 		})
@@ -2371,8 +2597,8 @@ func (c *conn) cmdNamespace(tag, cmd string, p *parser) {
 //
 // State: Authenticated and selected.
 func (c *conn) cmdStatus(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3328 ../rfc/3501:2424
-	// Examples: ../rfc/9051:3400 ../rfc/3501:2501
+	// Command: ../rfc/9051:3328 ../rfc/3501:2424 ../rfc/7162:1127
+	// Examples: ../rfc/9051:3400 ../rfc/3501:2501 ../rfc/7162:1139
 
 	// Request syntax: ../rfc/9051:7053 ../rfc/3501:5036
 	p.xspace()
@@ -2404,80 +2630,35 @@ func (c *conn) cmdStatus(tag, cmd string, p *parser) {
 
 // Response syntax: ../rfc/9051:6681 ../rfc/9051:7070 ../rfc/9051:7059 ../rfc/3501:4834
 func (c *conn) xstatusLine(tx *bstore.Tx, mb store.Mailbox, attrs []string) string {
-	var count, unseen, deleted int
-	var size int64
-
-	q := bstore.QueryTx[store.Message](tx)
-	q.FilterNonzero(store.Message{MailboxID: mb.ID})
-	err := q.ForEach(func(m store.Message) error {
-		count++
-		if !m.Seen {
-			unseen++
-		}
-		if m.Deleted {
-			deleted++
-		}
-		size += m.Size
-		return nil
-	})
-	xcheckf(err, "processing mailbox messages")
-
 	status := []string{}
 	for _, a := range attrs {
 		A := strings.ToUpper(a)
 		switch A {
 		case "MESSAGES":
-			status = append(status, A, fmt.Sprintf("%d", count))
+			status = append(status, A, fmt.Sprintf("%d", mb.Total+mb.Deleted))
 		case "UIDNEXT":
 			status = append(status, A, fmt.Sprintf("%d", mb.UIDNext))
 		case "UIDVALIDITY":
 			status = append(status, A, fmt.Sprintf("%d", mb.UIDValidity))
 		case "UNSEEN":
-			status = append(status, A, fmt.Sprintf("%d", unseen))
+			status = append(status, A, fmt.Sprintf("%d", mb.Unseen))
 		case "DELETED":
-			status = append(status, A, fmt.Sprintf("%d", deleted))
+			status = append(status, A, fmt.Sprintf("%d", mb.Deleted))
 		case "SIZE":
-			status = append(status, A, fmt.Sprintf("%d", size))
+			status = append(status, A, fmt.Sprintf("%d", mb.Size))
 		case "RECENT":
 			status = append(status, A, "0")
 		case "APPENDLIMIT":
 			// ../rfc/7889:255
 			status = append(status, A, "NIL")
+		case "HIGHESTMODSEQ":
+			// ../rfc/7162:366
+			status = append(status, A, fmt.Sprintf("%d", c.xhighestModSeq(tx, mb.ID).Client()))
 		default:
 			xsyntaxErrorf("unknown attribute %q", a)
 		}
 	}
-	return fmt.Sprintf("* STATUS %s (%s)", astring(mb.Name).pack(c), strings.Join(status, " "))
-}
-
-func xparseStoreFlags(l []string, syntax bool) (flags store.Flags, keywords []string) {
-	fields := map[string]*bool{
-		`\answered`:  &flags.Answered,
-		`\flagged`:   &flags.Flagged,
-		`\deleted`:   &flags.Deleted,
-		`\seen`:      &flags.Seen,
-		`\draft`:     &flags.Draft,
-		`$junk`:      &flags.Junk,
-		`$notjunk`:   &flags.Notjunk,
-		`$forwarded`: &flags.Forwarded,
-		`$phishing`:  &flags.Phishing,
-		`$mdnsent`:   &flags.MDNSent,
-	}
-	seen := map[string]bool{}
-	for _, f := range l {
-		f = strings.ToLower(f)
-		if field, ok := fields[f]; ok {
-			*field = true
-		} else if seen[f] {
-			if moxvar.Pedantic {
-				xuserErrorf("duplicate keyword %s", f)
-			}
-		} else {
-			keywords = append(keywords, f)
-			seen[f] = true
-		}
-	}
-	return
+	return fmt.Sprintf("* STATUS %s (%s)", astring(c.encodeMailbox(mb.Name)).pack(c), strings.Join(status, " "))
 }
 
 func flaglist(fl store.Flags, keywords []string) listspace {
@@ -2518,7 +2699,11 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 	var keywords []string
 	if p.hasPrefix("(") {
 		// Error must be a syntax error, to properly abort the connection due to literal.
-		storeFlags, keywords = xparseStoreFlags(p.xflagList(), true)
+		var err error
+		storeFlags, keywords, err = store.ParseFlagsKeywords(p.xflagList())
+		if err != nil {
+			xsyntaxErrorf("parsing flags: %v", err)
+		}
 		p.xspace()
 	}
 	var tm time.Time
@@ -2539,22 +2724,21 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 		c.xmailbox(tx, name, "TRYCREATE")
 	})
 	if sync {
-		c.writelinef("+")
+		c.writelinef("+ ")
 	}
 
 	// Read the message into a temporary file.
-	msgFile, err := store.CreateMessageTemp("imap-append")
+	msgFile, err := store.CreateMessageTemp(c.log, "imap-append")
 	xcheckf(err, "creating temp file for message")
 	defer func() {
-		if msgFile != nil {
-			err := os.Remove(msgFile.Name())
-			c.xsanity(err, "removing APPEND temporary file")
-			err = msgFile.Close()
-			c.xsanity(err, "closing APPEND temporary file")
-		}
+		p := msgFile.Name()
+		err := msgFile.Close()
+		c.xsanity(err, "closing APPEND temporary file")
+		err = os.Remove(p)
+		c.xsanity(err, "removing APPEND temporary file")
 	}()
 	defer c.xtrace(mlog.LevelTracedata)()
-	mw := &message.Writer{Writer: msgFile}
+	mw := message.NewWriter(msgFile)
 	msize, err := io.Copy(mw, io.LimitReader(c.br, size))
 	c.xtrace(mlog.LevelTrace) // Restore.
 	if err != nil {
@@ -2563,11 +2747,6 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 	}
 	if msize != size {
 		xserverErrorf("read %d bytes for message, expected %d (%w)", msize, size, errIO)
-	}
-	msgPrefix := []byte{}
-	// todo: should we treat the message as body? i believe headers are required in messages, and bodies are optional. so would make more sense to treat the data as headers. perhaps only if the headers are valid?
-	if !mw.HaveHeaders {
-		msgPrefix = []byte("\r\n")
 	}
 
 	if utf8 {
@@ -2586,32 +2765,44 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 	}
 
 	var mb store.Mailbox
-	var msg store.Message
+	var m store.Message
 	var pendingChanges []store.Change
 
 	c.account.WithWLock(func() {
+		var changes []store.Change
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mb = c.xmailbox(tx, name, "TRYCREATE")
 
 			// Ensure keywords are stored in mailbox.
-			var changed bool
-			mb.Keywords, changed = store.MergeKeywords(mb.Keywords, keywords)
-			if changed {
-				err := tx.Update(&mb)
-				xcheckf(err, "updating keywords in mailbox")
+			var mbKwChanged bool
+			mb.Keywords, mbKwChanged = store.MergeKeywords(mb.Keywords, keywords)
+			if mbKwChanged {
+				changes = append(changes, mb.ChangeKeywords())
 			}
 
-			msg = store.Message{
+			m = store.Message{
 				MailboxID:     mb.ID,
 				MailboxOrigID: mb.ID,
 				Received:      tm,
 				Flags:         storeFlags,
 				Keywords:      keywords,
-				Size:          size,
-				MsgPrefix:     msgPrefix,
+				Size:          mw.Size,
 			}
-			isSent := name == "Sent"
-			err := c.account.DeliverMessage(c.log, tx, &msg, msgFile, true, isSent, true, false)
+
+			ok, maxSize, err := c.account.CanAddMessageSize(tx, m.Size)
+			xcheckf(err, "checking quota")
+			if !ok {
+				// ../rfc/9051:5155
+				xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", maxSize)
+			}
+
+			mb.Add(m.MailboxCounts())
+
+			// Update mailbox before delivering, which updates uidnext which we mustn't overwrite.
+			err = tx.Update(&mb)
+			xcheckf(err, "updating mailbox counts")
+
+			err = c.account.DeliverMessage(c.log, tx, &m, msgFile, true, false, false, true)
 			xcheckf(err, "delivering message")
 		})
 
@@ -2621,20 +2812,18 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 		}
 
 		// Broadcast the change to other connections.
-		c.broadcast([]store.Change{store.ChangeAddUID{MailboxID: mb.ID, UID: msg.UID, Flags: msg.Flags, Keywords: msg.Keywords}})
+		changes = append(changes, m.ChangeAddUID(), mb.ChangeCounts())
+		c.broadcast(changes)
 	})
-
-	err = msgFile.Close()
-	c.log.Check(err, "closing appended file")
-	msgFile = nil
 
 	if c.mailboxID == mb.ID {
 		c.applyChanges(pendingChanges, false)
-		c.uidAppend(msg.UID)
+		c.uidAppend(m.UID)
+		// todo spec: with condstore/qresync, is there a mechanism to the client know the modseq for the appended uid? in theory an untagged fetch with the modseq after the OK APPENDUID could make sense, but this probably isn't allowed.
 		c.bwritelinef("* %d EXISTS", len(c.uids))
 	}
 
-	c.writeresultf("%s OK [APPENDUID %d %d] appended", tag, mb.UIDValidity, msg.UID)
+	c.writeresultf("%s OK [APPENDUID %d %d] appended", tag, mb.UIDValidity, m.UID)
 }
 
 // Idle makes a client wait until the server sends untagged updates, e.g. about
@@ -2660,8 +2849,8 @@ wait:
 			xcheckf(le.err, "get line")
 			line = le.line
 			break wait
-		case changes := <-c.comm.Changes:
-			c.applyChanges(changes, false)
+		case <-c.comm.Pending:
+			c.applyChanges(c.comm.Get(), false)
 			c.xflush()
 		case <-mox.Shutdown.Done():
 			// ../rfc/9051:5375
@@ -2706,7 +2895,7 @@ func (c *conn) cmdCheck(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdClose(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3636 ../rfc/3501:2652
+	// Command: ../rfc/9051:3636 ../rfc/3501:2652 ../rfc/7162:1836
 
 	// Request syntax: ../rfc/9051:6476 ../rfc/3501:4679
 	p.xempty()
@@ -2717,7 +2906,7 @@ func (c *conn) cmdClose(tag, cmd string, p *parser) {
 		return
 	}
 
-	remove := c.xexpunge(nil, true)
+	remove, _ := c.xexpunge(nil, true)
 
 	defer func() {
 		for _, m := range remove {
@@ -2733,13 +2922,21 @@ func (c *conn) cmdClose(tag, cmd string, p *parser) {
 
 // expunge messages marked for deletion in currently selected/active mailbox.
 // if uidSet is not nil, only messages matching the set are deleted.
-// messages that have been deleted from the database returned, but the corresponding files still have to be removed.
-func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
-	var remove []store.Message
+//
+// messages that have been marked expunged from the database are returned, but the
+// corresponding files still have to be removed.
+//
+// the highest modseq in the mailbox is returned, typically associated with the
+// removal of the messages, but if no messages were expunged the current latest max
+// modseq for the mailbox is returned.
+func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) (remove []store.Message, highestModSeq store.ModSeq) {
+	var modseq store.ModSeq
 
 	c.account.WithWLock(func() {
+		var mb store.Mailbox
+
 		c.xdbwrite(func(tx *bstore.Tx) {
-			mb := store.Mailbox{ID: c.mailboxID}
+			mb = store.Mailbox{ID: c.mailboxID}
 			err := tx.Get(&mb)
 			if err == bstore.ErrAbsent {
 				if missingMailboxOK {
@@ -2751,6 +2948,7 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 			qm := bstore.QueryTx[store.Message](tx)
 			qm.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			qm.FilterEqual("Deleted", true)
+			qm.FilterEqual("Expunged", false)
 			qm.FilterFn(func(m store.Message) bool {
 				// Only remove if this session knows about the message and if present in optional uidSet.
 				return uidSearch(c.uids, m.UID) > 0 && (uidSet == nil || uidSet.containsUID(m.UID, c.uids, c.searchResult))
@@ -2760,14 +2958,26 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 			xcheckf(err, "listing messages to delete")
 
 			if len(remove) == 0 {
+				highestModSeq = c.xhighestModSeq(tx, c.mailboxID)
 				return
 			}
 
+			// Assign new modseq.
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+			highestModSeq = modseq
+
 			removeIDs := make([]int64, len(remove))
 			anyIDs := make([]any, len(remove))
+			var totalSize int64
 			for i, m := range remove {
 				removeIDs[i] = m.ID
 				anyIDs[i] = m.ID
+				mb.Sub(m.MailboxCounts())
+				totalSize += m.Size
+				// Update "remove", because RetrainMessage below will save the message.
+				remove[i].Expunged = true
+				remove[i].ModSeq = modseq
 			}
 			qmr := bstore.QueryTx[store.Recipient](tx)
 			qmr.FilterEqual("MessageID", anyIDs...)
@@ -2776,17 +2986,26 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 
 			qm = bstore.QueryTx[store.Message](tx)
 			qm.FilterIDs(removeIDs)
-			_, err = qm.Delete()
-			xcheckf(err, "removing messages marked for deletion")
+			n, err := qm.UpdateNonzero(store.Message{Expunged: true, ModSeq: modseq})
+			if err == nil && n != len(removeIDs) {
+				err = fmt.Errorf("only %d messages set to expunged, expected %d", n, len(removeIDs))
+			}
+			xcheckf(err, "marking messages marked for deleted as expunged")
 
-			// Mark removed messages as not needing training, then retrain them, so if they
+			err = tx.Update(&mb)
+			xcheckf(err, "updating mailbox counts")
+
+			err = c.account.AddMessageSize(c.log, tx, -totalSize)
+			xcheckf(err, "updating disk usage")
+
+			// Mark expunged messages as not needing training, then retrain them, so if they
 			// were trained, they get untrained.
 			for i := range remove {
 				remove[i].Junk = false
 				remove[i].Notjunk = false
 			}
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, remove, true)
-			xcheckf(err, "untraining deleted messages")
+			xcheckf(err, "untraining expunged messages")
 		})
 
 		// Broadcast changes to other connections. We may not have actually removed any
@@ -2796,11 +3015,14 @@ func (c *conn) xexpunge(uidSet *numSet, missingMailboxOK bool) []store.Message {
 			for i, m := range remove {
 				ouids[i] = m.UID
 			}
-			changes := []store.Change{store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: ouids}}
+			changes := []store.Change{
+				store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: ouids, ModSeq: modseq},
+				mb.ChangeCounts(),
+			}
 			c.broadcast(changes)
 		}
 	})
-	return remove
+	return remove, highestModSeq
 }
 
 // Unselect is similar to close in that it closes the currently active mailbox, but
@@ -2823,7 +3045,7 @@ func (c *conn) cmdUnselect(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdExpunge(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:3687 ../rfc/3501:2695
+	// Command: ../rfc/9051:3687 ../rfc/3501:2695 ../rfc/7162:1770
 
 	// Request syntax: ../rfc/9051:6476 ../rfc/3501:4679
 	p.xempty()
@@ -2840,7 +3062,7 @@ func (c *conn) cmdExpunge(tag, cmd string, p *parser) {
 //
 // State: Selected
 func (c *conn) cmdUIDExpunge(tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:4775 ../rfc/4315:75
+	// Command: ../rfc/9051:4775 ../rfc/4315:75 ../rfc/7162:1873
 
 	// Request syntax: ../rfc/9051:7125 ../rfc/9051:7129 ../rfc/4315:298
 	p.xspace()
@@ -2860,7 +3082,7 @@ func (c *conn) cmdUIDExpunge(tag, cmd string, p *parser) {
 func (c *conn) cmdxExpunge(tag, cmd string, uidSet *numSet) {
 	// Command: ../rfc/9051:3687 ../rfc/3501:2695
 
-	remove := c.xexpunge(uidSet, false)
+	remove, highestModSeq := c.xexpunge(uidSet, false)
 
 	defer func() {
 		for _, m := range remove {
@@ -2871,13 +3093,29 @@ func (c *conn) cmdxExpunge(tag, cmd string, uidSet *numSet) {
 	}()
 
 	// Response syntax: ../rfc/9051:6742 ../rfc/3501:4864
+	var vanishedUIDs numSet
+	qresync := c.enabled[capQresync]
 	for _, m := range remove {
 		seq := c.xsequence(m.UID)
 		c.sequenceRemove(seq, m.UID)
-		c.bwritelinef("* %d EXPUNGE", seq)
+		if qresync {
+			vanishedUIDs.append(uint32(m.UID))
+		} else {
+			c.bwritelinef("* %d EXPUNGE", seq)
+		}
+	}
+	if !vanishedUIDs.empty() {
+		// VANISHED without EARLIER. ../rfc/7162:2004
+		for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+			c.bwritelinef("* VANISHED %s", s)
+		}
 	}
 
-	c.ok(tag, cmd)
+	if c.enabled[capCondstore] {
+		c.writeresultf("%s OK [HIGHESTMODSEQ %d] expunged", tag, highestModSeq.Client())
+	} else {
+		c.ok(tag, cmd)
+	}
 }
 
 // State: Selected
@@ -2985,8 +3223,11 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	var origUIDs, newUIDs []store.UID
 	var flags []store.Flags
 	var keywords [][]string
+	var modseq store.ModSeq // For messages in new mailbox, assigned when first message is copied.
 
 	c.account.WithWLock(func() {
+		var mbKwChanged bool
+
 		c.xdbwrite(func(tx *bstore.Tx) {
 			mbSrc := c.xmailboxID(tx, c.mailboxID) // Validate.
 			mbDst = c.xmailbox(tx, name, "TRYCREATE")
@@ -2998,22 +3239,39 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				xuserErrorf("no matching messages to copy")
 			}
 
+			var err error
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+
 			// Reserve the uids in the destination mailbox.
 			uidFirst := mbDst.UIDNext
 			mbDst.UIDNext += store.UID(len(uidargs))
-			err := tx.Update(&mbDst)
-			xcheckf(err, "reserve uid in destination mailbox")
 
 			// Fetch messages from database.
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
+			q.FilterEqual("Expunged", false)
 			xmsgs, err := q.List()
 			xcheckf(err, "fetching messages")
 
 			if len(xmsgs) != len(uidargs) {
 				xserverErrorf("uid and message mismatch")
 			}
+
+			// See if quota allows copy.
+			var totalSize int64
+			for _, m := range xmsgs {
+				totalSize += m.Size
+			}
+			if ok, maxSize, err := c.account.CanAddMessageSize(tx, totalSize); err != nil {
+				xcheckf(err, "checking quota")
+			} else if !ok {
+				// ../rfc/9051:5155
+				xusercodeErrorf("OVERQUOTA", "account over maximum total message size %d", maxSize)
+			}
+			err = c.account.AddMessageSize(c.log, tx, totalSize)
+			xcheckf(err, "updating disk usage")
 
 			msgs := map[store.UID]store.Message{}
 			for _, m := range xmsgs {
@@ -3022,6 +3280,8 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 			nmsgs := make([]store.Message, len(xmsgs))
 
 			conf, _ := c.account.Conf()
+
+			mbKeywords := map[string]struct{}{}
 
 			// Insert new messages into database.
 			var origMsgIDs, newMsgIDs []int64
@@ -3034,14 +3294,17 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				origMsgIDs = append(origMsgIDs, origID)
 				m.ID = 0
 				m.UID = uidFirst + store.UID(i)
+				m.CreateSeq = modseq
+				m.ModSeq = modseq
 				m.MailboxID = mbDst.ID
-				if mbSrc.Name == conf.RejectsMailbox && m.MailboxDestinedID != 0 {
+				if m.IsReject && m.MailboxDestinedID != 0 {
 					// Incorrectly delivered to Rejects mailbox. Adjust MailboxOrigID so this message
 					// is used for reputation calculation during future deliveries.
 					m.MailboxOrigID = m.MailboxDestinedID
+					m.IsReject = false
 				}
 				m.TrainedJunk = nil
-				m.JunkFlagsForMailbox(mbDst.Name, conf)
+				m.JunkFlagsForMailbox(mbDst, conf)
 				err := tx.Insert(&m)
 				xcheckf(err, "inserting message")
 				msgs[uid] = m
@@ -3051,6 +3314,9 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 				newMsgIDs = append(newMsgIDs, m.ID)
 				flags = append(flags, m.Flags)
 				keywords = append(keywords, m.Keywords)
+				for _, kw := range m.Keywords {
+					mbKeywords[kw] = struct{}{}
+				}
 
 				qmr := bstore.QueryTx[store.Recipient](tx)
 				qmr.FilterNonzero(store.Recipient{MessageID: origID})
@@ -3062,16 +3328,33 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 					err := tx.Insert(&mr)
 					xcheckf(err, "inserting message recipient")
 				}
+
+				mbDst.Add(m.MailboxCounts())
 			}
 
+			mbDst.Keywords, mbKwChanged = store.MergeKeywords(mbDst.Keywords, maps.Keys(mbKeywords))
+
+			err = tx.Update(&mbDst)
+			xcheckf(err, "updating destination mailbox for uids, keywords and counts")
+
 			// Copy message files to new message ID's.
+			syncDirs := map[string]struct{}{}
 			for i := range origMsgIDs {
 				src := c.account.MessagePath(origMsgIDs[i])
 				dst := c.account.MessagePath(newMsgIDs[i])
-				os.MkdirAll(filepath.Dir(dst), 0770) // todo optimization: keep track of dirs we already created, don't create them again
-				err := c.linkOrCopyFile(dst, src)
+				dstdir := filepath.Dir(dst)
+				if _, ok := syncDirs[dstdir]; !ok {
+					os.MkdirAll(dstdir, 0770)
+					syncDirs[dstdir] = struct{}{}
+				}
+				err := moxio.LinkOrCopy(c.log, dst, src, nil, true)
 				xcheckf(err, "link or copy file %q to %q", src, dst)
 				createdIDs = append(createdIDs, newMsgIDs[i])
+			}
+
+			for dir := range syncDirs {
+				err := moxio.SyncDir(c.log, dir)
+				xcheckf(err, "sync directory")
 			}
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, nmsgs, false)
@@ -3080,9 +3363,13 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 
 		// Broadcast changes to other connections.
 		if len(newUIDs) > 0 {
-			changes := make([]store.Change, len(newUIDs))
+			changes := make([]store.Change, 0, len(newUIDs)+2)
 			for i, uid := range newUIDs {
-				changes[i] = store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, Flags: flags[i], Keywords: keywords[i]}
+				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: uid, ModSeq: modseq, Flags: flags[i], Keywords: keywords[i]})
+			}
+			changes = append(changes, mbDst.ChangeCounts())
+			if mbKwChanged {
+				changes = append(changes, mbDst.ChangeKeywords())
 			}
 			c.broadcast(changes)
 		}
@@ -3095,56 +3382,13 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	c.writeresultf("%s OK [COPYUID %d %s %s] copied", tag, mbDst.UIDValidity, compactUIDSet(origUIDs).String(), compactUIDSet(newUIDs).String())
 }
 
-func (c *conn) linkOrCopyFile(dst, src string) error {
-	// Try hardlink first.
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-
-	// File system may not support hardlinks, or link would cross file systems. Do a regular file copy.
-	sf, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err := sf.Close()
-		c.xsanity(err, "closing copied src file")
-	}()
-
-	df, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0660)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if df != nil {
-			err = os.Remove(df.Name())
-			c.xsanity(err, "removing unfinished dst file")
-			err = df.Close()
-			c.xsanity(err, "closing unfinished dst file")
-		}
-	}()
-
-	if _, err := io.Copy(df, sf); err != nil {
-		return err
-	}
-	if err := df.Close(); err != nil {
-		xerr := os.Remove(df.Name())
-		c.xsanity(xerr, "removing unfinished dst file")
-		df = nil
-		return err
-	}
-	// todo: may need to do a file/dir sync to flush to disk. better to do it once after multiple linkOrCopyFile calls.
-	df = nil
-	return nil
-}
-
 // Move moves messages from the currently selected/active mailbox to a named mailbox.
 //
 // State: Selected
 func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
-	// Command: ../rfc/9051:4650 ../rfc/6851:119
+	// Command: ../rfc/9051:4650 ../rfc/6851:119 ../rfc/6851:265
 
-	// Request syntax: ../rfc/6851:320 ../rfc/9051:6744
+	// Request syntax: ../rfc/6851:320
 	p.xspace()
 	nums := p.xnumSet()
 	p.xspace()
@@ -3159,13 +3403,14 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 
 	uids, uidargs := c.gatherCopyMoveUIDs(isUID, nums)
 
-	var mbDst store.Mailbox
+	var mbSrc, mbDst store.Mailbox
 	var changes []store.Change
 	var newUIDs []store.UID
+	var modseq store.ModSeq
 
 	c.account.WithWLock(func() {
 		c.xdbwrite(func(tx *bstore.Tx) {
-			mbSrc := c.xmailboxID(tx, c.mailboxID) // Validate.
+			mbSrc = c.xmailboxID(tx, c.mailboxID) // Validate.
 			mbDst = c.xmailbox(tx, name, "TRYCREATE")
 			if mbDst.ID == c.mailboxID {
 				xuserErrorf("cannot move to currently selected mailbox")
@@ -3179,13 +3424,20 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 			uidFirst := mbDst.UIDNext
 			uidnext := uidFirst
 			mbDst.UIDNext += store.UID(len(uids))
-			err := tx.Update(&mbDst)
-			xcheckf(err, "reserve uids in destination mailbox")
 
-			// Update UID and MailboxID in database for messages.
+			// Assign a new modseq, for the new records and for the expunged records.
+			var err error
+			modseq, err = c.account.NextModSeq(tx)
+			xcheckf(err, "assigning next modseq")
+
+			// Update existing record with new UID and MailboxID in database for messages. We
+			// add a new but expunged record again in the original/source mailbox, for qresync.
+			// Keeping the original ID for the live message means we don't have to move the
+			// on-disk message contents file.
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
+			q.FilterEqual("Expunged", false)
 			q.SortAsc("UID")
 			msgs, err := q.List()
 			xcheckf(err, "listing messages to move")
@@ -3194,35 +3446,72 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 				xserverErrorf("uid and message mismatch")
 			}
 
+			keywords := map[string]struct{}{}
+
 			conf, _ := c.account.Conf()
 			for i := range msgs {
 				m := &msgs[i]
 				if m.UID != uids[i] {
 					xserverErrorf("internal error: got uid %d, expected %d, for index %d", m.UID, uids[i], i)
 				}
+
+				mbSrc.Sub(m.MailboxCounts())
+
+				// Copy of message record that we'll insert when UID is freed up.
+				om := *m
+				om.PrepareExpunge()
+				om.ID = 0 // Assign new ID.
+				om.ModSeq = modseq
+
 				m.MailboxID = mbDst.ID
-				if mbSrc.Name == conf.RejectsMailbox && m.MailboxDestinedID != 0 {
+				if m.IsReject && m.MailboxDestinedID != 0 {
 					// Incorrectly delivered to Rejects mailbox. Adjust MailboxOrigID so this message
 					// is used for reputation calculation during future deliveries.
 					m.MailboxOrigID = m.MailboxDestinedID
+					m.IsReject = false
+					m.Seen = false
 				}
+				mbDst.Add(m.MailboxCounts())
 				m.UID = uidnext
-				m.JunkFlagsForMailbox(mbDst.Name, conf)
+				m.ModSeq = modseq
+				m.JunkFlagsForMailbox(mbDst, conf)
 				uidnext++
 				err := tx.Update(m)
 				xcheckf(err, "updating moved message in database")
+
+				// Now that UID is unused, we can insert the old record again.
+				err = tx.Insert(&om)
+				xcheckf(err, "inserting record for expunge after moving message")
+
+				for _, kw := range m.Keywords {
+					keywords[kw] = struct{}{}
+				}
 			}
+
+			// Ensure destination mailbox has keywords of the moved messages.
+			var mbKwChanged bool
+			mbDst.Keywords, mbKwChanged = store.MergeKeywords(mbDst.Keywords, maps.Keys(keywords))
+			if mbKwChanged {
+				changes = append(changes, mbDst.ChangeKeywords())
+			}
+
+			err = tx.Update(&mbSrc)
+			xcheckf(err, "updating source mailbox counts")
+
+			err = tx.Update(&mbDst)
+			xcheckf(err, "updating destination mailbox for uids, keywords and counts")
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, msgs, false)
 			xcheckf(err, "retraining messages after move")
 
 			// Prepare broadcast changes to other connections.
-			changes = make([]store.Change, 0, 1+len(msgs))
-			changes = append(changes, store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: uids})
+			changes = make([]store.Change, 0, 1+len(msgs)+2)
+			changes = append(changes, store.ChangeRemoveUIDs{MailboxID: c.mailboxID, UIDs: uids, ModSeq: modseq})
 			for _, m := range msgs {
 				newUIDs = append(newUIDs, m.UID)
-				changes = append(changes, store.ChangeAddUID{MailboxID: mbDst.ID, UID: m.UID, Flags: m.Flags, Keywords: m.Keywords})
+				changes = append(changes, m.ChangeAddUID())
 			}
+			changes = append(changes, mbSrc.ChangeCounts(), mbDst.ChangeCounts())
 		})
 
 		c.broadcast(changes)
@@ -3231,13 +3520,30 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 	// ../rfc/9051:4708 ../rfc/6851:254
 	// ../rfc/9051:4713
 	c.bwritelinef("* OK [COPYUID %d %s %s] moved", mbDst.UIDValidity, compactUIDSet(uids).String(), compactUIDSet(newUIDs).String())
+	qresync := c.enabled[capQresync]
+	var vanishedUIDs numSet
 	for i := 0; i < len(uids); i++ {
 		seq := c.xsequence(uids[i])
 		c.sequenceRemove(seq, uids[i])
-		c.bwritelinef("* %d EXPUNGE", seq)
+		if qresync {
+			vanishedUIDs.append(uint32(uids[i]))
+		} else {
+			c.bwritelinef("* %d EXPUNGE", seq)
+		}
+	}
+	if !vanishedUIDs.empty() {
+		// VANISHED without EARLIER. ../rfc/7162:2004
+		for _, s := range vanishedUIDs.Strings(4*1024 - 32) {
+			c.bwritelinef("* VANISHED %s", s)
+		}
 	}
 
-	c.ok(tag, cmd)
+	if c.enabled[capQresync] {
+		// ../rfc/9051:6744 ../rfc/7162:1334
+		c.writeresultf("%s OK [HIGHESTMODSEQ %d] move", tag, modseq.Client())
+	} else {
+		c.ok(tag, cmd)
+	}
 }
 
 // Store sets a full set of flags, or adds/removes specific flags.
@@ -3246,10 +3552,22 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 	// Command: ../rfc/9051:4543 ../rfc/3501:3214
 
-	// Request syntax: ../rfc/9051:7076 ../rfc/3501:5052
+	// Request syntax: ../rfc/9051:7076 ../rfc/3501:5052 ../rfc/4466:691 ../rfc/7162:2471
 	p.xspace()
 	nums := p.xnumSet()
 	p.xspace()
+	var unchangedSince *int64
+	if p.take("(") {
+		// ../rfc/7162:2471
+		p.xtake("UNCHANGEDSINCE")
+		p.xspace()
+		v := p.xnumber64()
+		unchangedSince = &v
+		p.xtake(")")
+		p.xspace()
+		// UNCHANGEDSINCE is a CONDSTORE-enabling parameter ../rfc/7162:382
+		c.xensureCondstore(nil)
+	}
 	var plus, minus bool
 	if p.take("+") {
 		plus = true
@@ -3274,7 +3592,10 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 		xuserErrorf("mailbox open in read-only mode")
 	}
 
-	flags, keywords := xparseStoreFlags(flagstrs, false)
+	flags, keywords, err := store.ParseFlagsKeywords(flagstrs)
+	if err != nil {
+		xuserErrorf("parsing flags: %v", err)
+	}
 	var mask store.Flags
 	if plus {
 		mask, flags = flags, store.FlagsAll
@@ -3284,11 +3605,19 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 		mask = store.FlagsAll
 	}
 
+	var mb, origmb store.Mailbox
 	var updated []store.Message
+	var changed []store.Message // ModSeq more recent than unchangedSince, will be in MODIFIED response code, and we will send untagged fetch responses so client is up to date.
+	var modseq store.ModSeq     // Assigned when needed.
+	modified := map[int64]bool{}
 
 	c.account.WithWLock(func() {
+		var mbKwChanged bool
+		var changes []store.Change
+
 		c.xdbwrite(func(tx *bstore.Tx) {
-			mb := c.xmailboxID(tx, c.mailboxID) // Validate.
+			mb = c.xmailboxID(tx, c.mailboxID) // Validate.
+			origmb = mb
 
 			uidargs := c.xnumSetCondition(isUID, nums)
 
@@ -3298,9 +3627,8 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 
 			// Ensure keywords are in mailbox.
 			if !minus {
-				var changed bool
-				mb.Keywords, changed = store.MergeKeywords(mb.Keywords, keywords)
-				if changed {
+				mb.Keywords, mbKwChanged = store.MergeKeywords(mb.Keywords, keywords)
+				if mbKwChanged {
 					err := tx.Update(&mb)
 					xcheckf(err, "updating mailbox with keywords")
 				}
@@ -3309,38 +3637,148 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 			q := bstore.QueryTx[store.Message](tx)
 			q.FilterNonzero(store.Message{MailboxID: c.mailboxID})
 			q.FilterEqual("UID", uidargs...)
+			q.FilterEqual("Expunged", false)
 			err := q.ForEach(func(m store.Message) error {
+				// Client may specify a message multiple times, but we only process it once. ../rfc/7162:823
+				if modified[m.ID] {
+					return nil
+				}
+
+				mc := m.MailboxCounts()
+
+				origFlags := m.Flags
 				m.Flags = m.Flags.Set(mask, flags)
+				oldKeywords := append([]string{}, m.Keywords...)
 				if minus {
-					m.Keywords = store.RemoveKeywords(m.Keywords, keywords)
+					m.Keywords, _ = store.RemoveKeywords(m.Keywords, keywords)
 				} else if plus {
 					m.Keywords, _ = store.MergeKeywords(m.Keywords, keywords)
 				} else {
 					m.Keywords = keywords
 				}
+
+				keywordsChanged := func() bool {
+					sort.Strings(oldKeywords)
+					n := append([]string{}, m.Keywords...)
+					sort.Strings(n)
+					return !slices.Equal(oldKeywords, n)
+				}
+
+				// If the message has a more recent modseq than the check requires, we won't modify
+				// it and report in the final command response.
+				// ../rfc/7162:555
+				//
+				// unchangedSince 0 always fails the check, we don't turn it into 1 like with our
+				// internal modseqs. RFC implies that is not required for non-system flags, but we
+				// don't have per-flag modseq and this seems reasonable. ../rfc/7162:640
+				if unchangedSince != nil && m.ModSeq.Client() > *unchangedSince {
+					changed = append(changed, m)
+					return nil
+				}
+
+				// Note: we don't perform the optimization described in ../rfc/7162:1258
+				// It requires that we keep track of the flags we think the client knows (but only
+				// on this connection). We don't track that. It also isn't clear why this is
+				// allowed because it is skipping the condstore conditional check, and the new
+				// combination of flags could be unintended.
+
+				// We do not assign a new modseq if nothing actually changed. ../rfc/7162:1246 ../rfc/7162:312
+				if origFlags == m.Flags && !keywordsChanged() {
+					// Note: since we didn't update the modseq, we are not adding m.ID to "modified",
+					// it would skip the modseq check above. We still add m to list of updated, so we
+					// send an untagged fetch response. But we don't broadcast it.
+					updated = append(updated, m)
+					return nil
+				}
+
+				mb.Sub(mc)
+				mb.Add(m.MailboxCounts())
+
+				// Assign new modseq for first actual change.
+				if modseq == 0 {
+					var err error
+					modseq, err = c.account.NextModSeq(tx)
+					xcheckf(err, "next modseq")
+				}
+				m.ModSeq = modseq
+				modified[m.ID] = true
 				updated = append(updated, m)
+
+				changes = append(changes, m.ChangeFlags(origFlags))
+
 				return tx.Update(&m)
 			})
 			xcheckf(err, "storing flags in messages")
+
+			if mb.MailboxCounts != origmb.MailboxCounts {
+				err := tx.Update(&mb)
+				xcheckf(err, "updating mailbox counts")
+
+				changes = append(changes, mb.ChangeCounts())
+			}
+			if mbKwChanged {
+				changes = append(changes, mb.ChangeKeywords())
+			}
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, updated, false)
 			xcheckf(err, "training messages")
 		})
 
-		// Broadcast changes to other connections.
-		changes := make([]store.Change, len(updated))
-		for i, m := range updated {
-			changes[i] = store.ChangeFlags{MailboxID: m.MailboxID, UID: m.UID, Mask: mask, Flags: m.Flags, Keywords: m.Keywords}
-		}
 		c.broadcast(changes)
 	})
 
-	for _, m := range updated {
-		if !silent {
-			// ../rfc/9051:6749 ../rfc/3501:4869
-			c.bwritelinef("* %d FETCH (UID %d FLAGS %s)", c.xsequence(m.UID), m.UID, flaglist(m.Flags, m.Keywords).pack(c))
+	// In the RFC, the section about STORE/UID STORE says we must return MODSEQ when
+	// UNCHANGEDSINCE was specified. It does not specify it in case UNCHANGEDSINCE
+	// isn't specified. For that case it does say MODSEQ is needed in unsolicited
+	// untagged fetch responses. Implying that solicited untagged fetch responses
+	// should not include MODSEQ (why else mention unsolicited explicitly?). But, in
+	// the introduction to CONDSTORE it does explicitly specify MODSEQ should be
+	// included in untagged fetch responses at all times with CONDSTORE-enabled
+	// connections. It would have been better if the command behaviour was specified in
+	// the command section, not the introduction to the extension.
+	// ../rfc/7162:388 ../rfc/7162:852
+	// ../rfc/7162:549
+	if !silent || c.enabled[capCondstore] {
+		for _, m := range updated {
+			var flags string
+			if !silent {
+				flags = fmt.Sprintf(" FLAGS %s", flaglist(m.Flags, m.Keywords).pack(c))
+			}
+			var modseqStr string
+			if c.enabled[capCondstore] {
+				modseqStr = fmt.Sprintf(" MODSEQ (%d)", m.ModSeq.Client())
+			}
+			// ../rfc/9051:6749 ../rfc/3501:4869 ../rfc/7162:2490
+			c.bwritelinef("* %d FETCH (UID %d%s%s)", c.xsequence(m.UID), m.UID, flags, modseqStr)
 		}
 	}
 
-	c.ok(tag, cmd)
+	// We don't explicitly send flags for failed updated with silent set. The regular
+	// notification will get the flags to the client.
+	// ../rfc/7162:630 ../rfc/3501:3233
+
+	if len(changed) == 0 {
+		c.ok(tag, cmd)
+		return
+	}
+
+	// Write unsolicited untagged fetch responses for messages that didn't pass the
+	// unchangedsince check. ../rfc/7162:679
+	// Also gather UIDs or sequences for the MODIFIED response below. ../rfc/7162:571
+	var mnums []store.UID
+	for _, m := range changed {
+		c.bwritelinef("* %d FETCH (UID %d FLAGS %s MODSEQ (%d))", c.xsequence(m.UID), m.UID, flaglist(m.Flags, m.Keywords).pack(c), m.ModSeq.Client())
+		if isUID {
+			mnums = append(mnums, m.UID)
+		} else {
+			mnums = append(mnums, store.UID(c.xsequence(m.UID)))
+		}
+	}
+
+	sort.Slice(mnums, func(i, j int) bool {
+		return mnums[i] < mnums[j]
+	})
+	set := compactUIDSet(mnums)
+	// ../rfc/7162:2506
+	c.writeresultf("%s OK [MODIFIED %s] conditional store did not modify all", tag, set.String())
 }

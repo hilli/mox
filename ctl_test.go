@@ -1,4 +1,4 @@
-//go:build !quickstart && !integration
+//go:build !integration
 
 package main
 
@@ -7,6 +7,7 @@ import (
 	"flag"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mjl-/mox/dmarcdb"
@@ -20,6 +21,7 @@ import (
 )
 
 var ctxbg = context.Background()
+var pkglog = mlog.New("ctl", nil)
 
 func tcheck(t *testing.T, err error, errmsg string) {
 	if err != nil {
@@ -33,22 +35,19 @@ func tcheck(t *testing.T, err error, errmsg string) {
 // unhandled errors would cause a panic.
 func TestCtl(t *testing.T) {
 	os.RemoveAll("testdata/ctl/data")
-	mox.ConfigStaticPath = "testdata/ctl/mox.conf"
-	mox.ConfigDynamicPath = "testdata/ctl/domains.conf"
-	if errs := mox.LoadConfig(ctxbg, true, false); len(errs) > 0 {
+	mox.ConfigStaticPath = filepath.FromSlash("testdata/ctl/mox.conf")
+	mox.ConfigDynamicPath = filepath.FromSlash("testdata/ctl/domains.conf")
+	if errs := mox.LoadConfig(ctxbg, pkglog, true, false); len(errs) > 0 {
 		t.Fatalf("loading mox config: %v", errs)
 	}
-	switchDone := store.Switchboard()
-	defer close(switchDone)
-
-	xlog := mlog.New("ctl")
+	defer store.Switchboard()()
 
 	testctl := func(fn func(clientctl *ctl)) {
 		t.Helper()
 
 		cconn, sconn := net.Pipe()
-		clientctl := ctl{conn: cconn, log: xlog}
-		serverctl := ctl{conn: sconn, log: xlog}
+		clientctl := ctl{conn: cconn, log: pkglog}
+		serverctl := ctl{conn: sconn, log: pkglog}
 		go servectlcmd(ctxbg, &serverctl, func() {})
 		fn(&clientctl)
 		cconn.Close()
@@ -62,7 +61,7 @@ func TestCtl(t *testing.T) {
 
 	// "setaccountpassword"
 	testctl(func(ctl *ctl) {
-		ctlcmdSetaccountpassword(ctl, "mjl@mox.example", "test4321")
+		ctlcmdSetaccountpassword(ctl, "mjl", "test4321")
 	})
 
 	err := queue.Init()
@@ -148,13 +147,82 @@ func TestCtl(t *testing.T) {
 	})
 
 	// Export data, import it again
-	xcmdExport(true, []string{"testdata/ctl/data/tmp/export/mbox/", "testdata/ctl/data/accounts/mjl"}, nil)
-	xcmdExport(false, []string{"testdata/ctl/data/tmp/export/maildir/", "testdata/ctl/data/accounts/mjl"}, nil)
+	xcmdExport(true, []string{filepath.FromSlash("testdata/ctl/data/tmp/export/mbox/"), filepath.FromSlash("testdata/ctl/data/accounts/mjl")}, &cmd{log: pkglog})
+	xcmdExport(false, []string{filepath.FromSlash("testdata/ctl/data/tmp/export/maildir/"), filepath.FromSlash("testdata/ctl/data/accounts/mjl")}, &cmd{log: pkglog})
 	testctl(func(ctl *ctl) {
-		ctlcmdImport(ctl, true, "mjl", "inbox", "testdata/ctl/data/tmp/export/mbox/Inbox.mbox")
+		ctlcmdImport(ctl, true, "mjl", "inbox", filepath.FromSlash("testdata/ctl/data/tmp/export/mbox/Inbox.mbox"))
 	})
 	testctl(func(ctl *ctl) {
-		ctlcmdImport(ctl, false, "mjl", "inbox", "testdata/ctl/data/tmp/export/maildir/Inbox")
+		ctlcmdImport(ctl, false, "mjl", "inbox", filepath.FromSlash("testdata/ctl/data/tmp/export/maildir/Inbox"))
+	})
+
+	// "recalculatemailboxcounts"
+	testctl(func(ctl *ctl) {
+		ctlcmdRecalculateMailboxCounts(ctl, "mjl")
+	})
+
+	// "fixmsgsize"
+	testctl(func(ctl *ctl) {
+		ctlcmdFixmsgsize(ctl, "mjl")
+	})
+	testctl(func(ctl *ctl) {
+		acc, err := store.OpenAccount(ctl.log, "mjl")
+		tcheck(t, err, "open account")
+		defer acc.Close()
+
+		content := []byte("Subject: hi\r\n\r\nbody\r\n")
+
+		deliver := func(m *store.Message) {
+			t.Helper()
+			m.Size = int64(len(content))
+			msgf, err := store.CreateMessageTemp(ctl.log, "ctltest")
+			tcheck(t, err, "create temp file")
+			defer os.Remove(msgf.Name())
+			defer msgf.Close()
+			_, err = msgf.Write(content)
+			tcheck(t, err, "write message file")
+			err = acc.DeliverMailbox(ctl.log, "Inbox", m, msgf)
+			tcheck(t, err, "deliver message")
+		}
+
+		var msgBadSize store.Message
+		deliver(&msgBadSize)
+
+		msgBadSize.Size = 1
+		err = acc.DB.Update(ctxbg, &msgBadSize)
+		tcheck(t, err, "update message to bad size")
+		mb := store.Mailbox{ID: msgBadSize.MailboxID}
+		err = acc.DB.Get(ctxbg, &mb)
+		tcheck(t, err, "get db")
+		mb.Size -= int64(len(content))
+		mb.Size += 1
+		err = acc.DB.Update(ctxbg, &mb)
+		tcheck(t, err, "update mailbox size")
+
+		// Fix up the size.
+		ctlcmdFixmsgsize(ctl, "")
+
+		err = acc.DB.Get(ctxbg, &msgBadSize)
+		tcheck(t, err, "get message")
+		if msgBadSize.Size != int64(len(content)) {
+			t.Fatalf("after fixing, message size is %d, should be %d", msgBadSize.Size, len(content))
+		}
+	})
+
+	// "reparse"
+	testctl(func(ctl *ctl) {
+		ctlcmdReparse(ctl, "mjl")
+	})
+	testctl(func(ctl *ctl) {
+		ctlcmdReparse(ctl, "")
+	})
+
+	// "reassignthreads"
+	testctl(func(ctl *ctl) {
+		ctlcmdReassignthreads(ctl, "mjl")
+	})
+	testctl(func(ctl *ctl) {
+		ctlcmdReassignthreads(ctl, "")
 	})
 
 	// "backup", backup account.
@@ -168,13 +236,13 @@ func TestCtl(t *testing.T) {
 		os.RemoveAll("testdata/ctl/data/tmp/backup-data")
 		err := os.WriteFile("testdata/ctl/data/receivedid.key", make([]byte, 16), 0600)
 		tcheck(t, err, "writing receivedid.key")
-		ctlcmdBackup(ctl, "testdata/ctl/data/tmp/backup-data", false)
+		ctlcmdBackup(ctl, filepath.FromSlash("testdata/ctl/data/tmp/backup-data"), false)
 	})
 
 	// Verify the backup.
 	xcmd := cmd{
 		flag:     flag.NewFlagSet("", flag.ExitOnError),
-		flagArgs: []string{"testdata/ctl/data/tmp/backup-data"},
+		flagArgs: []string{filepath.FromSlash("testdata/ctl/data/tmp/backup-data")},
 	}
 	cmdVerifydata(&xcmd)
 }
