@@ -3887,6 +3887,7 @@ const webserver = async () => {
 	let handlerRows = [];
 	let handlersTbody;
 	let nohandler;
+	let moveButtonsVisible = false;
 	// Make a handler row. This is more complicated, since it can be one of the three
 	// types (static, redirect, forward), and can change between those types.
 	const handlerRow = (wh) => {
@@ -4041,7 +4042,7 @@ const webserver = async () => {
 			nohandler.style.display = handlerRows.length ? 'none' : '';
 		}), ' ', 
 		// We show/hide the buttons to move when clicking the Move button.
-		moveButtons = dom.span(style({ display: 'none' }), dom.clickbutton('↑↑', attr.title('Move to top.'), function click() {
+		moveButtons = dom.span(style({ display: moveButtonsVisible ? '' : 'none' }), dom.clickbutton('↑↑', attr.title('Move to top.'), function click() {
 			const index = handlerRows.findIndex(r => r === row);
 			if (index > 0) {
 				moveHandler(row, index, 0);
@@ -4144,8 +4145,9 @@ const webserver = async () => {
 			}),
 			' ',
 			dom.clickbutton('Move', function click() {
+				moveButtonsVisible = !moveButtonsVisible;
 				for (const row of handlerRows) {
-					row.moveButtons.style.display = row.moveButtons.style.display === 'none' ? '' : 'none';
+					row.moveButtons.style.display = moveButtonsVisible ? '' : 'none';
 				}
 			}),
 		];
