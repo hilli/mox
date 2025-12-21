@@ -2977,7 +2977,7 @@ address must opt-in to receiving DMARC reports by creating a DMARC record at
 
 		u, err := url.Parse(addr)
 		if err != nil {
-			printResult("parsing uri: %v (skipping)", addr, err)
+			printResult("parsing uri %s: %v (skipping)", addr, err)
 			return
 		}
 		var destdom dns.Domain
