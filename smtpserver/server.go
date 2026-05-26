@@ -3546,9 +3546,35 @@ func (c *conn) deliver(ctx context.Context, recvHdrFor func(string) string, msgW
 				continue
 			}
 
+			// Sieve filtering: evaluate the active script (if any) to decide
+			// where to deliver this recipient's copy. The decision may
+			// override the default mailbox (fileinto), discard, reject the
+			// recipient, or trigger redirects via the queue.
+			sieveDecision, sieveSkipDelivery := evalSieveForRecipient(ctx, c.log, c, a, dataFile, addError, rcpt)
+			if sieveSkipDelivery {
+				// Either rejected (addError already called) or discarded
+				// (silent accept). Don't touch ndelivered/nerr counters
+				// further; mark as a successful handling so the per-recipient
+				// post-loop check (line below) doesn't add a generic error.
+				if sieveDecision != nil && (sieveDecision.Discard || sieveDecision.Rejected) {
+					// For discard we treat as successful accept, just like
+					// the alias self-skip above. For reject, addError was
+					// already called.
+					if sieveDecision.Discard && !sieveDecision.Rejected {
+						ndelivered++ // count as handled to avoid "no recipients delivered" path.
+						metricDelivery.WithLabelValues("delivered", "sieve-discard").Inc()
+					}
+				}
+				continue
+			}
+			targetMailbox := a.mailbox
+			if sieveDecision != nil && sieveDecision.Mailbox != "" {
+				targetMailbox = sieveDecision.Mailbox
+			}
+
 			var delivered bool
 			a.d.acc.WithWLock(func() {
-				if err := a.d.acc.DeliverMailbox(log, a.mailbox, a.d.m, dataFile); err != nil {
+				if err := a.d.acc.DeliverMailbox(log, targetMailbox, a.d.m, dataFile); err != nil {
 					log.Errorx("delivering", err)
 					metricDelivery.WithLabelValues("delivererror", a0.reason).Inc()
 					if errors.Is(err, store.ErrOverQuota) {

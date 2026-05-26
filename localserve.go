@@ -184,6 +184,7 @@ during those commands instead of during "data".
 	golog.Print(" smtp://mox%40localhost:moxmoxmox@localhost:1587 - send email (without tls)")
 	golog.Print("imaps://mox%40localhost:moxmoxmox@localhost:1993 - read email")
 	golog.Print(" imap://mox%40localhost:moxmoxmox@localhost:1143 - read email (without tls)")
+	golog.Print("sieve://mox%40localhost:moxmoxmox@localhost:5190 - manage sieve scripts (without tls)")
 	golog.Print("https://localhost:1443/account/                  - account https (email mox@localhost, password moxmoxmox)")
 	golog.Print(" http://localhost:1080/account/                  - account http (without tls)")
 	golog.Print("https://localhost:1443/webmail/                  - webmail https (email mox@localhost, password moxmoxmox)")
@@ -336,6 +337,9 @@ func writeLocalConfig(log mlog.Log, dir, ip string) (rerr error) {
 	local.IMAP.NoRequireSTARTTLS = true
 	local.IMAPS.Enabled = true
 	local.IMAPS.Port = 1993
+	local.ManageSieve.Enabled = true
+	local.ManageSieve.Port = 5190
+	local.ManageSieve.NoRequireSTARTTLS = true
 	local.AccountHTTP.Enabled = true
 	local.AccountHTTP.Port = 1080
 	local.AccountHTTP.Path = "/account/"
@@ -387,6 +391,8 @@ func writeLocalConfig(log mlog.Log, dir, ip string) (rerr error) {
 	static.TLS.CA = &tlsca
 	static.Postmaster.Account = "mox"
 	static.Postmaster.Mailbox = "Inbox"
+	sieveEnabled := true
+	static.Sieve = &config.Sieve{Enabled: &sieveEnabled}
 
 	var moxconfBuf bytes.Buffer
 	err = sconf.WriteDocs(&moxconfBuf, static)

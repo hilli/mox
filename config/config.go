@@ -32,6 +32,38 @@ func Port(port, fallback int) int {
 	return port
 }
 
+// SieveDefaultMaxScriptSize is the default per-script size limit, in bytes.
+const SieveDefaultMaxScriptSize = 32 * 1024
+
+// SieveDefaultMaxScripts is the default number of scripts per account.
+const SieveDefaultMaxScripts = 16
+
+// SieveDefaultMaxTotalScriptSize is the default total size of all scripts per account.
+const SieveDefaultMaxTotalScriptSize = 256 * 1024
+
+// SieveDefaultExecutionTimeout is the default Sieve execution timeout per message.
+const SieveDefaultExecutionTimeout = 10 * time.Second
+
+// SieveDefaultMaxRedirects is the default limit on redirect actions per message.
+const SieveDefaultMaxRedirects = 4
+
+// Sieve is the policy for Sieve filtering. It can be configured at server, domain
+// and account level, with the most specific level taking precedence. Booleans are
+// pointers so an explicit false at a more specific level can override an inherited
+// true.
+type Sieve struct {
+	Enabled            *bool         `sconf:"optional" sconf-doc:"If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the next higher scope decides; if no scope sets it, Sieve is disabled."`
+	MaxScriptSize      int64         `sconf:"optional" sconf-doc:"Maximum size in bytes of a single Sieve script. Default 32KB."`
+	MaxScripts         int           `sconf:"optional" sconf-doc:"Maximum number of scripts an account can have. Default 16."`
+	MaxTotalScriptSize int64         `sconf:"optional" sconf-doc:"Maximum total size in bytes of all scripts for an account. Default 256KB."`
+	ExecutionTimeout   time.Duration `sconf:"optional" sconf-doc:"Maximum time a single Sieve script may run on one message. Default 10s."`
+	MaxRedirects       int           `sconf:"optional" sconf-doc:"Maximum number of redirect actions per script execution. Default 4."`
+	AutoCreateMailboxes *bool        `sconf:"optional" sconf-doc:"If set, fileinto to a non-existent mailbox creates the mailbox. Default true."`
+	RunOnDelivery       *bool        `sconf:"optional" sconf-doc:"If set, execute the active Sieve script on incoming SMTP delivery. Default true."`
+	RunOnIMAPEvents     *bool        `sconf:"optional" sconf-doc:"If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default false."`
+	FailureMode         string       `sconf:"optional" sconf-doc:"Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return temporary SMTP error, the default) or 'keep' (deliver to the default mailbox)."`
+}
+
 // Static is a parsed form of the mox.conf configuration file, before converting it
 // into a mox.Config after additional processing.
 type Static struct {
@@ -73,6 +105,8 @@ type Static struct {
 	NoOutgoingTLSReports            bool  `sconf:"optional" sconf-doc:"Do not send TLS reports. By default, reports about failed SMTP STARTTLS connections and related MTA-STS/DANE policies are sent to domains if their TLSRPT DNS record requests them. Reports covering a 24 hour UTC interval are sent daily. Reports are sent from the postmaster address of the configured domain the mailhostname is in. If there is no such domain, or it does not have DKIM configured, no reports are sent."`
 	OutgoingTLSReportsForAllSuccess bool  `sconf:"optional" sconf-doc:"Also send TLS reports if there were no SMTP STARTTLS connection failures. By default, reports are only sent when at least one failure occurred. If a report is sent, it does always include the successful connection counts as well."`
 	QuotaMessageSize                int64 `sconf:"optional" sconf-doc:"Default maximum total message size in bytes for each individual account, only applicable if greater than zero. Can be overridden per account. Attempting to add new messages to an account beyond its maximum total size will result in an error. Useful to prevent a single account from filling storage. The quota only applies to the email message files, not to any file system overhead and also not the message index database file (account for approximately 15% overhead)."`
+
+	Sieve *Sieve `sconf:"optional" sconf-doc:"Server-wide default policy for Sieve filtering. Can be overridden per-domain and per-account. If unset, Sieve is disabled by default."`
 
 	// All IPs that were explicitly listened on for external SMTP. Only set when there
 	// are no unspecified external SMTP listeners and there is at most one for IPv4 and
@@ -182,6 +216,11 @@ type Listener struct {
 		Port           int  `sconf:"optional" sconf-doc:"Default 993."`
 		EnabledOnHTTPS bool `sconf:"optional" sconf-doc:"Additionally enable IMAP on HTTPS port 443 via TLS ALPN. TLS Application Layer Protocol Negotiation allows clients to request a specific protocol from the server as part of the TLS connection setup. When this setting is enabled and a client requests the 'imap' protocol after TLS, it will be able to talk IMAP to Mox on port 443. This is meant to be useful as a censorship circumvention technique for Delta Chat."`
 	} `sconf:"optional" sconf-doc:"IMAP over TLS for reading email, by email applications. Requires a TLS config."`
+	ManageSieve struct {
+		Enabled           bool
+		Port              int  `sconf:"optional" sconf-doc:"Default 4190."`
+		NoRequireSTARTTLS bool `sconf:"optional" sconf-doc:"Do not require STARTTLS before authentication. Since users must login, this means passwords may be sent without encryption. Not recommended."`
+	} `sconf:"optional" sconf-doc:"ManageSieve (RFC 5804) for managing per-user Sieve filtering scripts. Starts out in plain text, can be upgraded to TLS with the STARTTLS command. Only useful when Sieve filtering is enabled (see Sieve in domains.conf)."`
 	AccountHTTP  WebService `sconf:"optional" sconf-doc:"Account web interface, for email users wanting to change their accounts, e.g. set new password, set new delivery rulesets. Default path is /."`
 	AccountHTTPS WebService `sconf:"optional" sconf-doc:"Account web interface listener like AccountHTTP, but for HTTPS. Requires a TLS config."`
 	AdminHTTP    WebService `sconf:"optional" sconf-doc:"Admin web interface, for managing domains, accounts, etc. Default path is /admin/. Preferably only enable on non-public IPs. Hint: use 'ssh -L 8080:localhost:80 you@yourmachine' and open http://localhost:8080/admin/, or set up a tunnel (e.g. WireGuard) and add its IP to the mox 'internal' listener."`
@@ -306,6 +345,7 @@ type Domain struct {
 	TLSRPT                      *TLSRPT          `sconf:"optional" sconf-doc:"With TLSRPT a domain specifies in DNS where reports about encountered SMTP TLS behaviour should be sent. Useful for monitoring. Incoming TLS reports are automatically parsed, validated, added to metrics and stored in the reporting database for later display in the admin web pages."`
 	Routes                      []Route          `sconf:"optional" sconf-doc:"Routes for delivering outgoing messages through the queue. Each delivery attempt evaluates account routes, these domain routes and finally global routes. The transport of the first matching route is used in the delivery attempt. If no routes match, which is the default with no configured routes, messages are delivered directly from the queue."`
 	Aliases                     map[string]Alias `sconf:"optional" sconf-doc:"Aliases that cause messages to be delivered to one or more locally configured addresses. Keys are localparts (encoded, as they appear in email addresses)."`
+	Sieve                       *Sieve           `sconf:"optional" sconf-doc:"Domain-level Sieve policy that overrides the server default."`
 
 	Domain                  dns.Domain `sconf:"-"`
 	ClientSettingsDNSDomain dns.Domain `sconf:"-" json:"-"`
@@ -457,6 +497,8 @@ type Account struct {
 	// We will not work around client incompatibilities based on client software. ../rfc/2971:93
 
 	Routes []Route `sconf:"optional" sconf-doc:"Routes for delivering outgoing messages through the queue. Each delivery attempt evaluates these account routes, domain routes and finally global routes. The transport of the first matching route is used in the delivery attempt. If no routes match, which is the default with no configured routes, messages are delivered directly from the queue."`
+
+	Sieve *Sieve `sconf:"optional" sconf-doc:"Account-level Sieve policy. Overrides the domain and server defaults."`
 
 	DNSDomain                  dns.Domain     `sconf:"-"` // Parsed form of Domain.
 	JunkMailbox                *regexp.Regexp `sconf:"-" json:"-"`

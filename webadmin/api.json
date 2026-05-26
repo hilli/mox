@@ -3530,6 +3530,14 @@
 					]
 				},
 				{
+					"Name": "Sieve",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"Sieve"
+					]
+				},
+				{
 					"Name": "Domain",
 					"Docs": "",
 					"Typewords": [
@@ -4073,6 +4081,86 @@
 			]
 		},
 		{
+			"Name": "Sieve",
+			"Docs": "Sieve is the policy for Sieve filtering. It can be configured at server, domain\nand account level, with the most specific level taking precedence. Booleans are\npointers so an explicit false at a more specific level can override an inherited\ntrue.",
+			"Fields": [
+				{
+					"Name": "Enabled",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				},
+				{
+					"Name": "MaxScriptSize",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "MaxScripts",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "MaxTotalScriptSize",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "ExecutionTimeout",
+					"Docs": "",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "MaxRedirects",
+					"Docs": "",
+					"Typewords": [
+						"int32"
+					]
+				},
+				{
+					"Name": "AutoCreateMailboxes",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				},
+				{
+					"Name": "RunOnDelivery",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				},
+				{
+					"Name": "RunOnIMAPEvents",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"bool"
+					]
+				},
+				{
+					"Name": "FailureMode",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
 			"Name": "Account",
 			"Docs": "",
 			"Fields": [
@@ -4235,6 +4323,14 @@
 					"Typewords": [
 						"[]",
 						"Route"
+					]
+				},
+				{
+					"Name": "Sieve",
+					"Docs": "",
+					"Typewords": [
+						"nullable",
+						"Sieve"
 					]
 				},
 				{

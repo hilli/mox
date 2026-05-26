@@ -930,6 +930,9 @@ var DBTypes = []any{
 	RulesetNoMailbox{},
 	Annotation{},
 	MessageErase{},
+	SieveScript{},
+	SieveSettings{},
+	SieveVacationResponse{},
 }
 
 // Account holds the information about a user, includings mailboxes, messages, imap subscriptions.

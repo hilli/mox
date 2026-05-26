@@ -11,6 +11,7 @@ import (
 	"maps"
 	"mime"
 	"net/textproto"
+	"os"
 	"slices"
 	"strings"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/moxio"
+	"github.com/mjl-/mox/sievefilter"
 	"github.com/mjl-/mox/store"
 )
 
@@ -291,6 +293,7 @@ func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
 
 	// ../rfc/9051:4432 We mark all messages that need it as seen at the end of the
 	// command, in a single transaction.
+	var sieveSeenMsgs []store.Message
 	if len(cmd.updateSeen) > 0 || len(cmd.newPreviews) > 0 {
 		c.account.WithWLock(func() {
 			changes := make([]store.Change, 0, len(cmd.updateSeen)+1)
@@ -331,6 +334,11 @@ func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
 					m.ModSeq = modseq
 					err = wtx.Update(&m)
 					xcheckf(err, "mark message as seen")
+
+					// Capture for IMAPSIEVE FLAG-cause execution after the
+					// FETCH response is complete. RFC 6785 §2.2.3 lists
+					// FETCH-caused \Seen as a flag-change event.
+					sieveSeenMsgs = append(sieveSeenMsgs, m)
 				}
 
 				changes = append(changes, mb.ChangeCounts())
@@ -370,6 +378,33 @@ func (c *conn) cmdxFetch(isUID bool, tag, cmdstr string, p *parser) {
 		c.xwriteresultf("%s OK [EXPUNGEISSUED] at least one message was expunged", tag)
 	} else {
 		c.ok(tag, cmdstr)
+	}
+
+	// RFC 6785: FETCH-induced \Seen flag changes trigger IMAPSIEVE FLAG-cause
+	// scripts. Done after the response is complete; the runIMAPSieve guard
+	// prevents recursion if the script itself sets flags.
+	if len(sieveSeenMsgs) > 0 {
+		// Look up the current mailbox name. Mailbox might have been renamed
+		// concurrently; the IMAPSIEVE metadata lookup uses the name, so
+		// re-read once.
+		var mailboxName string
+		c.account.DB.Read(context.TODO(), func(tx *bstore.Tx) error {
+			mb, err := store.MailboxID(tx, c.mailboxID)
+			if err == nil {
+				mailboxName = mb.Name
+			}
+			return nil
+		})
+		for i := range sieveSeenMsgs {
+			m := &sieveSeenMsgs[i]
+			f, err := os.Open(c.account.MessagePath(m.ID))
+			if err != nil {
+				c.log.Debugx("imapsieve open message for fetch seen event", err, slog.Int64("messageid", m.ID))
+				continue
+			}
+			c.runIMAPSieve(sievefilter.IMAPCauseFlag, mailboxName, m, f, []string{`\Seen`})
+			f.Close()
+		}
 	}
 }
 

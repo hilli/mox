@@ -1,0 +1,96 @@
+version: '3'
+
+# Taskfile for sieve-go. Install Task: https://taskfile.dev
+#
+# Common invocations:
+#   task           # default: vet + test
+#   task build     # compile everything
+#   task test      # go test ./...
+#   task cover     # coverage report per package
+#   task lint      # go vet + (optional) golangci-lint
+#   task example -- attachments
+#   task examples  # run every example once
+#   task tidy      # go mod tidy
+#   task clean     # remove built binaries and coverage artefacts
+
+vars:
+  COVER_OUT: '{{.ROOT_DIR}}/coverage.out'
+  COVER_HTML: '{{.ROOT_DIR}}/coverage.html'
+
+tasks:
+  default:
+    desc: Vet + test (the pre-commit baseline).
+    deps: [lint, test]
+
+  build:
+    desc: Compile all packages and examples.
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run all unit tests.
+    cmds:
+      - go test ./...
+
+  test:race:
+    desc: Run all unit tests with the race detector.
+    cmds:
+      - go test -race ./...
+
+  cover:
+    desc: Per-package coverage summary.
+    cmds:
+      - go test -cover ./...
+
+  cover:html:
+    desc: Generate an HTML coverage report at coverage.html.
+    cmds:
+      - go test -coverpkg=./... -coverprofile={{.COVER_OUT}} ./...
+      - go tool cover -html={{.COVER_OUT}} -o {{.COVER_HTML}}
+      - 'echo "Open: {{.COVER_HTML}}"'
+
+  lint:
+    desc: Static checks (go vet, plus golangci-lint when available).
+    cmds:
+      - go vet ./...
+      - |
+        if command -v golangci-lint >/dev/null 2>&1; then
+          golangci-lint run ./...
+        else
+          echo "golangci-lint not installed; skipping (install: https://golangci-lint.run)"
+        fi
+
+  fmt:
+    desc: gofmt -w on the whole tree.
+    cmds:
+      - gofmt -w .
+
+  tidy:
+    desc: go mod tidy.
+    cmds:
+      - go mod tidy
+
+  example:
+    desc: Run a single example, e.g. `task example -- attachments`.
+    cmds:
+      - 'go run ./examples/{{.CLI_ARGS}}'
+
+  examples:
+    desc: Run every example program once (validate reads from stdin).
+    cmds:
+      - go run ./examples/simple
+      - go run ./examples/attachments
+      - 'echo "keep;" | go run ./examples/validate'
+
+  clean:
+    desc: Remove build and coverage artefacts.
+    cmds:
+      - rm -f {{.COVER_OUT}} {{.COVER_HTML}}
+      - go clean ./...
+
+  ci:
+    desc: What CI should run.
+    cmds:
+      - task: lint
+      - task: test:race
+      - task: cover

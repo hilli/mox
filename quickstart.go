@@ -764,6 +764,7 @@ many authentication failures).
 	public.SMTP.Enabled = true
 	public.Submissions.Enabled = true
 	public.IMAPS.Enabled = true
+	public.ManageSieve.Enabled = true
 
 	if existingWebserver {
 		hostbase := filepath.FromSlash("path/to/" + dnshostname.Name())
@@ -887,6 +888,10 @@ and check the admin page for the needed DNS records.`)
 	sc.HostTLSRPT.Account = accountName
 	sc.HostTLSRPT.Localpart = "tlsreports"
 	sc.HostTLSRPT.Mailbox = "TLSRPT"
+
+	// Enable Sieve filtering by default.
+	sieveEnabled := true
+	sc.Sieve = &config.Sieve{Enabled: &sieveEnabled}
 
 	mox.ConfigStaticPath = filepath.FromSlash("config/mox.conf")
 	mox.ConfigDynamicPath = filepath.FromSlash("config/domains.conf")

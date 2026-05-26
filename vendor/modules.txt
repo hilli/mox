@@ -4,6 +4,28 @@ github.com/beorn7/perks/quantile
 # github.com/cespare/xxhash/v2 v2.2.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
+# github.com/hilli/sieve-go v0.0.0-20260521132353-c01be2fe8ea2
+## explicit; go 1.24
+github.com/hilli/sieve-go
+github.com/hilli/sieve-go/ast
+github.com/hilli/sieve-go/extensions/body
+github.com/hilli/sieve-go/extensions/editheader
+github.com/hilli/sieve-go/extensions/envelope
+github.com/hilli/sieve-go/extensions/fileinto
+github.com/hilli/sieve-go/extensions/imap4flags
+github.com/hilli/sieve-go/extensions/mime
+github.com/hilli/sieve-go/extensions/regex
+github.com/hilli/sieve-go/extensions/reject
+github.com/hilli/sieve-go/extensions/relational
+github.com/hilli/sieve-go/extensions/subaddress
+github.com/hilli/sieve-go/extensions/vacation
+github.com/hilli/sieve-go/extensions/variables
+github.com/hilli/sieve-go/interpreter
+github.com/hilli/sieve-go/lexer
+github.com/hilli/sieve-go/message
+github.com/hilli/sieve-go/parser
+github.com/hilli/sieve-go/registry
+github.com/hilli/sieve-go/token
 # github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0
 ## explicit; go 1.19
 github.com/matttproud/golang_protobuf_extensions/v2/pbutil

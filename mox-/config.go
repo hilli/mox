@@ -276,6 +276,26 @@ func (c *Config) Account(name string) (acc config.Account, ok bool) {
 	return
 }
 
+// SievePolicy returns the server, domain (if domain non-zero) and account
+// (if accountName non-empty) Sieve policy pointers, for inheritance resolution
+// by callers (e.g. sievefilter.Resolve). The returned pointers may be nil.
+func (c *Config) SievePolicy(accountName string, domain dns.Domain) (server, dom, acc *config.Sieve) {
+	c.withDynamicLock(func() {
+		server = c.Static.Sieve
+		if !domain.IsZero() {
+			if d, ok := c.Dynamic.Domains[domain.Name()]; ok {
+				dom = d.Sieve
+			}
+		}
+		if accountName != "" {
+			if a, ok := c.Dynamic.Accounts[accountName]; ok {
+				acc = a.Sieve
+			}
+		}
+	})
+	return
+}
+
 func (c *Config) AccountDestination(addr string) (accDest AccountDestination, alias *config.Alias, ok bool) {
 	c.withDynamicLock(func() {
 		accDest, ok = c.AccountDestinationsLocked[addr]

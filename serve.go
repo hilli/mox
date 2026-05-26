@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/mjl-/mox/dns"
 	"github.com/mjl-/mox/http"
 	"github.com/mjl-/mox/imapserver"
+	"github.com/mjl-/mox/managesieveserver"
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/mtastsdb"
@@ -56,6 +58,7 @@ func shutdown(log mlog.Log) {
 func start(mtastsdbRefresher, sendDMARCReports, sendTLSReports, skipForkExec bool) error {
 	smtpserver.Listen()
 	imapserver.Listen()
+	managesieveserver.Listen()
 	http.Listen()
 
 	if !skipForkExec {
@@ -102,11 +105,51 @@ func start(mtastsdbRefresher, sendDMARCReports, sendTLSReports, skipForkExec boo
 	store.StartAuthCache()
 	smtpserver.Serve()
 	imapserver.Serve()
+	managesieveserver.Serve()
 	http.Serve()
+
+	// Periodic Sieve vacation-response cleanup. Once per day, walk all
+	// accounts and delete vacation-response history older than 180 days.
+	// This bounds growth of the SieveVacationResponse table.
+	go sieveVacationCleaner()
 
 	go func() {
 		store.Switchboard()
 		<-make(chan struct{})
 	}()
 	return nil
+}
+
+// sieveVacationCleaner runs once a day and prunes old vacation-response rows
+// from each account database. It only runs for accounts that exist; opening
+// missing accounts is skipped.
+func sieveVacationCleaner() {
+	log := mlog.New("sievevacationcleaner", nil)
+	const keep = 180 * 24 * time.Hour
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	// Run once shortly after startup as well, in case mox is restarted often.
+	timer := time.NewTimer(5 * time.Minute)
+	for {
+		select {
+		case <-mox.Shutdown.Done():
+			return
+		case <-timer.C:
+		case <-t.C:
+		}
+		for _, accName := range mox.Conf.Accounts() {
+			acc, err := store.OpenAccount(log, accName, false)
+			if err != nil {
+				log.Debugx("opening account for vacation cleanup", err)
+				continue
+			}
+			n, err := acc.SieveVacationCleanupOlder(keep)
+			if err != nil {
+				log.Errorx("sieve vacation cleanup", err)
+			} else if n > 0 {
+				log.Info("sieve vacation cleanup", slog.String("account", accName), slog.Int("removed", n))
+			}
+			acc.Close()
+		}
+	}
 }

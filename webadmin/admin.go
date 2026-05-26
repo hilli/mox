@@ -1390,13 +1390,16 @@ When enabling MTA-STS, or updating a policy, always update the policy first (thr
 
 		// We'll assume if any submissions is configured, it is public. Same for imap. And
 		// if not, that there is a plain option.
-		var submissions, imaps bool
+		var submissions, imaps, managesieve bool
 		for _, l := range mox.Conf.Static.Listeners {
 			if l.TLS != nil && l.Submissions.Enabled {
 				submissions = true
 			}
 			if l.TLS != nil && l.IMAPS.Enabled {
 				imaps = true
+			}
+			if l.ManageSieve.Enabled {
+				managesieve = true
 			}
 		}
 		srvhost := func(ok bool) []string {
@@ -1416,6 +1419,7 @@ When enabling MTA-STS, or updating a policy, always update the policy first (thr
 			{name: "_submission", port: 587, host: srvhost(!submissions)},
 			{name: "_imaps", port: 993, host: srvhost(imaps)},
 			{name: "_imap", port: 143, host: srvhost(!imaps)},
+			{name: "_sieve", port: 4190, host: srvhost(managesieve)},
 			{name: "_pop3", port: 110, host: []string{"."}},
 			{name: "_pop3s", port: 995, host: []string{"."}},
 		}

@@ -267,6 +267,29 @@ func DomainRecords(domConf config.Domain, domain dns.Domain, hasDNSSEC bool, cer
 		"; For secure IMAP and submission autoconfig, point to mail host.",
 		fmt.Sprintf(`_imaps._tcp.%s.        SRV 0 1 993 %s.`, d, csd),
 		fmt.Sprintf(`_submissions._tcp.%s.  SRV 0 1 465 %s.`, d, csd),
+	)
+
+	// ManageSieve (RFC 5804). Advertise the SRV record only when ManageSieve is
+	// enabled on the public listener; otherwise emit a disabled SRV record.
+	managesieveEnabled := false
+	if public, ok := mox.Conf.Static.Listeners["public"]; ok && public.ManageSieve.Enabled {
+		managesieveEnabled = true
+	}
+	if managesieveEnabled {
+		records = append(records,
+			"",
+			"; For ManageSieve (RFC 5804), used by Sieve clients to manage filtering scripts.",
+			fmt.Sprintf(`_sieve._tcp.%s.        SRV 0 1 4190 %s.`, d, csd),
+		)
+	} else {
+		records = append(records,
+			"",
+			"; ManageSieve is not enabled on this server.",
+			fmt.Sprintf(`_sieve._tcp.%s.        SRV 0 0 0 .`, d),
+		)
+	}
+
+	records = append(records,
 		"",
 		// ../rfc/6186:242
 		"; Next records specify POP3 and non-TLS ports are not to be used.",

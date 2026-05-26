@@ -329,6 +329,19 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 				# technique for Delta Chat. (optional)
 				EnabledOnHTTPS: false
 
+			# ManageSieve (RFC 5804) for managing per-user Sieve filtering scripts. Starts out
+			# in plain text, can be upgraded to TLS with the STARTTLS command. Only useful
+			# when Sieve filtering is enabled (see Sieve in domains.conf). (optional)
+			ManageSieve:
+				Enabled: false
+
+				# Default 4190. (optional)
+				Port: 0
+
+				# Do not require STARTTLS before authentication. Since users must login, this
+				# means passwords may be sent without encryption. Not recommended. (optional)
+				NoRequireSTARTTLS: false
+
 			# Account web interface, for email users wanting to change their accounts, e.g.
 			# set new password, set new delivery rulesets. Default path is /. (optional)
 			AccountHTTP:
@@ -785,6 +798,48 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 	# (optional)
 	QuotaMessageSize: 0
 
+	# Server-wide default policy for Sieve filtering. Can be overridden per-domain and
+	# per-account. If unset, Sieve is disabled by default. (optional)
+	Sieve:
+
+		# If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the
+		# next higher scope decides; if no scope sets it, Sieve is disabled. (optional)
+		Enabled: false
+
+		# Maximum size in bytes of a single Sieve script. Default 32KB. (optional)
+		MaxScriptSize: 0
+
+		# Maximum number of scripts an account can have. Default 16. (optional)
+		MaxScripts: 0
+
+		# Maximum total size in bytes of all scripts for an account. Default 256KB.
+		# (optional)
+		MaxTotalScriptSize: 0
+
+		# Maximum time a single Sieve script may run on one message. Default 10s.
+		# (optional)
+		ExecutionTimeout: 0s
+
+		# Maximum number of redirect actions per script execution. Default 4. (optional)
+		MaxRedirects: 0
+
+		# If set, fileinto to a non-existent mailbox creates the mailbox. Default true.
+		# (optional)
+		AutoCreateMailboxes: false
+
+		# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
+		# (optional)
+		RunOnDelivery: false
+
+		# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
+		# false. (optional)
+		RunOnIMAPEvents: false
+
+		# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return
+		# temporary SMTP error, the default) or 'keep' (deliver to the default mailbox).
+		# (optional)
+		FailureMode:
+
 # domains.conf
 
 	# NOTE: This config file is in 'sconf' format. Indent with tabs. Comments must be
@@ -1029,6 +1084,47 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 					# If true, members are allowed to send messages with this alias address in the
 					# message From header. (optional)
 					AllowMsgFrom: false
+
+			# Domain-level Sieve policy that overrides the server default. (optional)
+			Sieve:
+
+				# If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the
+				# next higher scope decides; if no scope sets it, Sieve is disabled. (optional)
+				Enabled: false
+
+				# Maximum size in bytes of a single Sieve script. Default 32KB. (optional)
+				MaxScriptSize: 0
+
+				# Maximum number of scripts an account can have. Default 16. (optional)
+				MaxScripts: 0
+
+				# Maximum total size in bytes of all scripts for an account. Default 256KB.
+				# (optional)
+				MaxTotalScriptSize: 0
+
+				# Maximum time a single Sieve script may run on one message. Default 10s.
+				# (optional)
+				ExecutionTimeout: 0s
+
+				# Maximum number of redirect actions per script execution. Default 4. (optional)
+				MaxRedirects: 0
+
+				# If set, fileinto to a non-existent mailbox creates the mailbox. Default true.
+				# (optional)
+				AutoCreateMailboxes: false
+
+				# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
+				# (optional)
+				RunOnDelivery: false
+
+				# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
+				# false. (optional)
+				RunOnIMAPEvents: false
+
+				# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return
+				# temporary SMTP error, the default) or 'keep' (deliver to the default mailbox).
+				# (optional)
+				FailureMode:
 
 	# Accounts represent mox users, each with a password and email address(es) to
 	# which email can be delivered (possibly at different domains). Each account has
@@ -1351,6 +1447,47 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 					# for several times. (optional)
 					MinimumAttempts: 0
 					Transport:
+
+			# Account-level Sieve policy. Overrides the domain and server defaults. (optional)
+			Sieve:
+
+				# If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the
+				# next higher scope decides; if no scope sets it, Sieve is disabled. (optional)
+				Enabled: false
+
+				# Maximum size in bytes of a single Sieve script. Default 32KB. (optional)
+				MaxScriptSize: 0
+
+				# Maximum number of scripts an account can have. Default 16. (optional)
+				MaxScripts: 0
+
+				# Maximum total size in bytes of all scripts for an account. Default 256KB.
+				# (optional)
+				MaxTotalScriptSize: 0
+
+				# Maximum time a single Sieve script may run on one message. Default 10s.
+				# (optional)
+				ExecutionTimeout: 0s
+
+				# Maximum number of redirect actions per script execution. Default 4. (optional)
+				MaxRedirects: 0
+
+				# If set, fileinto to a non-existent mailbox creates the mailbox. Default true.
+				# (optional)
+				AutoCreateMailboxes: false
+
+				# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
+				# (optional)
+				RunOnDelivery: false
+
+				# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
+				# false. (optional)
+				RunOnIMAPEvents: false
+
+				# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return
+				# temporary SMTP error, the default) or 'keep' (deliver to the default mailbox).
+				# (optional)
+				FailureMode:
 
 	# Redirect all requests from domain (key) to domain (value). Always redirects to
 	# HTTPS. For plain HTTP redirects, use a WebHandler with a WebRedirect. (optional)

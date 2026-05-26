@@ -25,6 +25,7 @@ export interface Account {
 	NoCustomPassword: boolean
 	IMAPCapabilitiesDisabled?: string[] | null
 	Routes?: Route[] | null
+	Sieve?: Sieve | null
 	DNSDomain: Domain  // Parsed form of Domain.
 	Aliases?: AddressAlias[] | null
 }
@@ -100,6 +101,23 @@ export interface Route {
 	Transport: string
 	FromDomainASCII?: string[] | null
 	ToDomainASCII?: string[] | null
+}
+
+// Sieve is the policy for Sieve filtering. It can be configured at server, domain
+// and account level, with the most specific level taking precedence. Booleans are
+// pointers so an explicit false at a more specific level can override an inherited
+// true.
+export interface Sieve {
+	Enabled?: boolean | null
+	MaxScriptSize: number
+	MaxScripts: number
+	MaxTotalScriptSize: number
+	ExecutionTimeout: number
+	MaxRedirects: number
+	AutoCreateMailboxes?: boolean | null
+	RunOnDelivery?: boolean | null
+	RunOnIMAPEvents?: boolean | null
+	FailureMode: string
 }
 
 export interface AddressAlias {
@@ -293,11 +311,11 @@ export enum AuthResult {
 	AuthAborted = "aborted",
 }
 
-export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AutomaticJunkFlags":true,"Destination":true,"Domain":true,"ImportProgress":true,"Incoming":true,"IncomingMeta":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"NameAddress":true,"Outgoing":true,"OutgoingWebhook":true,"Route":true,"Ruleset":true,"Structure":true,"SubjectPass":true,"Suppression":true,"TLSPublicKey":true}
+export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AutomaticJunkFlags":true,"Destination":true,"Domain":true,"ImportProgress":true,"Incoming":true,"IncomingMeta":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"NameAddress":true,"Outgoing":true,"OutgoingWebhook":true,"Route":true,"Ruleset":true,"Sieve":true,"Structure":true,"SubjectPass":true,"Suppression":true,"TLSPublicKey":true}
 export const stringsTypes: {[typename: string]: boolean} = {"AuthResult":true,"CSRFToken":true,"Localpart":true,"OutgoingEvent":true}
 export const intsTypes: {[typename: string]: boolean} = {}
 export const types: TypenameMap = {
-	"Account": {"Name":"Account","Docs":"","Fields":[{"Name":"OutgoingWebhook","Docs":"","Typewords":["nullable","OutgoingWebhook"]},{"Name":"IncomingWebhook","Docs":"","Typewords":["nullable","IncomingWebhook"]},{"Name":"FromIDLoginAddresses","Docs":"","Typewords":["[]","string"]},{"Name":"KeepRetiredMessagePeriod","Docs":"","Typewords":["int64"]},{"Name":"KeepRetiredWebhookPeriod","Docs":"","Typewords":["int64"]},{"Name":"LoginDisabled","Docs":"","Typewords":["string"]},{"Name":"Domain","Docs":"","Typewords":["string"]},{"Name":"Description","Docs":"","Typewords":["string"]},{"Name":"FullName","Docs":"","Typewords":["string"]},{"Name":"Destinations","Docs":"","Typewords":["{}","Destination"]},{"Name":"SubjectPass","Docs":"","Typewords":["SubjectPass"]},{"Name":"QuotaMessageSize","Docs":"","Typewords":["int64"]},{"Name":"RejectsMailbox","Docs":"","Typewords":["string"]},{"Name":"KeepRejects","Docs":"","Typewords":["bool"]},{"Name":"AutomaticJunkFlags","Docs":"","Typewords":["AutomaticJunkFlags"]},{"Name":"JunkFilter","Docs":"","Typewords":["nullable","JunkFilter"]},{"Name":"MaxOutgoingMessagesPerDay","Docs":"","Typewords":["int32"]},{"Name":"MaxFirstTimeRecipientsPerDay","Docs":"","Typewords":["int32"]},{"Name":"NoFirstTimeSenderDelay","Docs":"","Typewords":["bool"]},{"Name":"NoCustomPassword","Docs":"","Typewords":["bool"]},{"Name":"IMAPCapabilitiesDisabled","Docs":"","Typewords":["[]","string"]},{"Name":"Routes","Docs":"","Typewords":["[]","Route"]},{"Name":"DNSDomain","Docs":"","Typewords":["Domain"]},{"Name":"Aliases","Docs":"","Typewords":["[]","AddressAlias"]}]},
+	"Account": {"Name":"Account","Docs":"","Fields":[{"Name":"OutgoingWebhook","Docs":"","Typewords":["nullable","OutgoingWebhook"]},{"Name":"IncomingWebhook","Docs":"","Typewords":["nullable","IncomingWebhook"]},{"Name":"FromIDLoginAddresses","Docs":"","Typewords":["[]","string"]},{"Name":"KeepRetiredMessagePeriod","Docs":"","Typewords":["int64"]},{"Name":"KeepRetiredWebhookPeriod","Docs":"","Typewords":["int64"]},{"Name":"LoginDisabled","Docs":"","Typewords":["string"]},{"Name":"Domain","Docs":"","Typewords":["string"]},{"Name":"Description","Docs":"","Typewords":["string"]},{"Name":"FullName","Docs":"","Typewords":["string"]},{"Name":"Destinations","Docs":"","Typewords":["{}","Destination"]},{"Name":"SubjectPass","Docs":"","Typewords":["SubjectPass"]},{"Name":"QuotaMessageSize","Docs":"","Typewords":["int64"]},{"Name":"RejectsMailbox","Docs":"","Typewords":["string"]},{"Name":"KeepRejects","Docs":"","Typewords":["bool"]},{"Name":"AutomaticJunkFlags","Docs":"","Typewords":["AutomaticJunkFlags"]},{"Name":"JunkFilter","Docs":"","Typewords":["nullable","JunkFilter"]},{"Name":"MaxOutgoingMessagesPerDay","Docs":"","Typewords":["int32"]},{"Name":"MaxFirstTimeRecipientsPerDay","Docs":"","Typewords":["int32"]},{"Name":"NoFirstTimeSenderDelay","Docs":"","Typewords":["bool"]},{"Name":"NoCustomPassword","Docs":"","Typewords":["bool"]},{"Name":"IMAPCapabilitiesDisabled","Docs":"","Typewords":["[]","string"]},{"Name":"Routes","Docs":"","Typewords":["[]","Route"]},{"Name":"Sieve","Docs":"","Typewords":["nullable","Sieve"]},{"Name":"DNSDomain","Docs":"","Typewords":["Domain"]},{"Name":"Aliases","Docs":"","Typewords":["[]","AddressAlias"]}]},
 	"OutgoingWebhook": {"Name":"OutgoingWebhook","Docs":"","Fields":[{"Name":"URL","Docs":"","Typewords":["string"]},{"Name":"Authorization","Docs":"","Typewords":["string"]},{"Name":"Events","Docs":"","Typewords":["[]","string"]}]},
 	"IncomingWebhook": {"Name":"IncomingWebhook","Docs":"","Fields":[{"Name":"URL","Docs":"","Typewords":["string"]},{"Name":"Authorization","Docs":"","Typewords":["string"]}]},
 	"Destination": {"Name":"Destination","Docs":"","Fields":[{"Name":"Mailbox","Docs":"","Typewords":["string"]},{"Name":"Rulesets","Docs":"","Typewords":["[]","Ruleset"]},{"Name":"SMTPError","Docs":"","Typewords":["string"]},{"Name":"MessageAuthRequiredSMTPError","Docs":"","Typewords":["string"]},{"Name":"FullName","Docs":"","Typewords":["string"]}]},
@@ -307,6 +325,7 @@ export const types: TypenameMap = {
 	"AutomaticJunkFlags": {"Name":"AutomaticJunkFlags","Docs":"","Fields":[{"Name":"Enabled","Docs":"","Typewords":["bool"]},{"Name":"JunkMailboxRegexp","Docs":"","Typewords":["string"]},{"Name":"NeutralMailboxRegexp","Docs":"","Typewords":["string"]},{"Name":"NotJunkMailboxRegexp","Docs":"","Typewords":["string"]}]},
 	"JunkFilter": {"Name":"JunkFilter","Docs":"","Fields":[{"Name":"Threshold","Docs":"","Typewords":["float64"]},{"Name":"Onegrams","Docs":"","Typewords":["bool"]},{"Name":"Twograms","Docs":"","Typewords":["bool"]},{"Name":"Threegrams","Docs":"","Typewords":["bool"]},{"Name":"MaxPower","Docs":"","Typewords":["float64"]},{"Name":"TopWords","Docs":"","Typewords":["int32"]},{"Name":"IgnoreWords","Docs":"","Typewords":["float64"]},{"Name":"RareWords","Docs":"","Typewords":["int32"]}]},
 	"Route": {"Name":"Route","Docs":"","Fields":[{"Name":"FromDomain","Docs":"","Typewords":["[]","string"]},{"Name":"ToDomain","Docs":"","Typewords":["[]","string"]},{"Name":"MinimumAttempts","Docs":"","Typewords":["int32"]},{"Name":"Transport","Docs":"","Typewords":["string"]},{"Name":"FromDomainASCII","Docs":"","Typewords":["[]","string"]},{"Name":"ToDomainASCII","Docs":"","Typewords":["[]","string"]}]},
+	"Sieve": {"Name":"Sieve","Docs":"","Fields":[{"Name":"Enabled","Docs":"","Typewords":["nullable","bool"]},{"Name":"MaxScriptSize","Docs":"","Typewords":["int64"]},{"Name":"MaxScripts","Docs":"","Typewords":["int32"]},{"Name":"MaxTotalScriptSize","Docs":"","Typewords":["int64"]},{"Name":"ExecutionTimeout","Docs":"","Typewords":["int64"]},{"Name":"MaxRedirects","Docs":"","Typewords":["int32"]},{"Name":"AutoCreateMailboxes","Docs":"","Typewords":["nullable","bool"]},{"Name":"RunOnDelivery","Docs":"","Typewords":["nullable","bool"]},{"Name":"RunOnIMAPEvents","Docs":"","Typewords":["nullable","bool"]},{"Name":"FailureMode","Docs":"","Typewords":["string"]}]},
 	"AddressAlias": {"Name":"AddressAlias","Docs":"","Fields":[{"Name":"SubscriptionAddress","Docs":"","Typewords":["string"]},{"Name":"Alias","Docs":"","Typewords":["Alias"]},{"Name":"MemberAddresses","Docs":"","Typewords":["[]","string"]}]},
 	"Alias": {"Name":"Alias","Docs":"","Fields":[{"Name":"Addresses","Docs":"","Typewords":["[]","string"]},{"Name":"PostPublic","Docs":"","Typewords":["bool"]},{"Name":"ListMembers","Docs":"","Typewords":["bool"]},{"Name":"AllowMsgFrom","Docs":"","Typewords":["bool"]},{"Name":"LocalpartStr","Docs":"","Typewords":["string"]},{"Name":"Domain","Docs":"","Typewords":["Domain"]},{"Name":"ParsedAddresses","Docs":"","Typewords":["[]","AliasAddress"]}]},
 	"AliasAddress": {"Name":"AliasAddress","Docs":"","Fields":[{"Name":"Address","Docs":"","Typewords":["Address"]},{"Name":"AccountName","Docs":"","Typewords":["string"]},{"Name":"Destination","Docs":"","Typewords":["Destination"]}]},
@@ -337,6 +356,7 @@ export const parser = {
 	AutomaticJunkFlags: (v: any) => parse("AutomaticJunkFlags", v) as AutomaticJunkFlags,
 	JunkFilter: (v: any) => parse("JunkFilter", v) as JunkFilter,
 	Route: (v: any) => parse("Route", v) as Route,
+	Sieve: (v: any) => parse("Sieve", v) as Sieve,
 	AddressAlias: (v: any) => parse("AddressAlias", v) as AddressAlias,
 	Alias: (v: any) => parse("Alias", v) as Alias,
 	AliasAddress: (v: any) => parse("AliasAddress", v) as AliasAddress,

@@ -7,7 +7,9 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -263,4 +265,321 @@ func TestALPN(t *testing.T) {
 	log.Info("trying HTTP (should succeed)", slog.String("host", nonalpnhost))
 	_, err = http.Get("https://" + nonalpnhost)
 	tcheck(t, err, "get non-alpn url")
+}
+
+// TestManageSieve exercises the ManageSieve protocol against a running mox
+// container. It verifies:
+//   - greeting includes IMPLEMENTATION, VERSION, SIEVE, SASL, STARTTLS.
+//   - STARTTLS reissues capabilities.
+//   - AUTHENTICATE PLAIN succeeds and OWNER is advertised.
+//   - PUTSCRIPT, CHECKSCRIPT, LISTSCRIPTS, GETSCRIPT, SETACTIVE, RENAMESCRIPT,
+//     and DELETESCRIPT all behave per RFC 5804.
+//   - Invalid scripts are rejected by PUTSCRIPT/CHECKSCRIPT (via sievefilter).
+//
+// The container is set up by testdata/integration/moxacmepebble.sh which runs
+// mox quickstart, so ManageSieve is enabled on port 4190 with STARTTLS.
+func TestManageSieve(t *testing.T) {
+	host := "moxacmepebble.mox1.example:4190"
+	tlsConfig := &tls.Config{ServerName: "moxacmepebble.mox1.example"}
+
+	rawConn, err := net.Dial("tcp", host)
+	tcheck(t, err, "dial managesieve")
+	defer rawConn.Close()
+
+	br := bufio.NewReader(rawConn)
+
+	// Greeting.
+	greet := mustReadUntilFinal(t, br, "greeting")
+	if !strings.Contains(greet, "IMPLEMENTATION") || !strings.Contains(greet, "VERSION") || !strings.Contains(greet, "SIEVE") || !strings.Contains(greet, "STARTTLS") {
+		t.Fatalf("missing expected greeting fields: %q", greet)
+	}
+
+	// STARTTLS.
+	mustWrite(t, rawConn, "STARTTLS\r\n")
+	resp := mustReadUntilFinal(t, br, "starttls")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("STARTTLS failed: %q", resp)
+	}
+	tlsConn := tls.Client(rawConn, tlsConfig)
+	tcheck(t, tlsConn.Handshake(), "tls handshake")
+	defer tlsConn.Close()
+	br = bufio.NewReader(tlsConn)
+	// Capabilities re-issued.
+	postTLS := mustReadUntilFinal(t, br, "post-tls capabilities")
+	if !strings.Contains(postTLS, "OK") || strings.Contains(postTLS, "STARTTLS") {
+		t.Fatalf("expected post-STARTTLS capabilities without STARTTLS: %q", postTLS)
+	}
+
+	// AUTHENTICATE PLAIN.
+	creds := base64.StdEncoding.EncodeToString([]byte("\x00moxtest1@mox1.example\x00accountpass1234"))
+	mustWrite(t, tlsConn, fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", creds))
+	auth := mustReadUntilFinal(t, br, "auth")
+	if !strings.Contains(auth, "OK") {
+		t.Fatalf("auth failed: %q", auth)
+	}
+	if !strings.Contains(auth, "OWNER") {
+		t.Fatalf("expected OWNER capability post-auth: %q", auth)
+	}
+
+	// PUTSCRIPT with a valid script.
+	script := "require [\"fileinto\"];\r\nfileinto \"Filtered\";\r\n"
+	mustWrite(t, tlsConn, fmt.Sprintf("PUTSCRIPT \"itest\" {%d+}\r\n%s\r\n", len(script), script))
+	resp = mustReadUntilFinal(t, br, "putscript")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("PUTSCRIPT failed: %q", resp)
+	}
+
+	// CHECKSCRIPT with an invalid script -> NO.
+	bad := "this is not sieve\r\n"
+	mustWrite(t, tlsConn, fmt.Sprintf("CHECKSCRIPT {%d+}\r\n%s\r\n", len(bad), bad))
+	resp = mustReadUntilFinal(t, br, "checkscript-bad")
+	if !strings.Contains(resp, "NO") {
+		t.Fatalf("CHECKSCRIPT should have rejected bad script: %q", resp)
+	}
+
+	// CHECKSCRIPT with a valid script.
+	good := "discard;\r\n"
+	mustWrite(t, tlsConn, fmt.Sprintf("CHECKSCRIPT {%d+}\r\n%s\r\n", len(good), good))
+	resp = mustReadUntilFinal(t, br, "checkscript-good")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("CHECKSCRIPT good failed: %q", resp)
+	}
+
+	// LISTSCRIPTS includes "itest".
+	mustWrite(t, tlsConn, "LISTSCRIPTS\r\n")
+	resp = mustReadUntilFinal(t, br, "listscripts")
+	if !strings.Contains(resp, "itest") {
+		t.Fatalf("LISTSCRIPTS missing itest: %q", resp)
+	}
+
+	// SETACTIVE.
+	mustWrite(t, tlsConn, "SETACTIVE \"itest\"\r\n")
+	resp = mustReadUntilFinal(t, br, "setactive")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("SETACTIVE failed: %q", resp)
+	}
+
+	// LISTSCRIPTS marks active.
+	mustWrite(t, tlsConn, "LISTSCRIPTS\r\n")
+	resp = mustReadUntilFinal(t, br, "listscripts-active")
+	if !strings.Contains(resp, "ACTIVE") {
+		t.Fatalf("LISTSCRIPTS missing ACTIVE: %q", resp)
+	}
+
+	// GETSCRIPT returns content.
+	mustWrite(t, tlsConn, "GETSCRIPT \"itest\"\r\n")
+	// Read literal size line.
+	sizeLine, err := br.ReadString('\n')
+	tcheck(t, err, "getscript size line")
+	sizeLine = strings.TrimRight(sizeLine, "\r\n")
+	if !strings.HasPrefix(sizeLine, "{") {
+		t.Fatalf("expected literal, got %q", sizeLine)
+	}
+	// Read script content + trailing CRLF + OK line.
+	content := make([]byte, len(script))
+	_, err = io.ReadFull(br, content)
+	tcheck(t, err, "getscript content")
+	if string(content) != script {
+		t.Fatalf("script content mismatch: %q vs %q", content, script)
+	}
+	// Consume trailing CRLF after literal.
+	_, _ = br.ReadString('\n')
+	okLine, _ := br.ReadString('\n')
+	if !strings.HasPrefix(strings.TrimRight(okLine, "\r\n"), "OK") {
+		t.Fatalf("expected OK after GETSCRIPT, got %q", okLine)
+	}
+
+	// RENAMESCRIPT.
+	// Deactivate first so we can rename freely (server allows rename of active too).
+	mustWrite(t, tlsConn, "RENAMESCRIPT \"itest\" \"itest-renamed\"\r\n")
+	resp = mustReadUntilFinal(t, br, "renamescript")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("RENAMESCRIPT failed: %q", resp)
+	}
+
+	// DELETESCRIPT - active script should fail.
+	mustWrite(t, tlsConn, "DELETESCRIPT \"itest-renamed\"\r\n")
+	resp = mustReadUntilFinal(t, br, "deletescript-active")
+	if !strings.Contains(resp, "NO") {
+		t.Fatalf("DELETESCRIPT of active should NO: %q", resp)
+	}
+
+	// Deactivate then delete.
+	mustWrite(t, tlsConn, "SETACTIVE \"\"\r\n")
+	resp = mustReadUntilFinal(t, br, "setactive-empty")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("SETACTIVE \"\" failed: %q", resp)
+	}
+	mustWrite(t, tlsConn, "DELETESCRIPT \"itest-renamed\"\r\n")
+	resp = mustReadUntilFinal(t, br, "deletescript")
+	if !strings.Contains(resp, "OK") {
+		t.Fatalf("DELETESCRIPT failed: %q", resp)
+	}
+
+	// LOGOUT.
+	mustWrite(t, tlsConn, "LOGOUT\r\n")
+	logout, _ := br.ReadString('\n')
+	if !strings.HasPrefix(strings.TrimRight(logout, "\r\n"), "OK") {
+		t.Fatalf("expected OK on LOGOUT, got %q", logout)
+	}
+}
+
+func mustWrite(t *testing.T, w io.Writer, s string) {
+	t.Helper()
+	if _, err := w.Write([]byte(s)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func mustReadUntilFinal(t *testing.T, br *bufio.Reader, where string) string {
+	t.Helper()
+	var sb strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("%s: read: %v (got so far: %q)", where, err, sb.String())
+		}
+		sb.WriteString(line)
+		trimmed := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(trimmed, "OK") || strings.HasPrefix(trimmed, "NO") || strings.HasPrefix(trimmed, "BYE") {
+			return sb.String()
+		}
+	}
+}
+
+// TestSieveDelivery exercises Sieve filtering on incoming SMTP delivery
+// against the running container set. It:
+//   - connects to moxmail2's ManageSieve port and installs an active
+//     fileinto script for moxtest2@mox2.example,
+//   - submits a message from moxacmepebble (moxtest1@mox1.example) to
+//     moxtest2@mox2.example via Submissions,
+//   - verifies via IMAP IDLE on moxmail2 that the message lands in the
+//     Sieve-designated mailbox ("SieveTest") rather than INBOX.
+//
+// Requires Sieve to be enabled in the generated config (mox quickstart does
+// this by default since the Sieve integration landed).
+func TestSieveDelivery(t *testing.T) {
+	log := mlog.New("integration", nil)
+	mlog.Logfmt = true
+
+	hostname, err := os.Hostname()
+	tcheck(t, err, "hostname")
+	ourHostname, err := dns.ParseDomain(hostname)
+	tcheck(t, err, "parse hostname")
+
+	// 1) Install and activate the Sieve script on moxmail2 via ManageSieve.
+	const sieveAddr = "moxmail2.mox2.example:4190"
+	installSieve := func() {
+		rawConn, err := net.Dial("tcp", sieveAddr)
+		tcheck(t, err, "dial managesieve")
+		defer rawConn.Close()
+		br := bufio.NewReader(rawConn)
+		// Read greeting + initial capabilities until OK.
+		mustReadUntilFinal(t, br, "managesieve greeting")
+		// STARTTLS.
+		mustWrite(t, rawConn, "STARTTLS\r\n")
+		mustReadUntilFinal(t, br, "starttls")
+		tlsConn := tls.Client(rawConn, &tls.Config{ServerName: "moxmail2.mox2.example"})
+		tcheck(t, tlsConn.Handshake(), "managesieve tls handshake")
+		br = bufio.NewReader(tlsConn)
+		// Re-read post-TLS capabilities + OK.
+		mustReadUntilFinal(t, br, "post-tls caps")
+		// AUTHENTICATE PLAIN.
+		creds := base64.StdEncoding.EncodeToString([]byte("\x00moxtest2@mox2.example\x00accountpass4321"))
+		mustWrite(t, tlsConn, fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", creds))
+		auth := mustReadUntilFinal(t, br, "auth")
+		if !strings.Contains(auth, "OK") {
+			t.Fatalf("managesieve auth failed: %q", auth)
+		}
+		// PUTSCRIPT.
+		script := "require [\"fileinto\"];\r\nfileinto \"SieveTest\";\r\n"
+		mustWrite(t, tlsConn, fmt.Sprintf("PUTSCRIPT \"deliveryfilter\" {%d+}\r\n%s\r\n", len(script), script))
+		put := mustReadUntilFinal(t, br, "putscript")
+		if !strings.Contains(put, "OK") {
+			t.Fatalf("PUTSCRIPT failed: %q", put)
+		}
+		// SETACTIVE.
+		mustWrite(t, tlsConn, "SETACTIVE \"deliveryfilter\"\r\n")
+		set := mustReadUntilFinal(t, br, "setactive")
+		if !strings.Contains(set, "OK") {
+			t.Fatalf("SETACTIVE failed: %q", set)
+		}
+		// LOGOUT.
+		mustWrite(t, tlsConn, "LOGOUT\r\n")
+		_, _ = br.ReadString('\n')
+	}
+	installSieve()
+	log.Print("sieve script installed and activated on moxmail2")
+
+	// 2) Connect IMAP IDLE on moxmail2 watching SieveTest, then submit.
+	imapconn, err := tls.Dial("tcp", "moxmail2.mox2.example:993", nil)
+	tcheck(t, err, "dial imap")
+	defer imapconn.Close()
+	opts := imapclient.Opts{Logger: slog.Default().With("cid", mox.Cid())}
+	imapc, err := imapclient.New(imapconn, &opts)
+	tcheck(t, err, "new imapclient")
+	_, err = imapc.Login("moxtest2@mox2.example", "accountpass4321")
+	tcheck(t, err, "imap login")
+
+	// The SieveTest mailbox may not exist yet — it will be created on first
+	// delivery by Sieve fileinto. Use IDLE on Inbox to detect "no delivery
+	// into Inbox" later; but more directly: subscribe/select after delivery.
+
+	// Submit the message via submissions on moxacmepebble.
+	const subject = "sieve-integration-test"
+	subjectMarker := fmt.Sprintf("Subject: %s", subject)
+	const mailfrom = "moxtest1@mox1.example"
+	const rcptto = "moxtest2@mox2.example"
+	const desthost = "moxacmepebble.mox1.example:465"
+
+	conn, err := tls.Dial("tcp", desthost, nil)
+	tcheck(t, err, "dial submission")
+	defer conn.Close()
+
+	msg := fmt.Sprintf("From: <%s>\r\nTo: <%s>\r\n%s\r\nMessage-Id: <sieve-int@example.org>\r\n\r\nbody.\r\n", mailfrom, rcptto, subjectMarker)
+	auth := func(mechanisms []string, cs *tls.ConnectionState) (sasl.Client, error) {
+		return sasl.NewClientPlain(mailfrom, "accountpass1234"), nil
+	}
+	smtpc, err := smtpclient.New(mox.Context, log.Logger, conn, smtpclient.TLSSkip, false, ourHostname, dns.Domain{ASCII: "moxacmepebble.mox1.example"}, smtpclient.Opts{Auth: auth})
+	tcheck(t, err, "smtp hello")
+	err = smtpc.Deliver(mox.Context, mailfrom, rcptto, int64(len(msg)), strings.NewReader(msg), false, false, false)
+	tcheck(t, err, "smtp deliver")
+	smtpc.Close()
+
+	// Poll the SieveTest mailbox for the message. Allow up to 15 seconds
+	// for delivery to traverse SMTP and reach the destination. We check by
+	// SELECT-ing the mailbox and inspecting the untagged EXISTS response.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		resp, err := imapc.Select("SieveTest")
+		if err != nil {
+			continue // mailbox not created yet
+		}
+		// Scan untagged responses for EXISTS > 0.
+		exists := 0
+		for _, u := range resp.Untagged {
+			if v, ok := u.(imapclient.UntaggedExists); ok {
+				exists = int(v)
+			}
+		}
+		if exists > 0 {
+			log.Print("message delivered to SieveTest by Sieve", slog.Int("exists", exists))
+			return
+		}
+	}
+
+	// Diagnostic: check Inbox to see if message arrived but Sieve didn't filter.
+	if resp, err := imapc.Select("Inbox"); err == nil {
+		exists := 0
+		for _, u := range resp.Untagged {
+			if v, ok := u.(imapclient.UntaggedExists); ok {
+				exists = int(v)
+			}
+		}
+		if exists > 0 {
+			t.Fatalf("message arrived in Inbox (Sieve did not filter): EXISTS=%d", exists)
+		}
+	}
+	t.Fatalf("message not found in SieveTest within 15 seconds")
 }

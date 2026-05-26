@@ -24,6 +24,7 @@ const (
 	Import           Panic = "import"
 	Serve            Panic = "serve"
 	Imapserver       Panic = "imapserver"
+	Managesieveserver Panic = "managesieveserver"
 	Dmarcdb          Panic = "dmarcdb"
 	Mtastsdb         Panic = "mtastsdb"
 	Queue            Panic = "queue"

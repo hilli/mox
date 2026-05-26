@@ -77,6 +77,7 @@ import (
 	"github.com/mjl-/mox/moxvar"
 	"github.com/mjl-/mox/ratelimit"
 	"github.com/mjl-/mox/scram"
+	"github.com/mjl-/mox/sievefilter"
 	"github.com/mjl-/mox/store"
 )
 
@@ -252,6 +253,11 @@ type conn struct {
 	uidnext   store.UID   // We don't return search/fetch/etc results for uids >= uidnext, which is updated when applying changes.
 	exists    uint32      // Needed for uidonly, equal to len(uids) for non-uidonly sessions.
 	uids      []store.UID // UIDs known in this session, sorted. todo future: store more space-efficiently, as ranges.
+
+	// inSieve is set while a Sieve-driven action (e.g. fileinto, redirect, mark
+	// deleted, or flag update) is being applied. When true, IMAPSIEVE hooks
+	// must not fire again, satisfying RFC 6785 §2.2.3 and §6 loop prevention.
+	inSieve bool
 }
 
 // capability for use with ENABLED and CAPABILITY. We always keep this upper case,
@@ -2417,6 +2423,9 @@ func (c *conn) capabilities() string {
 	if c.tls && len(c.conn.(*tls.Conn).ConnectionState().PeerCertificates) > 0 && !c.viaHTTPS && !c.noTLSClientAuth {
 		caps += " AUTH=EXTERNAL"
 	}
+	if tok := sieveCapabilityToken(); tok != "" {
+		caps += " " + tok
+	}
 	return caps
 }
 
@@ -4258,6 +4267,16 @@ func (c *conn) cmdAppend(tag, cmd string, p *parser) {
 		uidset = fmt.Sprintf("%d:%d", appends[0].m.UID, appends[len(appends)-1].m.UID)
 	}
 	c.xwriteresultf("%s OK [APPENDUID %d %s] appended", tag, mb.UIDValidity, uidset)
+
+	// RFC 6785 IMAPSIEVE: run the active script (if any) for each appended
+	// message after the response has been written. Errors are logged and do
+	// not affect the client's APPEND result.
+	for _, a := range appends {
+		if a.file == nil {
+			continue
+		}
+		c.runIMAPSieve(sievefilter.IMAPCauseAppend, name, &a.m, a.file, nil)
+	}
 }
 
 // Idle makes a client wait until the server sends untagged updates, e.g. about
@@ -4703,6 +4722,9 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 	var keywords [][]string
 	var modseq store.ModSeq // For messages in new mailbox, assigned when first message is copied.
 
+	// Captured for post-response IMAPSIEVE evaluation.
+	var sieveNewMsgs []store.Message
+
 	c.account.WithWLock(func() {
 
 		c.xdbwrite(func(tx *bstore.Tx) {
@@ -4848,6 +4870,9 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, nmsgs)
 			xcheckf(err, "train copied messages")
+
+			// Capture for IMAPSIEVE after the response is written.
+			sieveNewMsgs = append([]store.Message(nil), nmsgs...)
 		})
 
 		newIDs = nil
@@ -4877,6 +4902,18 @@ func (c *conn) cmdxCopy(isUID bool, tag, cmd string, p *parser) {
 
 	// ../rfc/9051:6881 ../rfc/4315:183
 	c.xwriteresultf("%s OK [COPYUID %d %s %s] copied", tag, mbDst.UIDValidity, compactUIDSet(uids).String(), compactUIDSet(newUIDs).String())
+
+	// RFC 6785: run IMAPSIEVE for each newly inserted message (COPY cause).
+	for i := range sieveNewMsgs {
+		m := &sieveNewMsgs[i]
+		f, err := os.Open(c.account.MessagePath(m.ID))
+		if err != nil {
+			c.log.Debugx("imapsieve open message for copy event", err, slog.Int64("messageid", m.ID))
+			continue
+		}
+		c.runIMAPSieve(sievefilter.IMAPCauseCopy, name, m, f, nil)
+		f.Close()
+	}
 }
 
 // Move moves messages from the currently selected/active mailbox to a named mailbox.
@@ -4914,6 +4951,10 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 		}
 	}()
 
+	// Captured for post-response IMAPSIEVE evaluation (MOVE destination
+	// creation is treated as a COPY-like event per our design).
+	var sieveMovedIDs []int64
+
 	c.account.WithWLock(func() {
 		var changes []store.Change
 
@@ -4947,6 +4988,7 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 			newIDs, chl := c.xmoveMessages(tx, q, len(uids), modseq, &mbSrc, &mbDst)
 			changes = append(changes, chl...)
 			cleanupIDs = newIDs
+			sieveMovedIDs = append([]int64(nil), newIDs...)
 		})
 
 		cleanupIDs = nil
@@ -4988,6 +5030,23 @@ func (c *conn) cmdxMove(isUID bool, tag, cmd string, p *parser) {
 		c.xwriteresultf("%s OK [HIGHESTMODSEQ %d] move", tag, modseq.Client())
 	} else {
 		c.ok(tag, cmd)
+	}
+
+	// RFC 6785: for MOVE we treat the destination message creation as a
+	// COPY-like event (Mox-defined behaviour; not strictly RFC-required).
+	for _, id := range sieveMovedIDs {
+		m := store.Message{ID: id}
+		if err := c.account.DB.Get(context.TODO(), &m); err != nil {
+			c.log.Debugx("imapsieve load moved message", err, slog.Int64("messageid", id))
+			continue
+		}
+		f, err := os.Open(c.account.MessagePath(m.ID))
+		if err != nil {
+			c.log.Debugx("imapsieve open moved message file", err, slog.Int64("messageid", id))
+			continue
+		}
+		c.runIMAPSieve(sievefilter.IMAPCauseCopy, name, &m, f, nil)
+		f.Close()
 	}
 }
 
@@ -5201,6 +5260,25 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 	var modseq store.ModSeq     // Assigned when needed.
 	modified := map[int64]bool{}
 
+	// For IMAPSIEVE FLAG-cause execution after the STORE completes.
+	var sieveModifiedMsgs []store.Message
+	sieveChangedFlags := append([]string(nil), flagstrs...)
+
+	// Run IMAPSIEVE on STORE-modified messages once the command response has
+	// been written. RFC 6785 §2.2.3: the script sees flags AFTER the change.
+	defer func() {
+		for i := range sieveModifiedMsgs {
+			m := &sieveModifiedMsgs[i]
+			f, err := os.Open(c.account.MessagePath(m.ID))
+			if err != nil {
+				c.log.Debugx("imapsieve open message for store event", err, slog.Int64("messageid", m.ID))
+				continue
+			}
+			c.runIMAPSieve(sievefilter.IMAPCauseFlag, mb.Name, m, f, sieveChangedFlags)
+			f.Close()
+		}
+	}()
+
 	c.account.WithWLock(func() {
 		var mbKwChanged bool
 		var changes []store.Change
@@ -5314,6 +5392,13 @@ func (c *conn) cmdxStore(isUID bool, tag, cmd string, p *parser) {
 
 			err = c.account.RetrainMessages(context.TODO(), c.log, tx, updated)
 			xcheckf(err, "training messages")
+
+			// Capture modified messages for IMAPSIEVE FLAG-cause execution.
+			for _, m := range updated {
+				if modified[m.ID] {
+					sieveModifiedMsgs = append(sieveModifiedMsgs, m)
+				}
+			}
 		})
 
 		c.broadcast(changes)
