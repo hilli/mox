@@ -193,7 +193,9 @@ func (c *Conn) recover(rerr *error, resp *Response) {
 		if r, ok := (*rerr).(Response); ok && resp != nil {
 			*resp = r
 		}
-		c.errHandle(*rerr)
+		if c.errHandle != nil {
+			c.errHandle(*rerr)
+		}
 		return
 	}
 

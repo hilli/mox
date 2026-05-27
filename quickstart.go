@@ -46,7 +46,7 @@ import (
 var moxService string
 
 func cmdQuickstart(c *cmd) {
-	c.params = "[-skipdial] [-existing-webserver] [-hostname host] user@domain [user | uid]"
+	c.params = "[-skipdial] [-skipdns] [-existing-webserver] [-hostname host] user@domain [user | uid]"
 	c.help = `Quickstart generates configuration files and prints instructions to quickly set up a mox instance.
 
 Quickstart writes configuration files, prints initial admin and account
@@ -85,9 +85,11 @@ output of "mox config describe-domains" and see the output of
 	var existingWebserver bool
 	var hostname string
 	var skipDial bool
+	var skipDNS bool
 	c.flag.BoolVar(&existingWebserver, "existing-webserver", false, "use if a webserver is already running, so mox won't listen on port 80 and 443; you'll have to provide tls certificates/keys, and configure the existing webserver as reverse proxy, forwarding requests to mox.")
 	c.flag.StringVar(&hostname, "hostname", "", "hostname mox will run on, by default the hostname of the machine quickstart runs on; if specified, the IPs for the hostname are configured for the public listener")
 	c.flag.BoolVar(&skipDial, "skipdial", false, "skip check for outgoing smtp (port 25) connectivity or for domain age with rdap")
+	c.flag.BoolVar(&skipDNS, "skipdns", false, "skip DNS-related checks like DNSSEC resolver validation; for testing environments")
 	args := c.Parse()
 	if len(args) != 1 && len(args) != 2 {
 		c.Usage()
@@ -189,14 +191,15 @@ logging in with IMAP.
 	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer resolveCancel()
 
-	// Some DNSSEC-verifying resolvers return unauthentic data for ".", so we check "com".
-	fmt.Printf("Checking if DNS resolvers are DNSSEC-verifying...")
-	_, resolverDNSSECResult, err := resolver.LookupNS(resolveCtx, "com.")
-	if err != nil {
-		fmt.Println("")
-		fatalf("checking dnssec support in resolver: %v", err)
-	} else if !resolverDNSSECResult.Authentic {
-		fmt.Printf(`
+	if !skipDNS {
+		// Some DNSSEC-verifying resolvers return unauthentic data for ".", so we check "com".
+		fmt.Printf("Checking if DNS resolvers are DNSSEC-verifying...")
+		_, resolverDNSSECResult, err := resolver.LookupNS(resolveCtx, "com.")
+		if err != nil {
+			fmt.Println("")
+			fatalf("checking dnssec support in resolver: %v", err)
+		} else if !resolverDNSSECResult.Authentic {
+			fmt.Printf(`
 
 WARNING: It looks like the DNS resolvers configured on your system do not
 verify DNSSEC, or aren't trusted (by having loopback IPs or through "options
@@ -234,8 +237,9 @@ Troubleshooting hints:
 - Increase logging in unbound, see options "verbosity" and "log-queries".
 
 `)
-	} else {
-		fmt.Println(" OK")
+		} else {
+			fmt.Println(" OK")
+		}
 	}
 
 	// We are going to find the (public) IPs to listen on and possibly the host name.
