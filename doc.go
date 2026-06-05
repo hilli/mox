@@ -20,11 +20,18 @@ any parameters. Followed by the help and usage information for each command.
 
 	mox [-config config/mox.conf] [-pedantic] ...
 	mox serve
-	mox quickstart [-skipdial] [-existing-webserver] [-hostname host] user@domain [user | uid]
+	mox quickstart [-skipdial] [-skipdns] [-existing-webserver] [-hostname host] user@domain [user | uid]
 	mox stop
 	mox setaccountpassword account
 	mox setadminpassword
 	mox loglevels [level [pkg]]
+	mox sieve list account
+	mox sieve get account name
+	mox sieve put account name < script
+	mox sieve rm account name
+	mox sieve rename account oldname newname
+	mox sieve activate account name
+	mox sieve deactivate account
 	mox queue holdrules list
 	mox queue holdrules add [ruleflags]
 	mox queue holdrules remove ruleid
@@ -183,13 +190,15 @@ traffic to your existing backend applications. Look for "WebHandlers:" in the
 output of "mox config describe-domains" and see the output of
 "mox config example webhandlers".
 
-	usage: mox quickstart [-skipdial] [-existing-webserver] [-hostname host] user@domain [user | uid]
+	usage: mox quickstart [-skipdial] [-skipdns] [-existing-webserver] [-hostname host] user@domain [user | uid]
 	  -existing-webserver
 	    	use if a webserver is already running, so mox won't listen on port 80 and 443; you'll have to provide tls certificates/keys, and configure the existing webserver as reverse proxy, forwarding requests to mox.
 	  -hostname string
 	    	hostname mox will run on, by default the hostname of the machine quickstart runs on; if specified, the IPs for the hostname are configured for the public listener
 	  -skipdial
 	    	skip check for outgoing smtp (port 25) connectivity or for domain age with rdap
+	  -skipdns
+	    	skip DNS-related checks like DNSSEC resolver validation; for testing environments
 
 # mox stop
 
@@ -241,6 +250,57 @@ Specify a pkg and an empty level to clear the configured level for a package.
 Valid labels: error, info, debug, trace, traceauth, tracedata.
 
 	usage: mox loglevels [level [pkg]]
+
+# mox sieve list
+
+List sieve scripts for an account.
+
+Prints a line per script with name, size, whether it is active, and the
+created and last-updated timestamps.
+
+	usage: mox sieve list account
+
+# mox sieve get
+
+Print the sieve script with the given name for an account to stdout.
+
+	usage: mox sieve get account name
+
+# mox sieve put
+
+Store a sieve script for an account, reading the script from stdin.
+
+The script is validated before being stored. If a script with the same name
+already exists, it is replaced. Any non-fatal warnings from validation are
+printed to stderr.
+
+	usage: mox sieve put account name < script
+
+# mox sieve rm
+
+Remove the sieve script with the given name for an account.
+
+The active script cannot be removed; deactivate it first.
+
+	usage: mox sieve rm account name
+
+# mox sieve rename
+
+Rename a sieve script for an account.
+
+	usage: mox sieve rename account oldname newname
+
+# mox sieve activate
+
+Activate the sieve script with the given name for an account.
+
+	usage: mox sieve activate account name
+
+# mox sieve deactivate
+
+Deactivate the currently active sieve script for an account.
+
+	usage: mox sieve deactivate account
 
 # mox queue holdrules list
 

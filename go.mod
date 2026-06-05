@@ -3,6 +3,7 @@ module github.com/mjl-/mox
 go 1.25.0
 
 require (
+	github.com/hilli/sieve-go v0.0.0-20260521132353-c01be2fe8ea2
 	github.com/mjl-/adns v0.0.0-20250321173553-ab04b05bdfea
 	github.com/mjl-/autocert v0.0.0-20250321204043-abab2b936e31
 	github.com/mjl-/bstore v0.0.10
@@ -24,7 +25,6 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/hilli/sieve-go v0.0.0-20260521132353-c01be2fe8ea2 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/mjl-/sherpats v0.0.6 // indirect
 	github.com/mjl-/xfmt v0.0.2 // indirect

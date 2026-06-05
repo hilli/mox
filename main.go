@@ -108,6 +108,13 @@ var commands = []struct {
 	{"setaccountpassword", cmdSetaccountpassword},
 	{"setadminpassword", cmdSetadminpassword},
 	{"loglevels", cmdLoglevels},
+	{"sieve list", cmdSieveList},
+	{"sieve get", cmdSieveGet},
+	{"sieve put", cmdSievePut},
+	{"sieve rm", cmdSieveRemove},
+	{"sieve rename", cmdSieveRename},
+	{"sieve activate", cmdSieveActivate},
+	{"sieve deactivate", cmdSieveDeactivate},
 	{"queue holdrules list", cmdQueueHoldrulesList},
 	{"queue holdrules add", cmdQueueHoldrulesAdd},
 	{"queue holdrules remove", cmdQueueHoldrulesRemove},
@@ -1196,6 +1203,160 @@ func cmdConfigTlspubkeyRemove(c *cmd) {
 func ctlcmdConfigTlspubkeyRemove(ctl *ctl, fingerprint string) {
 	ctl.xwrite("tlspubkeyrm")
 	ctl.xwrite(fingerprint)
+	ctl.xreadok()
+}
+
+func cmdSieveList(c *cmd) {
+	c.params = "account"
+	c.help = `List sieve scripts for an account.
+
+Prints a line per script with name, size, whether it is active, and the
+created and last-updated timestamps.
+`
+	args := c.Parse()
+	if len(args) != 1 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveList(xctl(), args[0])
+}
+
+func ctlcmdSieveList(ctl *ctl, account string) {
+	ctl.xwrite("sievelist")
+	ctl.xwrite(account)
+	ctl.xreadok()
+	ctl.xstreamto(os.Stdout)
+}
+
+func cmdSieveGet(c *cmd) {
+	c.params = "account name"
+	c.help = `Print the sieve script with the given name for an account to stdout.`
+	args := c.Parse()
+	if len(args) != 2 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveGet(xctl(), args[0], args[1])
+}
+
+func ctlcmdSieveGet(ctl *ctl, account, name string) {
+	ctl.xwrite("sieveget")
+	ctl.xwrite(account)
+	ctl.xwrite(name)
+	ctl.xreadok()
+	ctl.xstreamto(os.Stdout)
+}
+
+func cmdSievePut(c *cmd) {
+	c.params = "account name < script"
+	c.help = `Store a sieve script for an account, reading the script from stdin.
+
+The script is validated before being stored. If a script with the same name
+already exists, it is replaced. Any non-fatal warnings from validation are
+printed to stderr.
+`
+	args := c.Parse()
+	if len(args) != 2 {
+		c.Usage()
+	}
+
+	buf, err := io.ReadAll(os.Stdin)
+	xcheckf(err, "reading script from stdin")
+
+	mustLoadConfig()
+	ctlcmdSievePut(xctl(), args[0], args[1], buf)
+}
+
+func ctlcmdSievePut(ctl *ctl, account, name string, script []byte) {
+	ctl.xwrite("sieveput")
+	ctl.xwrite(account)
+	ctl.xwrite(name)
+	ctl.xstreamfrom(bytes.NewReader(script))
+	ctl.xreadok()
+	warnings := ctl.xread()
+	if warnings != "" {
+		fmt.Fprintln(os.Stderr, warnings)
+	}
+}
+
+func cmdSieveRemove(c *cmd) {
+	c.params = "account name"
+	c.help = `Remove the sieve script with the given name for an account.
+
+The active script cannot be removed; deactivate it first.
+`
+	args := c.Parse()
+	if len(args) != 2 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveRemove(xctl(), args[0], args[1])
+}
+
+func ctlcmdSieveRemove(ctl *ctl, account, name string) {
+	ctl.xwrite("sieverm")
+	ctl.xwrite(account)
+	ctl.xwrite(name)
+	ctl.xreadok()
+}
+
+func cmdSieveRename(c *cmd) {
+	c.params = "account oldname newname"
+	c.help = `Rename a sieve script for an account.`
+	args := c.Parse()
+	if len(args) != 3 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveRename(xctl(), args[0], args[1], args[2])
+}
+
+func ctlcmdSieveRename(ctl *ctl, account, oldName, newName string) {
+	ctl.xwrite("sieverename")
+	ctl.xwrite(account)
+	ctl.xwrite(oldName)
+	ctl.xwrite(newName)
+	ctl.xreadok()
+}
+
+func cmdSieveActivate(c *cmd) {
+	c.params = "account name"
+	c.help = `Activate the sieve script with the given name for an account.`
+	args := c.Parse()
+	if len(args) != 2 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveActivate(xctl(), args[0], args[1])
+}
+
+func ctlcmdSieveActivate(ctl *ctl, account, name string) {
+	ctl.xwrite("sieveactivate")
+	ctl.xwrite(account)
+	ctl.xwrite(name)
+	ctl.xreadok()
+}
+
+func cmdSieveDeactivate(c *cmd) {
+	c.params = "account"
+	c.help = `Deactivate the currently active sieve script for an account.`
+	args := c.Parse()
+	if len(args) != 1 {
+		c.Usage()
+	}
+
+	mustLoadConfig()
+	ctlcmdSieveDeactivate(xctl(), args[0])
+}
+
+func ctlcmdSieveDeactivate(ctl *ctl, account string) {
+	ctl.xwrite("sievedeactivate")
+	ctl.xwrite(account)
 	ctl.xreadok()
 }
 

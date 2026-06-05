@@ -743,8 +743,156 @@
 			"Returns": []
 		},
 		{
+			"Name": "AccountSieveScripts",
+			"Docs": "AccountSieveScripts returns the Sieve scripts stored for an account, ordered by\nname, along with the name of the active script (empty string if none). The\nscript content is not included; use AccountSieveScript to fetch it.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "scripts",
+					"Typewords": [
+						"[]",
+						"SieveScript"
+					]
+				},
+				{
+					"Name": "active",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AccountSieveScript",
+			"Docs": "AccountSieveScript returns the content of the named Sieve script for an account.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "name",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "content",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AccountSievePutScript",
+			"Docs": "AccountSievePutScript stores a Sieve script for an account, creating it or\nreplacing an existing script with the same name. The script name and content\nare validated and checked against the account's Sieve quota. Any validation\nwarnings are returned.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "name",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "content",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": [
+				{
+					"Name": "warnings",
+					"Typewords": [
+						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "AccountSieveDeleteScript",
+			"Docs": "AccountSieveDeleteScript deletes the named Sieve script for an account. The\nactive script cannot be deleted; deactivate it first with AccountSieveSetActive.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "name",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AccountSieveRenameScript",
+			"Docs": "AccountSieveRenameScript renames a Sieve script for an account. Fails if a\nscript with the new name already exists.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "oldName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "newName",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
+			"Name": "AccountSieveSetActive",
+			"Docs": "AccountSieveSetActive sets the active Sieve script for an account. An empty\nname deactivates the currently active script, leaving no active script.",
+			"Params": [
+				{
+					"Name": "accountName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "name",
+					"Typewords": [
+						"string"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
 			"Name": "ClientConfigsDomain",
-			"Docs": "ClientConfigsDomain returns configurations for email clients, IMAP and\nSubmission (SMTP) for the domain.",
+			"Docs": "",
 			"Params": [
 				{
 					"Name": "domain",
@@ -5397,6 +5545,47 @@
 					"Typewords": [
 						"[]",
 						"string"
+					]
+				}
+			]
+		},
+		{
+			"Name": "SieveScript",
+			"Docs": "SieveScript is the metadata of a Sieve script stored for an account. The\nscript content is not included; use AccountSieveScript to fetch it.",
+			"Fields": [
+				{
+					"Name": "Name",
+					"Docs": "",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "Size",
+					"Docs": "Size of the script content in bytes.",
+					"Typewords": [
+						"int64"
+					]
+				},
+				{
+					"Name": "Active",
+					"Docs": "Whether this is the active script.",
+					"Typewords": [
+						"bool"
+					]
+				},
+				{
+					"Name": "Created",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
+					]
+				},
+				{
+					"Name": "Updated",
+					"Docs": "",
+					"Typewords": [
+						"timestamp"
 					]
 				}
 			]

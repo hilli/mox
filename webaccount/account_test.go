@@ -559,6 +559,74 @@ func TestAccount(t *testing.T) {
 	account, _, _, _ = api.Account(ctx)
 	tcompare(t, account.IMAPCapabilitiesDisabled, []string{})
 
+	// Sieve scripts.
+	scripts, active := api.SieveScripts(ctx)
+	tcompare(t, len(scripts), 0)
+	tcompare(t, active, "")
+
+	warnings := api.SievePutScript(ctx, "first", "keep;")
+	tcompare(t, warnings, "")
+	api.SievePutScript(ctx, "second", "discard;")
+
+	scripts, active = api.SieveScripts(ctx)
+	tcompare(t, len(scripts), 2)
+	tcompare(t, active, "")
+
+	content := api.SieveScript(ctx, "first")
+	tcompare(t, content, "keep;")
+
+	// Empty content and invalid name are user errors.
+	tneedErrorCode(t, "user:error", func() { api.SievePutScript(ctx, "third", "") })
+	tneedErrorCode(t, "user:error", func() { api.SievePutScript(ctx, "bad\nname", "keep;") })
+
+	// Invalid sieve syntax is a user error and the script is not stored.
+	tneedErrorCode(t, "user:error", func() { api.SievePutScript(ctx, "third", "not_a_command;") })
+	tneedErrorCode(t, "user:error", func() { api.SieveScript(ctx, "third") })
+
+	// Getting an absent script is a user error.
+	tneedErrorCode(t, "user:error", func() { api.SieveScript(ctx, "absent") })
+
+	api.SieveSetActive(ctx, "first")
+	scripts, active = api.SieveScripts(ctx)
+	tcompare(t, active, "first")
+	for _, s := range scripts {
+		tcompare(t, s.Active, s.Name == "first")
+	}
+
+	// Renaming the active script moves the active reference along with it.
+	api.SieveRenameScript(ctx, "first", "firstrenamed")
+	_, active = api.SieveScripts(ctx)
+	tcompare(t, active, "firstrenamed")
+	tneedErrorCode(t, "user:error", func() { api.SieveScript(ctx, "first") })
+	content = api.SieveScript(ctx, "firstrenamed")
+	tcompare(t, content, "keep;")
+	api.SieveRenameScript(ctx, "firstrenamed", "first")
+	_, active = api.SieveScripts(ctx)
+	tcompare(t, active, "first")
+
+	// The active script cannot be deleted.
+	tneedErrorCode(t, "user:error", func() { api.SieveDeleteScript(ctx, "first") })
+
+	// Rename to an existing name fails, to a new name succeeds.
+	tneedErrorCode(t, "user:error", func() { api.SieveRenameScript(ctx, "second", "first") })
+	tneedErrorCode(t, "user:error", func() { api.SieveRenameScript(ctx, "absent", "renamed") })
+	api.SieveRenameScript(ctx, "second", "third")
+	scripts, _ = api.SieveScripts(ctx)
+	tcompare(t, len(scripts), 2)
+
+	// Setting an absent script active is a user error.
+	tneedErrorCode(t, "user:error", func() { api.SieveSetActive(ctx, "absent") })
+
+	// Deactivate, then the previously active script can be deleted.
+	api.SieveSetActive(ctx, "")
+	_, active = api.SieveScripts(ctx)
+	tcompare(t, active, "")
+	api.SieveDeleteScript(ctx, "first")
+	tneedErrorCode(t, "user:error", func() { api.SieveDeleteScript(ctx, "absent") })
+	api.SieveDeleteScript(ctx, "third")
+	scripts, _ = api.SieveScripts(ctx)
+	tcompare(t, len(scripts), 0)
+
 	api.Logout(ctx)
 	tneedErrorCode(t, "server:error", func() { api.Logout(ctx) })
 }

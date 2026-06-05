@@ -31,6 +31,7 @@ import (
 	"github.com/mjl-/mox/mlog"
 	"github.com/mjl-/mox/mox-"
 	"github.com/mjl-/mox/queue"
+	"github.com/mjl-/mox/sievefilter"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/store"
 	"github.com/mjl-/mox/webapi"
@@ -310,6 +311,18 @@ func xparseJSON(xctl *ctl, s string, v any) {
 	dec.DisallowUnknownFields()
 	err := dec.Decode(v)
 	xctl.xcheck(err, "parsing from ctl as json")
+}
+
+// ctlSievePolicy resolves the effective Sieve policy (quota limits) for an
+// account, mirroring the resolution done by the ManageSieve server and the
+// admin API.
+func ctlSievePolicy(accountName string) sievefilter.Policy {
+	var domain dns.Domain
+	if accConf, ok := mox.Conf.Account(accountName); ok {
+		domain = accConf.DNSDomain
+	}
+	server, dom, acc := mox.Conf.SievePolicy(accountName, domain)
+	return sievefilter.Resolve(server, dom, acc)
 }
 
 func servectlcmd(ctx context.Context, xctl *ctl, cid int64, shutdown func()) {
@@ -1201,6 +1214,164 @@ func servectlcmd(ctx context.Context, xctl *ctl, cid int64, shutdown func()) {
 		fp := xctl.xread()
 		err := store.TLSPublicKeyRemove(ctx, fp)
 		xctl.xcheck(err, "removing tls public key")
+		xctl.xwriteok()
+
+	case "sievelist":
+		/* protocol:
+		> "sievelist"
+		> account
+		< "ok" or error
+		< stream: per script a line "name\tsize\tactive\tcreated\tupdated", preceded by a "# ..." header
+		*/
+		account := xctl.xread()
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		list, active, err := acc.SieveListScripts()
+		xctl.xcheck(err, "listing sieve scripts")
+		xctl.xwriteok()
+		xw := xctl.writer()
+		fmt.Fprintf(xw, "# name\tsize\tactive\tcreated\tupdated\n")
+		for _, s := range list {
+			fmt.Fprintf(xw, "%s\t%d\t%v\t%s\t%s\n", s.Name, len(s.Content), s.Name == active, s.Created.UTC().Format(time.RFC3339Nano), s.Updated.UTC().Format(time.RFC3339Nano))
+		}
+		xw.xclose()
+
+	case "sieveget":
+		/* protocol:
+		> "sieveget"
+		> account
+		> name
+		< "ok" or error
+		< stream (script content)
+		*/
+		account := xctl.xread()
+		name := xctl.xread()
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		buf, err := acc.SieveGetScript(name)
+		xctl.xcheck(err, "get sieve script")
+		xctl.xwriteok()
+		xctl.xstreamfrom(bytes.NewReader(buf))
+
+	case "sieveput":
+		/* protocol:
+		> "sieveput"
+		> account
+		> name
+		> stream (script content)
+		< "ok" or error
+		< warnings (single line, may be empty)
+		*/
+		account := xctl.xread()
+		name := xctl.xread()
+		var b bytes.Buffer
+		xctl.xstreamto(&b)
+		content := b.Bytes()
+		err := store.CheckSieveScriptName(name)
+		xctl.xcheck(err, "checking script name")
+		if len(content) == 0 {
+			xctl.xcheck(fmt.Errorf("script is empty"), "checking script")
+		}
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		p := ctlSievePolicy(account)
+		err = acc.SieveCheckQuota(name, int64(len(content)), p.MaxScripts, p.MaxScriptSize, p.MaxTotalScriptSize)
+		xctl.xcheck(err, "checking sieve quota")
+		warnings, err := sievefilter.Validate(content)
+		xctl.xcheck(err, "validating sieve script")
+		err = acc.SievePutScript(name, content)
+		xctl.xcheck(err, "storing sieve script")
+		xctl.xwriteok()
+		xctl.xwrite(warnings)
+
+	case "sieverm":
+		/* protocol:
+		> "sieverm"
+		> account
+		> name
+		< "ok" or error
+		*/
+		account := xctl.xread()
+		name := xctl.xread()
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		err = acc.SieveDeleteScript(name)
+		xctl.xcheck(err, "deleting sieve script")
+		xctl.xwriteok()
+
+	case "sieverename":
+		/* protocol:
+		> "sieverename"
+		> account
+		> oldname
+		> newname
+		< "ok" or error
+		*/
+		account := xctl.xread()
+		oldName := xctl.xread()
+		newName := xctl.xread()
+		err := store.CheckSieveScriptName(newName)
+		xctl.xcheck(err, "checking new script name")
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		err = acc.SieveRenameScript(oldName, newName)
+		xctl.xcheck(err, "renaming sieve script")
+		xctl.xwriteok()
+
+	case "sieveactivate":
+		/* protocol:
+		> "sieveactivate"
+		> account
+		> name
+		< "ok" or error
+		*/
+		account := xctl.xread()
+		name := xctl.xread()
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		err = acc.SieveSetActive(name)
+		xctl.xcheck(err, "activating sieve script")
+		xctl.xwriteok()
+
+	case "sievedeactivate":
+		/* protocol:
+		> "sievedeactivate"
+		> account
+		< "ok" or error
+		*/
+		account := xctl.xread()
+		acc, err := store.OpenAccount(xctl.log, account, false)
+		xctl.xcheck(err, "open account")
+		defer func() {
+			err := acc.Close()
+			xctl.log.Check(err, "close account")
+		}()
+		err = acc.SieveSetActive("")
+		xctl.xcheck(err, "deactivating sieve script")
 		xctl.xwriteok()
 
 	case "addressadd":

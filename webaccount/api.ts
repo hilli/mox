@@ -264,6 +264,16 @@ export interface LoginAttempt {
 	Result: AuthResult
 }
 
+// SieveScript is the metadata of a Sieve script stored for the account. The
+// script content is not included; use SieveScript to fetch it.
+export interface SieveScript {
+	Name: string
+	Size: number  // Size of the script content in bytes.
+	Active: boolean  // Whether this is the active script.
+	Created: Date
+	Updated: Date
+}
+
 export type CSRFToken = string
 
 // Localpart is a decoded local part of an email address, before the "@".
@@ -311,7 +321,7 @@ export enum AuthResult {
 	AuthAborted = "aborted",
 }
 
-export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AutomaticJunkFlags":true,"Destination":true,"Domain":true,"ImportProgress":true,"Incoming":true,"IncomingMeta":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"NameAddress":true,"Outgoing":true,"OutgoingWebhook":true,"Route":true,"Ruleset":true,"Sieve":true,"Structure":true,"SubjectPass":true,"Suppression":true,"TLSPublicKey":true}
+export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AutomaticJunkFlags":true,"Destination":true,"Domain":true,"ImportProgress":true,"Incoming":true,"IncomingMeta":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"NameAddress":true,"Outgoing":true,"OutgoingWebhook":true,"Route":true,"Ruleset":true,"Sieve":true,"SieveScript":true,"Structure":true,"SubjectPass":true,"Suppression":true,"TLSPublicKey":true}
 export const stringsTypes: {[typename: string]: boolean} = {"AuthResult":true,"CSRFToken":true,"Localpart":true,"OutgoingEvent":true}
 export const intsTypes: {[typename: string]: boolean} = {}
 export const types: TypenameMap = {
@@ -339,6 +349,7 @@ export const types: TypenameMap = {
 	"IncomingMeta": {"Name":"IncomingMeta","Docs":"","Fields":[{"Name":"MsgID","Docs":"","Typewords":["int64"]},{"Name":"MailFrom","Docs":"","Typewords":["string"]},{"Name":"MailFromValidated","Docs":"","Typewords":["bool"]},{"Name":"MsgFromValidated","Docs":"","Typewords":["bool"]},{"Name":"RcptTo","Docs":"","Typewords":["string"]},{"Name":"DKIMVerifiedDomains","Docs":"","Typewords":["[]","string"]},{"Name":"RemoteIP","Docs":"","Typewords":["string"]},{"Name":"Received","Docs":"","Typewords":["timestamp"]},{"Name":"MailboxName","Docs":"","Typewords":["string"]},{"Name":"Automated","Docs":"","Typewords":["bool"]}]},
 	"TLSPublicKey": {"Name":"TLSPublicKey","Docs":"","Fields":[{"Name":"Fingerprint","Docs":"","Typewords":["string"]},{"Name":"Created","Docs":"","Typewords":["timestamp"]},{"Name":"Type","Docs":"","Typewords":["string"]},{"Name":"Name","Docs":"","Typewords":["string"]},{"Name":"NoIMAPPreauth","Docs":"","Typewords":["bool"]},{"Name":"CertDER","Docs":"","Typewords":["nullable","string"]},{"Name":"Account","Docs":"","Typewords":["string"]},{"Name":"LoginAddress","Docs":"","Typewords":["string"]}]},
 	"LoginAttempt": {"Name":"LoginAttempt","Docs":"","Fields":[{"Name":"Key","Docs":"","Typewords":["nullable","string"]},{"Name":"Last","Docs":"","Typewords":["timestamp"]},{"Name":"First","Docs":"","Typewords":["timestamp"]},{"Name":"Count","Docs":"","Typewords":["int64"]},{"Name":"AccountName","Docs":"","Typewords":["string"]},{"Name":"LoginAddress","Docs":"","Typewords":["string"]},{"Name":"RemoteIP","Docs":"","Typewords":["string"]},{"Name":"LocalIP","Docs":"","Typewords":["string"]},{"Name":"TLS","Docs":"","Typewords":["string"]},{"Name":"TLSPubKeyFingerprint","Docs":"","Typewords":["string"]},{"Name":"Protocol","Docs":"","Typewords":["string"]},{"Name":"UserAgent","Docs":"","Typewords":["string"]},{"Name":"AuthMech","Docs":"","Typewords":["string"]},{"Name":"Result","Docs":"","Typewords":["AuthResult"]}]},
+	"SieveScript": {"Name":"SieveScript","Docs":"","Fields":[{"Name":"Name","Docs":"","Typewords":["string"]},{"Name":"Size","Docs":"","Typewords":["int64"]},{"Name":"Active","Docs":"","Typewords":["bool"]},{"Name":"Created","Docs":"","Typewords":["timestamp"]},{"Name":"Updated","Docs":"","Typewords":["timestamp"]}]},
 	"CSRFToken": {"Name":"CSRFToken","Docs":"","Values":null},
 	"Localpart": {"Name":"Localpart","Docs":"","Values":null},
 	"OutgoingEvent": {"Name":"OutgoingEvent","Docs":"","Values":[{"Name":"EventDelivered","Value":"delivered","Docs":""},{"Name":"EventSuppressed","Value":"suppressed","Docs":""},{"Name":"EventDelayed","Value":"delayed","Docs":""},{"Name":"EventFailed","Value":"failed","Docs":""},{"Name":"EventRelayed","Value":"relayed","Docs":""},{"Name":"EventExpanded","Value":"expanded","Docs":""},{"Name":"EventCanceled","Value":"canceled","Docs":""},{"Name":"EventUnrecognized","Value":"unrecognized","Docs":""}]},
@@ -370,6 +381,7 @@ export const parser = {
 	IncomingMeta: (v: any) => parse("IncomingMeta", v) as IncomingMeta,
 	TLSPublicKey: (v: any) => parse("TLSPublicKey", v) as TLSPublicKey,
 	LoginAttempt: (v: any) => parse("LoginAttempt", v) as LoginAttempt,
+	SieveScript: (v: any) => parse("SieveScript", v) as SieveScript,
 	CSRFToken: (v: any) => parse("CSRFToken", v) as CSRFToken,
 	Localpart: (v: any) => parse("Localpart", v) as Localpart,
 	OutgoingEvent: (v: any) => parse("OutgoingEvent", v) as OutgoingEvent,
@@ -688,6 +700,68 @@ export class Client {
 		const paramTypes: string[][] = [["[]","string"]]
 		const returnTypes: string[][] = []
 		const params: any[] = [capabilitiesDisabled]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
+	// SieveScripts returns the Sieve scripts stored for the account, ordered by name,
+	// along with the name of the active script (empty string if none). The script
+	// content is not included; use SieveScript to fetch it.
+	async SieveScripts(): Promise<[SieveScript[] | null, string]> {
+		const fn: string = "SieveScripts"
+		const paramTypes: string[][] = []
+		const returnTypes: string[][] = [["[]","SieveScript"],["string"]]
+		const params: any[] = []
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as [SieveScript[] | null, string]
+	}
+
+	// SieveScript returns the content of the named Sieve script for the account.
+	async SieveScript(name: string): Promise<string> {
+		const fn: string = "SieveScript"
+		const paramTypes: string[][] = [["string"]]
+		const returnTypes: string[][] = [["string"]]
+		const params: any[] = [name]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as string
+	}
+
+	// SievePutScript stores a Sieve script for the account, creating it or replacing
+	// an existing script with the same name. The script name and content are
+	// validated and checked against the account's Sieve quota. Any validation
+	// warnings are returned.
+	async SievePutScript(name: string, content: string): Promise<string> {
+		const fn: string = "SievePutScript"
+		const paramTypes: string[][] = [["string"],["string"]]
+		const returnTypes: string[][] = [["string"]]
+		const params: any[] = [name, content]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as string
+	}
+
+	// SieveDeleteScript deletes the named Sieve script for the account. The active
+	// script cannot be deleted; deactivate it first with SieveSetActive.
+	async SieveDeleteScript(name: string): Promise<void> {
+		const fn: string = "SieveDeleteScript"
+		const paramTypes: string[][] = [["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [name]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
+	// SieveRenameScript renames a Sieve script for the account. Fails if a script
+	// with the new name already exists.
+	async SieveRenameScript(oldName: string, newName: string): Promise<void> {
+		const fn: string = "SieveRenameScript"
+		const paramTypes: string[][] = [["string"],["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [oldName, newName]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
+	// SieveSetActive sets the active Sieve script for the account. An empty name
+	// deactivates the currently active script, leaving no active script.
+	async SieveSetActive(name: string): Promise<void> {
+		const fn: string = "SieveSetActive"
+		const paramTypes: string[][] = [["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [name]
 		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
 	}
 }

@@ -62,6 +62,7 @@ import (
 	"github.com/mjl-/mox/mtastsdb"
 	"github.com/mjl-/mox/publicsuffix"
 	"github.com/mjl-/mox/queue"
+	"github.com/mjl-/mox/sievefilter"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/spf"
 	"github.com/mjl-/mox/store"
@@ -2062,8 +2063,173 @@ func (Admin) AccountLoginDisabledSave(ctx context.Context, accountName string, l
 	xcheckf(ctx, err, "removing current sessions")
 }
 
-// ClientConfigsDomain returns configurations for email clients, IMAP and
-// Submission (SMTP) for the domain.
+// SieveScript is the metadata of a Sieve script stored for an account. The
+// script content is not included; use AccountSieveScript to fetch it.
+type SieveScript struct {
+	Name    string
+	Size    int64 // Size of the script content in bytes.
+	Active  bool  // Whether this is the active script.
+	Created time.Time
+	Updated time.Time
+}
+
+// sievePolicy resolves the effective Sieve policy (quota limits) for an account,
+// mirroring the resolution done by the ManageSieve server.
+func sievePolicy(accountName string) sievefilter.Policy {
+	var domain dns.Domain
+	if accConf, ok := mox.Conf.Account(accountName); ok {
+		domain = accConf.DNSDomain
+	}
+	server, dom, acc := mox.Conf.SievePolicy(accountName, domain)
+	return sievefilter.Resolve(server, dom, acc)
+}
+
+// AccountSieveScripts returns the Sieve scripts stored for an account, ordered by
+// name, along with the name of the active script (empty string if none). The
+// script content is not included; use AccountSieveScript to fetch it.
+func (Admin) AccountSieveScripts(ctx context.Context, accountName string) (scripts []SieveScript, active string) {
+	log := pkglog.WithContext(ctx)
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	list, activeName, err := acc.SieveListScripts()
+	xcheckf(ctx, err, "listing sieve scripts")
+
+	scripts = make([]SieveScript, len(list))
+	for i, s := range list {
+		scripts[i] = SieveScript{
+			Name:    s.Name,
+			Size:    int64(len(s.Content)),
+			Active:  s.Name == activeName,
+			Created: s.Created,
+			Updated: s.Updated,
+		}
+	}
+	return scripts, activeName
+}
+
+// AccountSieveScript returns the content of the named Sieve script for an account.
+func (Admin) AccountSieveScript(ctx context.Context, accountName string, name string) (content string) {
+	log := pkglog.WithContext(ctx)
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	buf, err := acc.SieveGetScript(name)
+	if err != nil && (errors.Is(err, store.ErrSieveScriptNotFound) || errors.Is(err, store.ErrSieveScriptNameInvalid)) {
+		xcheckuserf(ctx, err, "get sieve script")
+	}
+	xcheckf(ctx, err, "get sieve script")
+	return string(buf)
+}
+
+// AccountSievePutScript stores a Sieve script for an account, creating it or
+// replacing an existing script with the same name. The script name and content
+// are validated and checked against the account's Sieve quota. Any validation
+// warnings are returned.
+func (Admin) AccountSievePutScript(ctx context.Context, accountName string, name string, content string) (warnings string) {
+	log := pkglog.WithContext(ctx)
+
+	if err := store.CheckSieveScriptName(name); err != nil {
+		xcheckuserf(ctx, err, "checking script name")
+	}
+	if len(content) == 0 {
+		xusererrorf(ctx, "script is empty")
+	}
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	p := sievePolicy(accountName)
+	err = acc.SieveCheckQuota(name, int64(len(content)), p.MaxScripts, p.MaxScriptSize, p.MaxTotalScriptSize)
+	if err != nil && (errors.Is(err, store.ErrSieveScriptTooLarge) || errors.Is(err, store.ErrSieveTooManyScripts) || errors.Is(err, store.ErrSieveTotalTooLarge)) {
+		xcheckuserf(ctx, err, "checking sieve quota")
+	}
+	xcheckf(ctx, err, "checking sieve quota")
+
+	warnings, err = sievefilter.Validate([]byte(content))
+	if err != nil {
+		xcheckuserf(ctx, err, "validating sieve script")
+	}
+
+	err = acc.SievePutScript(name, []byte(content))
+	xcheckf(ctx, err, "storing sieve script")
+	return warnings
+}
+
+// AccountSieveDeleteScript deletes the named Sieve script for an account. The
+// active script cannot be deleted; deactivate it first with AccountSieveSetActive.
+func (Admin) AccountSieveDeleteScript(ctx context.Context, accountName string, name string) {
+	log := pkglog.WithContext(ctx)
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	err = acc.SieveDeleteScript(name)
+	if err != nil && (errors.Is(err, store.ErrSieveScriptNotFound) || errors.Is(err, store.ErrSieveScriptActive) || errors.Is(err, store.ErrSieveScriptNameInvalid)) {
+		xcheckuserf(ctx, err, "deleting sieve script")
+	}
+	xcheckf(ctx, err, "deleting sieve script")
+}
+
+// AccountSieveRenameScript renames a Sieve script for an account. Fails if a
+// script with the new name already exists.
+func (Admin) AccountSieveRenameScript(ctx context.Context, accountName string, oldName string, newName string) {
+	log := pkglog.WithContext(ctx)
+
+	if err := store.CheckSieveScriptName(newName); err != nil {
+		xcheckuserf(ctx, err, "checking new script name")
+	}
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	err = acc.SieveRenameScript(oldName, newName)
+	if err != nil && (errors.Is(err, store.ErrSieveScriptNotFound) || errors.Is(err, store.ErrSieveScriptExists) || errors.Is(err, store.ErrSieveScriptNameInvalid)) {
+		xcheckuserf(ctx, err, "renaming sieve script")
+	}
+	xcheckf(ctx, err, "renaming sieve script")
+}
+
+// AccountSieveSetActive sets the active Sieve script for an account. An empty
+// name deactivates the currently active script, leaving no active script.
+func (Admin) AccountSieveSetActive(ctx context.Context, accountName string, name string) {
+	log := pkglog.WithContext(ctx)
+
+	acc, err := store.OpenAccount(log, accountName, false)
+	xcheckf(ctx, err, "open account")
+	defer func() {
+		err := acc.Close()
+		log.Check(err, "closing account")
+	}()
+
+	err = acc.SieveSetActive(name)
+	if err != nil && (errors.Is(err, store.ErrSieveScriptNotFound) || errors.Is(err, store.ErrSieveScriptNameInvalid)) {
+		xcheckuserf(ctx, err, "setting active sieve script")
+	}
+	xcheckf(ctx, err, "setting active sieve script")
+}
 func (Admin) ClientConfigsDomain(ctx context.Context, domain string) admin.ClientConfigs {
 	d, err := dns.ParseDomain(domain)
 	xcheckuserf(ctx, err, "parsing domain")

@@ -300,12 +300,14 @@ const formatQuotaSize = (v: number) => {
 }
 
 const index = async () => {
-	const [[acc, storageUsed, storageLimit, suppressions], tlspubkeys0, recentLoginAttempts] = await Promise.all([
+	const [[acc, storageUsed, storageLimit, suppressions], tlspubkeys0, recentLoginAttempts, [sieveScripts0]] = await Promise.all([
 		client.Account(),
 		client.TLSPublicKeys(),
 		client.LoginAttempts(10),
+		client.SieveScripts(),
 	])
 	const tlspubkeys = tlspubkeys0 || []
+	let sieveScripts = sieveScripts0 || []
 
 	let fullNameForm: HTMLFormElement
 	let fullNameFieldset: HTMLFieldSetElement
@@ -1508,6 +1510,161 @@ openssl pkcs12 \\
 				),
 			),
 		),
+		dom.br(),
+
+		dom.h2('Sieve scripts'),
+		dom.p('Sieve scripts filter incoming messages during delivery, e.g. to move messages to a mailbox or to forward or reject them. Only the active script is executed. Scripts can also be managed with a ManageSieve client.'),
+		(() => {
+			let elem = dom.div()
+
+			const reload = async (target: {disabled: boolean}, p: Promise<any>) => {
+				await check(target, (async () => {
+					await p
+					const [scripts] = await client.SieveScripts()
+					sieveScripts = scripts || []
+					render()
+				})())
+			}
+
+			const editScript = async (target: {disabled: boolean}, name: string) => {
+				const content = await check(target, client.SieveScript(name))
+				let body: HTMLTextAreaElement
+				let warningsBox: HTMLElement
+				const close = popup(
+					dom.div(
+						style({maxWidth: '60em'}),
+						dom.h1('Edit Sieve script "'+name+'"'),
+						warningsBox=dom.div(),
+						dom.form(
+							async function submit(e: SubmitEvent & {target: {disabled: boolean}}) {
+								e.preventDefault()
+								e.stopPropagation()
+								const warnings = await check(e.target, client.SievePutScript(name, body.value))
+								if (warnings) {
+									dom._kids(warningsBox, box(yellow, 'Saved with warnings: '+warnings))
+									await reload(e.target, Promise.resolve())
+									return
+								}
+								await reload(e.target, Promise.resolve())
+								close()
+							},
+							body=dom.textarea(new String(content), attr.rows('20'), style({width: '100%', fontFamily: 'monospace'})),
+							dom.br(),
+							dom.submitbutton('Save'),
+						),
+					),
+				)
+			}
+
+			const render = () => {
+				const e = dom.div(
+					dom.table(
+						dom.thead(
+							dom.tr(
+								dom.th('Name'),
+								dom.th('Size'),
+								dom.th('Active', attr.title('Only the active script is executed during delivery.')),
+								dom.th('Created'),
+								dom.th('Updated'),
+								dom.th('Action'),
+							),
+						),
+						dom.tbody(
+							sieveScripts.length === 0 ? dom.tr(dom.td(attr.colspan('6'), '(None)')) : [],
+							sieveScripts.map(s =>
+								dom.tr(
+									dom.td(s.Name),
+									dom.td(style({textAlign: 'right'}), formatQuotaSize(s.Size)),
+									dom.td(s.Active ? '✓' : ''),
+									dom.td(age(s.Created)),
+									dom.td(age(s.Updated)),
+									dom.td(
+										style({display: 'flex', gap: '.5ex', flexWrap: 'wrap'}),
+										dom.clickbutton('Edit', function click(e: MouseEvent) {
+											editScript(e.target! as HTMLButtonElement, s.Name)
+										}),
+										s.Active ?
+											dom.clickbutton('Deactivate', function click(e: MouseEvent) {
+												reload(e.target! as HTMLButtonElement, client.SieveSetActive(''))
+											}) :
+											dom.clickbutton('Activate', function click(e: MouseEvent) {
+												reload(e.target! as HTMLButtonElement, client.SieveSetActive(s.Name))
+											}),
+										dom.clickbutton('Rename', function click() {
+											let newName: HTMLInputElement
+											const close = popup(
+												dom.div(
+													dom.h1('Rename Sieve script "'+s.Name+'"'),
+													dom.form(
+														async function submit(e: SubmitEvent & {target: {disabled: boolean}}) {
+															e.preventDefault()
+															e.stopPropagation()
+															await reload(e.target, client.SieveRenameScript(s.Name, newName.value))
+															close()
+														},
+														dom.label(
+															style({display: 'block', marginBottom: '1ex'}),
+															dom.div(dom.b('New name')),
+															newName=dom.input(attr.required(''), attr.value(s.Name)),
+														),
+														dom.submitbutton('Rename'),
+													),
+												),
+											)
+										}),
+										dom.clickbutton('Delete', s.Active ? attr.disabled('') : [], attr.title(s.Active ? 'The active script cannot be deleted; deactivate it first.' : ''), function click(e: MouseEvent) {
+											if (!window.confirm('Are you sure you want to delete Sieve script "'+s.Name+'"?')) {
+												return
+											}
+											reload(e.target! as HTMLButtonElement, client.SieveDeleteScript(s.Name))
+										}),
+									),
+								),
+							),
+						),
+					),
+					dom.clickbutton('Add script', style({marginTop: '1ex'}), function click() {
+						let name: HTMLInputElement
+						let body: HTMLTextAreaElement
+						const close = popup(
+							dom.div(
+								style({maxWidth: '60em'}),
+								dom.h1('Add Sieve script'),
+								dom.form(
+									async function submit(e: SubmitEvent & {target: {disabled: boolean}}) {
+										e.preventDefault()
+										e.stopPropagation()
+										const warnings = await check(e.target, client.SievePutScript(name.value, body.value))
+										if (warnings) {
+											window.alert('Saved with warnings: '+warnings)
+										}
+										await reload(e.target, Promise.resolve())
+										close()
+									},
+									dom.label(
+										style({display: 'block', marginBottom: '1ex'}),
+										dom.div(dom.b('Name')),
+										name=dom.input(attr.required('')),
+									),
+									dom.label(
+										style({display: 'block', marginBottom: '1ex'}),
+										dom.div(dom.b('Script')),
+										body=dom.textarea(attr.rows('20'), style({width: '100%', fontFamily: 'monospace'})),
+									),
+									dom.submitbutton('Add'),
+								),
+							),
+						)
+					}),
+				)
+				if (elem) {
+					elem.replaceWith(e)
+				}
+				elem = e
+			}
+			render()
+			return elem
+		})(),
 		dom.br(),
 
 		dom.h2('Export'),

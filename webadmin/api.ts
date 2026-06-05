@@ -650,6 +650,16 @@ export interface Reverse {
 	Hostnames?: string[] | null
 }
 
+// SieveScript is the metadata of a Sieve script stored for an account. The
+// script content is not included; use AccountSieveScript to fetch it.
+export interface SieveScript {
+	Name: string
+	Size: number  // Size of the script content in bytes.
+	Active: boolean  // Whether this is the active script.
+	Created: Date
+	Updated: Date
+}
+
 // ClientConfigs holds the client configuration for IMAP/Submission for a
 // domain.
 export interface ClientConfigs {
@@ -1180,7 +1190,7 @@ export enum AuthResult {
 	AuthAborted = "aborted",
 }
 
-export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AuthResults":true,"AutoconfCheckResult":true,"AutodiscoverCheckResult":true,"AutodiscoverSRV":true,"AutomaticJunkFlags":true,"Canonicalization":true,"CheckResult":true,"ClientConfigs":true,"ClientConfigsEntry":true,"ConfigDomain":true,"DANECheckResult":true,"DKIM":true,"DKIMAuthResult":true,"DKIMCheckResult":true,"DKIMRecord":true,"DMARC":true,"DMARCCheckResult":true,"DMARCRecord":true,"DMARCSummary":true,"DNSSECResult":true,"DateRange":true,"Destination":true,"Directive":true,"Domain":true,"DomainFeedback":true,"Dynamic":true,"Evaluation":true,"EvaluationStat":true,"Extension":true,"FailureDetails":true,"Filter":true,"HoldRule":true,"Hook":true,"HookFilter":true,"HookResult":true,"HookRetired":true,"HookRetiredFilter":true,"HookRetiredSort":true,"HookSort":true,"IPDomain":true,"IPRevCheckResult":true,"Identifiers":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"MTASTS":true,"MTASTSCheckResult":true,"MTASTSRecord":true,"MX":true,"MXCheckResult":true,"Modifier":true,"Msg":true,"MsgResult":true,"MsgRetired":true,"OutgoingWebhook":true,"Pair":true,"Policy":true,"PolicyEvaluated":true,"PolicyOverrideReason":true,"PolicyPublished":true,"PolicyRecord":true,"Record":true,"Report":true,"ReportMetadata":true,"ReportRecord":true,"Result":true,"ResultPolicy":true,"RetiredFilter":true,"RetiredSort":true,"Reverse":true,"Route":true,"Row":true,"Ruleset":true,"SMTPAuth":true,"SPFAuthResult":true,"SPFCheckResult":true,"SPFRecord":true,"SRV":true,"SRVConfCheckResult":true,"STSMX":true,"Selector":true,"Sieve":true,"Sort":true,"SubjectPass":true,"Summary":true,"SuppressAddress":true,"TLSCheckResult":true,"TLSPublicKey":true,"TLSRPT":true,"TLSRPTCheckResult":true,"TLSRPTDateRange":true,"TLSRPTRecord":true,"TLSRPTSummary":true,"TLSRPTSuppressAddress":true,"TLSReportRecord":true,"TLSResult":true,"Transport":true,"TransportDirect":true,"TransportFail":true,"TransportSMTP":true,"TransportSocks":true,"URI":true,"WebForward":true,"WebHandler":true,"WebInternal":true,"WebRedirect":true,"WebStatic":true,"WebserverConfig":true}
+export const structTypes: {[typename: string]: boolean} = {"Account":true,"Address":true,"AddressAlias":true,"Alias":true,"AliasAddress":true,"AuthResults":true,"AutoconfCheckResult":true,"AutodiscoverCheckResult":true,"AutodiscoverSRV":true,"AutomaticJunkFlags":true,"Canonicalization":true,"CheckResult":true,"ClientConfigs":true,"ClientConfigsEntry":true,"ConfigDomain":true,"DANECheckResult":true,"DKIM":true,"DKIMAuthResult":true,"DKIMCheckResult":true,"DKIMRecord":true,"DMARC":true,"DMARCCheckResult":true,"DMARCRecord":true,"DMARCSummary":true,"DNSSECResult":true,"DateRange":true,"Destination":true,"Directive":true,"Domain":true,"DomainFeedback":true,"Dynamic":true,"Evaluation":true,"EvaluationStat":true,"Extension":true,"FailureDetails":true,"Filter":true,"HoldRule":true,"Hook":true,"HookFilter":true,"HookResult":true,"HookRetired":true,"HookRetiredFilter":true,"HookRetiredSort":true,"HookSort":true,"IPDomain":true,"IPRevCheckResult":true,"Identifiers":true,"IncomingWebhook":true,"JunkFilter":true,"LoginAttempt":true,"MTASTS":true,"MTASTSCheckResult":true,"MTASTSRecord":true,"MX":true,"MXCheckResult":true,"Modifier":true,"Msg":true,"MsgResult":true,"MsgRetired":true,"OutgoingWebhook":true,"Pair":true,"Policy":true,"PolicyEvaluated":true,"PolicyOverrideReason":true,"PolicyPublished":true,"PolicyRecord":true,"Record":true,"Report":true,"ReportMetadata":true,"ReportRecord":true,"Result":true,"ResultPolicy":true,"RetiredFilter":true,"RetiredSort":true,"Reverse":true,"Route":true,"Row":true,"Ruleset":true,"SMTPAuth":true,"SPFAuthResult":true,"SPFCheckResult":true,"SPFRecord":true,"SRV":true,"SRVConfCheckResult":true,"STSMX":true,"Selector":true,"Sieve":true,"SieveScript":true,"Sort":true,"SubjectPass":true,"Summary":true,"SuppressAddress":true,"TLSCheckResult":true,"TLSPublicKey":true,"TLSRPT":true,"TLSRPTCheckResult":true,"TLSRPTDateRange":true,"TLSRPTRecord":true,"TLSRPTSummary":true,"TLSRPTSuppressAddress":true,"TLSReportRecord":true,"TLSResult":true,"Transport":true,"TransportDirect":true,"TransportFail":true,"TransportSMTP":true,"TransportSocks":true,"URI":true,"WebForward":true,"WebHandler":true,"WebInternal":true,"WebRedirect":true,"WebStatic":true,"WebserverConfig":true}
 export const stringsTypes: {[typename: string]: boolean} = {"Align":true,"AuthResult":true,"CSRFToken":true,"DMARCPolicy":true,"IP":true,"Localpart":true,"Mode":true,"RUA":true}
 export const intsTypes: {[typename: string]: boolean} = {}
 export const types: TypenameMap = {
@@ -1259,6 +1269,7 @@ export const types: TypenameMap = {
 	"SPFAuthResult": {"Name":"SPFAuthResult","Docs":"","Fields":[{"Name":"Domain","Docs":"","Typewords":["string"]},{"Name":"Scope","Docs":"","Typewords":["string"]},{"Name":"Result","Docs":"","Typewords":["string"]}]},
 	"DMARCSummary": {"Name":"DMARCSummary","Docs":"","Fields":[{"Name":"Domain","Docs":"","Typewords":["string"]},{"Name":"Total","Docs":"","Typewords":["int32"]},{"Name":"DispositionNone","Docs":"","Typewords":["int32"]},{"Name":"DispositionQuarantine","Docs":"","Typewords":["int32"]},{"Name":"DispositionReject","Docs":"","Typewords":["int32"]},{"Name":"DKIMFail","Docs":"","Typewords":["int32"]},{"Name":"SPFFail","Docs":"","Typewords":["int32"]},{"Name":"PolicyOverrides","Docs":"","Typewords":["{}","int32"]}]},
 	"Reverse": {"Name":"Reverse","Docs":"","Fields":[{"Name":"Hostnames","Docs":"","Typewords":["[]","string"]}]},
+	"SieveScript": {"Name":"SieveScript","Docs":"","Fields":[{"Name":"Name","Docs":"","Typewords":["string"]},{"Name":"Size","Docs":"","Typewords":["int64"]},{"Name":"Active","Docs":"","Typewords":["bool"]},{"Name":"Created","Docs":"","Typewords":["timestamp"]},{"Name":"Updated","Docs":"","Typewords":["timestamp"]}]},
 	"ClientConfigs": {"Name":"ClientConfigs","Docs":"","Fields":[{"Name":"Entries","Docs":"","Typewords":["[]","ClientConfigsEntry"]}]},
 	"ClientConfigsEntry": {"Name":"ClientConfigsEntry","Docs":"","Fields":[{"Name":"Protocol","Docs":"","Typewords":["string"]},{"Name":"Host","Docs":"","Typewords":["Domain"]},{"Name":"Port","Docs":"","Typewords":["int32"]},{"Name":"Listener","Docs":"","Typewords":["string"]},{"Name":"Note","Docs":"","Typewords":["string"]}]},
 	"HoldRule": {"Name":"HoldRule","Docs":"","Fields":[{"Name":"ID","Docs":"","Typewords":["int64"]},{"Name":"Account","Docs":"","Typewords":["string"]},{"Name":"SenderDomain","Docs":"","Typewords":["Domain"]},{"Name":"RecipientDomain","Docs":"","Typewords":["Domain"]},{"Name":"SenderDomainStr","Docs":"","Typewords":["string"]},{"Name":"RecipientDomainStr","Docs":"","Typewords":["string"]}]},
@@ -1383,6 +1394,7 @@ export const parser = {
 	SPFAuthResult: (v: any) => parse("SPFAuthResult", v) as SPFAuthResult,
 	DMARCSummary: (v: any) => parse("DMARCSummary", v) as DMARCSummary,
 	Reverse: (v: any) => parse("Reverse", v) as Reverse,
+	SieveScript: (v: any) => parse("SieveScript", v) as SieveScript,
 	ClientConfigs: (v: any) => parse("ClientConfigs", v) as ClientConfigs,
 	ClientConfigsEntry: (v: any) => parse("ClientConfigsEntry", v) as ClientConfigsEntry,
 	HoldRule: (v: any) => parse("HoldRule", v) as HoldRule,
@@ -1778,8 +1790,68 @@ export class Client {
 		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
 	}
 
-	// ClientConfigsDomain returns configurations for email clients, IMAP and
-	// Submission (SMTP) for the domain.
+	// AccountSieveScripts returns the Sieve scripts stored for an account, ordered by
+	// name, along with the name of the active script (empty string if none). The
+	// script content is not included; use AccountSieveScript to fetch it.
+	async AccountSieveScripts(accountName: string): Promise<[SieveScript[] | null, string]> {
+		const fn: string = "AccountSieveScripts"
+		const paramTypes: string[][] = [["string"]]
+		const returnTypes: string[][] = [["[]","SieveScript"],["string"]]
+		const params: any[] = [accountName]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as [SieveScript[] | null, string]
+	}
+
+	// AccountSieveScript returns the content of the named Sieve script for an account.
+	async AccountSieveScript(accountName: string, name: string): Promise<string> {
+		const fn: string = "AccountSieveScript"
+		const paramTypes: string[][] = [["string"],["string"]]
+		const returnTypes: string[][] = [["string"]]
+		const params: any[] = [accountName, name]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as string
+	}
+
+	// AccountSievePutScript stores a Sieve script for an account, creating it or
+	// replacing an existing script with the same name. The script name and content
+	// are validated and checked against the account's Sieve quota. Any validation
+	// warnings are returned.
+	async AccountSievePutScript(accountName: string, name: string, content: string): Promise<string> {
+		const fn: string = "AccountSievePutScript"
+		const paramTypes: string[][] = [["string"],["string"],["string"]]
+		const returnTypes: string[][] = [["string"]]
+		const params: any[] = [accountName, name, content]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as string
+	}
+
+	// AccountSieveDeleteScript deletes the named Sieve script for an account. The
+	// active script cannot be deleted; deactivate it first with AccountSieveSetActive.
+	async AccountSieveDeleteScript(accountName: string, name: string): Promise<void> {
+		const fn: string = "AccountSieveDeleteScript"
+		const paramTypes: string[][] = [["string"],["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [accountName, name]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
+	// AccountSieveRenameScript renames a Sieve script for an account. Fails if a
+	// script with the new name already exists.
+	async AccountSieveRenameScript(accountName: string, oldName: string, newName: string): Promise<void> {
+		const fn: string = "AccountSieveRenameScript"
+		const paramTypes: string[][] = [["string"],["string"],["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [accountName, oldName, newName]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
+	// AccountSieveSetActive sets the active Sieve script for an account. An empty
+	// name deactivates the currently active script, leaving no active script.
+	async AccountSieveSetActive(accountName: string, name: string): Promise<void> {
+		const fn: string = "AccountSieveSetActive"
+		const paramTypes: string[][] = [["string"],["string"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [accountName, name]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
 	async ClientConfigsDomain(domain: string): Promise<ClientConfigs> {
 		const fn: string = "ClientConfigsDomain"
 		const paramTypes: string[][] = [["string"]]

@@ -527,6 +527,63 @@ func TestCtl(t *testing.T) {
 	}
 	cmdVerifydata(&xcmd)
 
+	// "sieve" commands.
+	testctl(func(xctl *ctl) {
+		ctlcmdSievePut(xctl, "mjl", "ctlscript", []byte("keep;\n"))
+	})
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveList(xctl, "mjl")
+	})
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveGet(xctl, "mjl", "ctlscript")
+	})
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveActivate(xctl, "mjl", "ctlscript")
+	})
+
+	func() {
+		acc, err := store.OpenAccount(pkglog, "mjl", false)
+		tcheck(t, err, "open account")
+		defer func() { tcheck(t, acc.Close(), "close account") }()
+		l, active, err := acc.SieveListScripts()
+		tcheck(t, err, "list sieve scripts")
+		if len(l) != 1 || l[0].Name != "ctlscript" {
+			t.Fatalf("got scripts %v, expected [ctlscript]", l)
+		}
+		if active != "ctlscript" {
+			t.Fatalf("got active %q, expected ctlscript", active)
+		}
+		content, err := acc.SieveGetScript("ctlscript")
+		tcheck(t, err, "get sieve script")
+		if string(content) != "keep;\n" {
+			t.Fatalf("got content %q, expected keep;", content)
+		}
+	}()
+
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveRename(xctl, "mjl", "ctlscript", "ctlscript2")
+	})
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveDeactivate(xctl, "mjl")
+	})
+	testctl(func(xctl *ctl) {
+		ctlcmdSieveRemove(xctl, "mjl", "ctlscript2")
+	})
+
+	func() {
+		acc, err := store.OpenAccount(pkglog, "mjl", false)
+		tcheck(t, err, "open account")
+		defer func() { tcheck(t, acc.Close(), "close account") }()
+		l, active, err := acc.SieveListScripts()
+		tcheck(t, err, "list sieve scripts")
+		if len(l) != 0 {
+			t.Fatalf("got scripts %v, expected none", l)
+		}
+		if active != "" {
+			t.Fatalf("got active %q, expected none", active)
+		}
+	}()
+
 	// IMAP connection.
 	testctl(func(xctl *ctl) {
 		a, b := net.Pipe()

@@ -268,7 +268,7 @@ var api;
 		AuthResult["AuthError"] = "error";
 		AuthResult["AuthAborted"] = "aborted";
 	})(AuthResult = api.AuthResult || (api.AuthResult = {}));
-	api.structTypes = { "Account": true, "Address": true, "AddressAlias": true, "Alias": true, "AliasAddress": true, "AutomaticJunkFlags": true, "Destination": true, "Domain": true, "ImportProgress": true, "Incoming": true, "IncomingMeta": true, "IncomingWebhook": true, "JunkFilter": true, "LoginAttempt": true, "NameAddress": true, "Outgoing": true, "OutgoingWebhook": true, "Route": true, "Ruleset": true, "Sieve": true, "Structure": true, "SubjectPass": true, "Suppression": true, "TLSPublicKey": true };
+	api.structTypes = { "Account": true, "Address": true, "AddressAlias": true, "Alias": true, "AliasAddress": true, "AutomaticJunkFlags": true, "Destination": true, "Domain": true, "ImportProgress": true, "Incoming": true, "IncomingMeta": true, "IncomingWebhook": true, "JunkFilter": true, "LoginAttempt": true, "NameAddress": true, "Outgoing": true, "OutgoingWebhook": true, "Route": true, "Ruleset": true, "Sieve": true, "SieveScript": true, "Structure": true, "SubjectPass": true, "Suppression": true, "TLSPublicKey": true };
 	api.stringsTypes = { "AuthResult": true, "CSRFToken": true, "Localpart": true, "OutgoingEvent": true };
 	api.intsTypes = {};
 	api.types = {
@@ -296,6 +296,7 @@ var api;
 		"IncomingMeta": { "Name": "IncomingMeta", "Docs": "", "Fields": [{ "Name": "MsgID", "Docs": "", "Typewords": ["int64"] }, { "Name": "MailFrom", "Docs": "", "Typewords": ["string"] }, { "Name": "MailFromValidated", "Docs": "", "Typewords": ["bool"] }, { "Name": "MsgFromValidated", "Docs": "", "Typewords": ["bool"] }, { "Name": "RcptTo", "Docs": "", "Typewords": ["string"] }, { "Name": "DKIMVerifiedDomains", "Docs": "", "Typewords": ["[]", "string"] }, { "Name": "RemoteIP", "Docs": "", "Typewords": ["string"] }, { "Name": "Received", "Docs": "", "Typewords": ["timestamp"] }, { "Name": "MailboxName", "Docs": "", "Typewords": ["string"] }, { "Name": "Automated", "Docs": "", "Typewords": ["bool"] }] },
 		"TLSPublicKey": { "Name": "TLSPublicKey", "Docs": "", "Fields": [{ "Name": "Fingerprint", "Docs": "", "Typewords": ["string"] }, { "Name": "Created", "Docs": "", "Typewords": ["timestamp"] }, { "Name": "Type", "Docs": "", "Typewords": ["string"] }, { "Name": "Name", "Docs": "", "Typewords": ["string"] }, { "Name": "NoIMAPPreauth", "Docs": "", "Typewords": ["bool"] }, { "Name": "CertDER", "Docs": "", "Typewords": ["nullable", "string"] }, { "Name": "Account", "Docs": "", "Typewords": ["string"] }, { "Name": "LoginAddress", "Docs": "", "Typewords": ["string"] }] },
 		"LoginAttempt": { "Name": "LoginAttempt", "Docs": "", "Fields": [{ "Name": "Key", "Docs": "", "Typewords": ["nullable", "string"] }, { "Name": "Last", "Docs": "", "Typewords": ["timestamp"] }, { "Name": "First", "Docs": "", "Typewords": ["timestamp"] }, { "Name": "Count", "Docs": "", "Typewords": ["int64"] }, { "Name": "AccountName", "Docs": "", "Typewords": ["string"] }, { "Name": "LoginAddress", "Docs": "", "Typewords": ["string"] }, { "Name": "RemoteIP", "Docs": "", "Typewords": ["string"] }, { "Name": "LocalIP", "Docs": "", "Typewords": ["string"] }, { "Name": "TLS", "Docs": "", "Typewords": ["string"] }, { "Name": "TLSPubKeyFingerprint", "Docs": "", "Typewords": ["string"] }, { "Name": "Protocol", "Docs": "", "Typewords": ["string"] }, { "Name": "UserAgent", "Docs": "", "Typewords": ["string"] }, { "Name": "AuthMech", "Docs": "", "Typewords": ["string"] }, { "Name": "Result", "Docs": "", "Typewords": ["AuthResult"] }] },
+		"SieveScript": { "Name": "SieveScript", "Docs": "", "Fields": [{ "Name": "Name", "Docs": "", "Typewords": ["string"] }, { "Name": "Size", "Docs": "", "Typewords": ["int64"] }, { "Name": "Active", "Docs": "", "Typewords": ["bool"] }, { "Name": "Created", "Docs": "", "Typewords": ["timestamp"] }, { "Name": "Updated", "Docs": "", "Typewords": ["timestamp"] }] },
 		"CSRFToken": { "Name": "CSRFToken", "Docs": "", "Values": null },
 		"Localpart": { "Name": "Localpart", "Docs": "", "Values": null },
 		"OutgoingEvent": { "Name": "OutgoingEvent", "Docs": "", "Values": [{ "Name": "EventDelivered", "Value": "delivered", "Docs": "" }, { "Name": "EventSuppressed", "Value": "suppressed", "Docs": "" }, { "Name": "EventDelayed", "Value": "delayed", "Docs": "" }, { "Name": "EventFailed", "Value": "failed", "Docs": "" }, { "Name": "EventRelayed", "Value": "relayed", "Docs": "" }, { "Name": "EventExpanded", "Value": "expanded", "Docs": "" }, { "Name": "EventCanceled", "Value": "canceled", "Docs": "" }, { "Name": "EventUnrecognized", "Value": "unrecognized", "Docs": "" }] },
@@ -326,6 +327,7 @@ var api;
 		IncomingMeta: (v) => api.parse("IncomingMeta", v),
 		TLSPublicKey: (v) => api.parse("TLSPublicKey", v),
 		LoginAttempt: (v) => api.parse("LoginAttempt", v),
+		SieveScript: (v) => api.parse("SieveScript", v),
 		CSRFToken: (v) => api.parse("CSRFToken", v),
 		Localpart: (v) => api.parse("Localpart", v),
 		OutgoingEvent: (v) => api.parse("OutgoingEvent", v),
@@ -610,6 +612,62 @@ var api;
 			const paramTypes = [["[]", "string"]];
 			const returnTypes = [];
 			const params = [capabilitiesDisabled];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SieveScripts returns the Sieve scripts stored for the account, ordered by name,
+		// along with the name of the active script (empty string if none). The script
+		// content is not included; use SieveScript to fetch it.
+		async SieveScripts() {
+			const fn = "SieveScripts";
+			const paramTypes = [];
+			const returnTypes = [["[]", "SieveScript"], ["string"]];
+			const params = [];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SieveScript returns the content of the named Sieve script for the account.
+		async SieveScript(name) {
+			const fn = "SieveScript";
+			const paramTypes = [["string"]];
+			const returnTypes = [["string"]];
+			const params = [name];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SievePutScript stores a Sieve script for the account, creating it or replacing
+		// an existing script with the same name. The script name and content are
+		// validated and checked against the account's Sieve quota. Any validation
+		// warnings are returned.
+		async SievePutScript(name, content) {
+			const fn = "SievePutScript";
+			const paramTypes = [["string"], ["string"]];
+			const returnTypes = [["string"]];
+			const params = [name, content];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SieveDeleteScript deletes the named Sieve script for the account. The active
+		// script cannot be deleted; deactivate it first with SieveSetActive.
+		async SieveDeleteScript(name) {
+			const fn = "SieveDeleteScript";
+			const paramTypes = [["string"]];
+			const returnTypes = [];
+			const params = [name];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SieveRenameScript renames a Sieve script for the account. Fails if a script
+		// with the new name already exists.
+		async SieveRenameScript(oldName, newName) {
+			const fn = "SieveRenameScript";
+			const paramTypes = [["string"], ["string"]];
+			const returnTypes = [];
+			const params = [oldName, newName];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
+		// SieveSetActive sets the active Sieve script for the account. An empty name
+		// deactivates the currently active script, leaving no active script.
+		async SieveSetActive(name) {
+			const fn = "SieveSetActive";
+			const paramTypes = [["string"]];
+			const returnTypes = [];
+			const params = [name];
 			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
 		}
 	}
@@ -1181,12 +1239,14 @@ const formatQuotaSize = (v) => {
 	return '' + v;
 };
 const index = async () => {
-	const [[acc, storageUsed, storageLimit, suppressions], tlspubkeys0, recentLoginAttempts] = await Promise.all([
+	const [[acc, storageUsed, storageLimit, suppressions], tlspubkeys0, recentLoginAttempts, [sieveScripts0]] = await Promise.all([
 		client.Account(),
 		client.TLSPublicKeys(),
 		client.LoginAttempts(10),
+		client.SieveScripts(),
 	]);
 	const tlspubkeys = tlspubkeys0 || [];
+	let sieveScripts = sieveScripts0 || [];
 	let fullNameForm;
 	let fullNameFieldset;
 	let fullName;
@@ -1728,7 +1788,77 @@ openssl pkcs12 \\
 		e.preventDefault();
 		e.stopPropagation();
 		await check(imapFieldset, (async () => await client.IMAPSave(imapCapabilitiesDisabled.value.split(' ').filter(s => s)))());
-	}, imapFieldset = dom.fieldset(dom.div(style({ display: 'flex', gap: '1em', alignItems: 'flex-end' }), dom.div(dom.label('Disabled IMAP capabilities (space-separated)', attr.title('IMAP capabilities (upper-case) to disable on the connection after authentication. Useful if the account uses an email client with an incompatible implementation for a capability/extension.'), dom.br(), imapCapabilitiesDisabled = dom.input(attr.value((acc.IMAPCapabilitiesDisabled || []).join(' '))))), dom.div(dom.submitbutton('Save'))))), dom.br(), dom.h2('Export'), dom.p('Export all messages in all mailboxes.'), dom.form(attr.target('_blank'), attr.method('POST'), attr.action('export'), dom.input(attr.type('hidden'), attr.name('csrf'), attr.value(localStorageGet('webaccountcsrftoken') || '')), dom.input(attr.type('hidden'), attr.name('mailbox'), attr.value('')), dom.input(attr.type('hidden'), attr.name('recursive'), attr.value('on')), dom.div(style({ display: 'flex', flexDirection: 'column', gap: '.5ex' }), dom.div(dom.label(dom.input(attr.type('radio'), attr.name('format'), attr.value('maildir'), attr.checked('')), ' Maildir'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('format'), attr.value('mbox')), ' Mbox')), dom.div(dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('tar')), ' Tar'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('tgz'), attr.checked('')), ' Tgz'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('zip')), ' Zip'), ' '), dom.div(style({ marginTop: '1ex' }), dom.submitbutton('Export')))), dom.br(), dom.h2('Import'), dom.p('Import messages from a .zip or .tgz file with maildirs and/or mbox files.'), importForm = dom.form(async function submit(e) {
+	}, imapFieldset = dom.fieldset(dom.div(style({ display: 'flex', gap: '1em', alignItems: 'flex-end' }), dom.div(dom.label('Disabled IMAP capabilities (space-separated)', attr.title('IMAP capabilities (upper-case) to disable on the connection after authentication. Useful if the account uses an email client with an incompatible implementation for a capability/extension.'), dom.br(), imapCapabilitiesDisabled = dom.input(attr.value((acc.IMAPCapabilitiesDisabled || []).join(' '))))), dom.div(dom.submitbutton('Save'))))), dom.br(), dom.h2('Sieve scripts'), dom.p('Sieve scripts filter incoming messages during delivery, e.g. to move messages to a mailbox or to forward or reject them. Only the active script is executed. Scripts can also be managed with a ManageSieve client.'), (() => {
+		let elem = dom.div();
+		const reload = async (target, p) => {
+			await check(target, (async () => {
+				await p;
+				const [scripts] = await client.SieveScripts();
+				sieveScripts = scripts || [];
+				render();
+			})());
+		};
+		const editScript = async (target, name) => {
+			const content = await check(target, client.SieveScript(name));
+			let body;
+			let warningsBox;
+			const close = popup(dom.div(style({ maxWidth: '60em' }), dom.h1('Edit Sieve script "' + name + '"'), warningsBox = dom.div(), dom.form(async function submit(e) {
+				e.preventDefault();
+				e.stopPropagation();
+				const warnings = await check(e.target, client.SievePutScript(name, body.value));
+				if (warnings) {
+					dom._kids(warningsBox, box(yellow, 'Saved with warnings: ' + warnings));
+					await reload(e.target, Promise.resolve());
+					return;
+				}
+				await reload(e.target, Promise.resolve());
+				close();
+			}, body = dom.textarea(new String(content), attr.rows('20'), style({ width: '100%', fontFamily: 'monospace' })), dom.br(), dom.submitbutton('Save'))));
+		};
+		const render = () => {
+			const e = dom.div(dom.table(dom.thead(dom.tr(dom.th('Name'), dom.th('Size'), dom.th('Active', attr.title('Only the active script is executed during delivery.')), dom.th('Created'), dom.th('Updated'), dom.th('Action'))), dom.tbody(sieveScripts.length === 0 ? dom.tr(dom.td(attr.colspan('6'), '(None)')) : [], sieveScripts.map(s => dom.tr(dom.td(s.Name), dom.td(style({ textAlign: 'right' }), formatQuotaSize(s.Size)), dom.td(s.Active ? '✓' : ''), dom.td(age(s.Created)), dom.td(age(s.Updated)), dom.td(style({ display: 'flex', gap: '.5ex', flexWrap: 'wrap' }), dom.clickbutton('Edit', function click(e) {
+				editScript(e.target, s.Name);
+			}), s.Active ?
+				dom.clickbutton('Deactivate', function click(e) {
+					reload(e.target, client.SieveSetActive(''));
+				}) :
+				dom.clickbutton('Activate', function click(e) {
+					reload(e.target, client.SieveSetActive(s.Name));
+				}), dom.clickbutton('Rename', function click() {
+				let newName;
+				const close = popup(dom.div(dom.h1('Rename Sieve script "' + s.Name + '"'), dom.form(async function submit(e) {
+					e.preventDefault();
+					e.stopPropagation();
+					await reload(e.target, client.SieveRenameScript(s.Name, newName.value));
+					close();
+				}, dom.label(style({ display: 'block', marginBottom: '1ex' }), dom.div(dom.b('New name')), newName = dom.input(attr.required(''), attr.value(s.Name))), dom.submitbutton('Rename'))));
+			}), dom.clickbutton('Delete', s.Active ? attr.disabled('') : [], attr.title(s.Active ? 'The active script cannot be deleted; deactivate it first.' : ''), function click(e) {
+				if (!window.confirm('Are you sure you want to delete Sieve script "' + s.Name + '"?')) {
+					return;
+				}
+				reload(e.target, client.SieveDeleteScript(s.Name));
+			})))))), dom.clickbutton('Add script', style({ marginTop: '1ex' }), function click() {
+				let name;
+				let body;
+				const close = popup(dom.div(style({ maxWidth: '60em' }), dom.h1('Add Sieve script'), dom.form(async function submit(e) {
+					e.preventDefault();
+					e.stopPropagation();
+					const warnings = await check(e.target, client.SievePutScript(name.value, body.value));
+					if (warnings) {
+						window.alert('Saved with warnings: ' + warnings);
+					}
+					await reload(e.target, Promise.resolve());
+					close();
+				}, dom.label(style({ display: 'block', marginBottom: '1ex' }), dom.div(dom.b('Name')), name = dom.input(attr.required(''))), dom.label(style({ display: 'block', marginBottom: '1ex' }), dom.div(dom.b('Script')), body = dom.textarea(attr.rows('20'), style({ width: '100%', fontFamily: 'monospace' }))), dom.submitbutton('Add'))));
+			}));
+			if (elem) {
+				elem.replaceWith(e);
+			}
+			elem = e;
+		};
+		render();
+		return elem;
+	})(), dom.br(), dom.h2('Export'), dom.p('Export all messages in all mailboxes.'), dom.form(attr.target('_blank'), attr.method('POST'), attr.action('export'), dom.input(attr.type('hidden'), attr.name('csrf'), attr.value(localStorageGet('webaccountcsrftoken') || '')), dom.input(attr.type('hidden'), attr.name('mailbox'), attr.value('')), dom.input(attr.type('hidden'), attr.name('recursive'), attr.value('on')), dom.div(style({ display: 'flex', flexDirection: 'column', gap: '.5ex' }), dom.div(dom.label(dom.input(attr.type('radio'), attr.name('format'), attr.value('maildir'), attr.checked('')), ' Maildir'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('format'), attr.value('mbox')), ' Mbox')), dom.div(dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('tar')), ' Tar'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('tgz'), attr.checked('')), ' Tgz'), ' ', dom.label(dom.input(attr.type('radio'), attr.name('archive'), attr.value('zip')), ' Zip'), ' '), dom.div(style({ marginTop: '1ex' }), dom.submitbutton('Export')))), dom.br(), dom.h2('Import'), dom.p('Import messages from a .zip or .tgz file with maildirs and/or mbox files.'), importForm = dom.form(async function submit(e) {
 		e.preventDefault();
 		e.stopPropagation();
 		const request = async () => {
