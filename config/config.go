@@ -52,16 +52,36 @@ const SieveDefaultMaxRedirects = 4
 // pointers so an explicit false at a more specific level can override an inherited
 // true.
 type Sieve struct {
-	Enabled            *bool         `sconf:"optional" sconf-doc:"If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the next higher scope decides; if no scope sets it, Sieve is disabled."`
-	MaxScriptSize      int64         `sconf:"optional" sconf-doc:"Maximum size in bytes of a single Sieve script. Default 32KB."`
-	MaxScripts         int           `sconf:"optional" sconf-doc:"Maximum number of scripts an account can have. Default 16."`
-	MaxTotalScriptSize int64         `sconf:"optional" sconf-doc:"Maximum total size in bytes of all scripts for an account. Default 256KB."`
-	ExecutionTimeout   time.Duration `sconf:"optional" sconf-doc:"Maximum time a single Sieve script may run on one message. Default 10s."`
-	MaxRedirects       int           `sconf:"optional" sconf-doc:"Maximum number of redirect actions per script execution. Default 4."`
-	AutoCreateMailboxes *bool        `sconf:"optional" sconf-doc:"If set, fileinto to a non-existent mailbox creates the mailbox. Default true."`
-	RunOnDelivery       *bool        `sconf:"optional" sconf-doc:"If set, execute the active Sieve script on incoming SMTP delivery. Default true."`
-	RunOnIMAPEvents     *bool        `sconf:"optional" sconf-doc:"If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default false."`
-	FailureMode         string       `sconf:"optional" sconf-doc:"Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return temporary SMTP error, the default) or 'keep' (deliver to the default mailbox)."`
+	Enabled             *bool         `sconf:"optional" sconf-doc:"If set, Sieve filtering is enabled (or disabled) at this scope. If unset, the next higher scope decides; if no scope sets it, Sieve is disabled."`
+	MaxScriptSize       int64         `sconf:"optional" sconf-doc:"Maximum size in bytes of a single Sieve script. Default 32KB."`
+	MaxScripts          int           `sconf:"optional" sconf-doc:"Maximum number of scripts an account can have. Default 16."`
+	MaxTotalScriptSize  int64         `sconf:"optional" sconf-doc:"Maximum total size in bytes of all scripts for an account. Default 256KB."`
+	ExecutionTimeout    time.Duration `sconf:"optional" sconf-doc:"Maximum time a single Sieve script may run on one message. Default 10s."`
+	MaxRedirects        int           `sconf:"optional" sconf-doc:"Maximum number of redirect actions per script execution. Default 4."`
+	AutoCreateMailboxes *bool         `sconf:"optional" sconf-doc:"If set, fileinto to a non-existent mailbox creates the mailbox. Default true."`
+	RunOnDelivery       *bool         `sconf:"optional" sconf-doc:"If set, execute the active Sieve script on incoming SMTP delivery. Default true."`
+	RunOnIMAPEvents     *bool         `sconf:"optional" sconf-doc:"If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default false."`
+	FailureMode         string        `sconf:"optional" sconf-doc:"Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return temporary SMTP error, the default) or 'keep' (deliver to the default mailbox)."`
+}
+
+// SRSDefaultMaxAge is the default validity window for a rewritten SRS sender:
+// bounces to an SRS address older than this are rejected.
+const SRSDefaultMaxAge = 21 * 24 * time.Hour
+
+// SRS is the server-wide Sender Rewriting Scheme configuration. SRS is only used
+// when forwarding a message to a third party; it rewrites the envelope sender to
+// an address at Domain so the forwarding hop passes SPF, and decodes bounces back
+// to the original sender. The secret authenticates rewritten addresses so mox
+// cannot be abused as an open relay for backscatter.
+type SRS struct {
+	Enabled    bool          `sconf-doc:"If true, rewrite the envelope sender of forwarded messages using SRS, and accept/relay bounces to SRS addresses at Domain."`
+	SecretFile string        `sconf-doc:"File containing the HMAC secret used to sign and verify rewritten addresses. Keep this stable: rotating it invalidates outstanding rewritten senders, so in-flight bounces can no longer be decoded. Must be the same across any mox instances sharing the SRS Domain."`
+	Domain     string        `sconf:"optional" sconf-doc:"Domain that rewritten envelope senders are anchored at, e.g. the mail hostname. It must publish an SPF record authorising this server and have DKIM configured so forwarded mail is signed. If empty, the global hostname is used."`
+	MaxAge     time.Duration `sconf:"optional" sconf-doc:"How long a rewritten sender remains valid for bounce reversal. Bounces to older SRS addresses are rejected. Default 21 days."`
+
+	// Parsed/loaded forms, populated by PrepareStaticConfig.
+	DNSDomain dns.Domain `sconf:"-" json:"-"`
+	Secret    []byte     `sconf:"-" json:"-"`
 }
 
 // Static is a parsed form of the mox.conf configuration file, before converting it
@@ -107,6 +127,8 @@ type Static struct {
 	QuotaMessageSize                int64 `sconf:"optional" sconf-doc:"Default maximum total message size in bytes for each individual account, only applicable if greater than zero. Can be overridden per account. Attempting to add new messages to an account beyond its maximum total size will result in an error. Useful to prevent a single account from filling storage. The quota only applies to the email message files, not to any file system overhead and also not the message index database file (account for approximately 15% overhead)."`
 
 	Sieve *Sieve `sconf:"optional" sconf-doc:"Server-wide default policy for Sieve filtering. Can be overridden per-domain and per-account. If unset, Sieve is disabled by default."`
+
+	SRS *SRS `sconf:"optional" sconf-doc:"Sender Rewriting Scheme. When forwarding a message to a third party (e.g. via a Sieve redirect), the envelope sender is rewritten to a local address at the configured domain so SPF passes on the forwarding hop, and bounces are decoded and relayed back to the original sender. Only the SMTP envelope is rewritten; message headers (including From) are left intact, so DKIM/DMARC of the original message are unaffected. If unset, SRS is disabled and forwarded messages keep the original envelope sender."`
 
 	// All IPs that were explicitly listened on for external SMTP. Only set when there
 	// are no unspecified external SMTP listeners and there is at most one for IPv4 and

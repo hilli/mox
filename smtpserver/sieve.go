@@ -17,6 +17,7 @@ import (
 	"github.com/mjl-/mox/queue"
 	"github.com/mjl-/mox/sievefilter"
 	"github.com/mjl-/mox/smtp"
+	"github.com/mjl-/mox/srs"
 	"github.com/mjl-/mox/store"
 )
 
@@ -200,6 +201,22 @@ func submitRedirect(ctx context.Context, log mlog.Log, c *conn, a analysis, data
 		return errors.New("missing mail from for redirect")
 	}
 	sender := *c.mailFrom
+	// SRS: rewrite the envelope sender so the forwarding hop passes SPF at the
+	// destination, and so bounces (DSNs) come back to an address we can decode.
+	// Skip the null sender (a bounce being forwarded must keep its empty MAIL
+	// FROM). Skip senders already at a domain we host: our own SPF authorises
+	// this server for them, so rewriting is unnecessary and lets their bounces
+	// flow back natively (this also doubles as the per-domain opt-out). Only the
+	// envelope changes; the message's From header and DKIM signatures are
+	// untouched, preserving the original DMARC alignment. On any rewrite error we
+	// fall back to the original sender rather than dropping mail.
+	if srsCfg := moxSRSConfig(); srsCfg != nil && !sender.IsZero() && !senderIsLocal(sender) {
+		if rewritten, err := srs.Forward(senderAddress(sender), *srsCfg); err != nil {
+			log.Errorx("srs forward rewrite, using original sender", err, slog.String("sender", sender.String()))
+		} else {
+			sender = rewritten.Path()
+		}
+	}
 	subject := ""
 	now := time.Now()
 	prefix := a.d.m.MsgPrefix
@@ -212,7 +229,37 @@ func submitRedirect(ctx context.Context, log mlog.Log, c *conn, a analysis, data
 	return nil
 }
 
-// applyEditHeaders mutates a.d.m.MsgPrefix to reflect Sieve editheader
+// moxSRSConfig returns the resolved SRS config if SRS is enabled and ready, or
+// nil to indicate forwarding should keep the original envelope sender.
+func moxSRSConfig() *srs.Config {
+	s := mox.Conf.Static.SRS
+	if s == nil || !s.Enabled || len(s.Secret) == 0 || s.DNSDomain.IsZero() {
+		return nil
+	}
+	return &srs.Config{Secret: s.Secret, Domain: s.DNSDomain, MaxAge: s.MaxAge}
+}
+
+// senderAddress converts an envelope smtp.Path to an smtp.Address for SRS. The
+// caller has already ensured the path is not the null sender and carries a
+// domain (not a bare IP), which holds for envelope senders of forwarded mail.
+func senderAddress(p smtp.Path) smtp.Address {
+	return smtp.Address{Localpart: p.Localpart, Domain: p.IPDomain.Domain}
+}
+
+// senderIsLocal reports whether the envelope sender is at a domain this server
+// hosts (a configured domain or the system hostname). Such senders are already
+// covered by our own SPF, so SRS rewriting is skipped for them.
+func senderIsLocal(p smtp.Path) bool {
+	d := p.IPDomain.Domain
+	if d.IsZero() {
+		return false
+	}
+	if _, ok := mox.Conf.Domain(d); ok {
+		return true
+	}
+	return d == mox.Conf.Static.HostnameDomain
+}
+
 // addheader/deleteheader actions captured in the decision. The on-disk
 // message file is never mutated (it is shared between recipients and is
 // immutable per the storage layer); deletions therefore only affect

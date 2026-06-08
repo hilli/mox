@@ -637,6 +637,29 @@ func PrepareStaticConfig(ctx context.Context, log mlog.Log, configFile string, c
 	}
 	c.HostnameDomain = hostname
 
+	if c.SRS != nil && c.SRS.Enabled {
+		if c.SRS.Domain == "" {
+			c.SRS.DNSDomain = c.HostnameDomain
+		} else if d, err := dns.ParseDomain(c.SRS.Domain); err != nil {
+			addErrorf("parsing srs domain %q: %v", c.SRS.Domain, err)
+		} else {
+			c.SRS.DNSDomain = d
+		}
+		if c.SRS.SecretFile == "" {
+			addErrorf("srs enabled but no secret file configured")
+		} else {
+			p := configDirPath(configFile, c.SRS.SecretFile)
+			buf, err := os.ReadFile(p)
+			if err != nil {
+				addErrorf("reading srs secret file %q: %v", p, err)
+			} else if secret := bytes.TrimSpace(buf); len(secret) == 0 {
+				addErrorf("srs secret file %q is empty", p)
+			} else {
+				c.SRS.Secret = secret
+			}
+		}
+	}
+
 	if c.HostTLSRPT.Account != "" {
 		tlsrptLocalpart, err := smtp.ParseLocalpart(c.HostTLSRPT.Localpart)
 		if err != nil {

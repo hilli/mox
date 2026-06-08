@@ -840,6 +840,34 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 		# (optional)
 		FailureMode:
 
+	# Sender Rewriting Scheme. When forwarding a message to a third party (e.g. via a
+	# Sieve redirect), the envelope sender is rewritten to a local address at the
+	# configured domain so SPF passes on the forwarding hop, and bounces are decoded
+	# and relayed back to the original sender. Only the SMTP envelope is rewritten;
+	# message headers (including From) are left intact, so DKIM/DMARC of the original
+	# message are unaffected. If unset, SRS is disabled and forwarded messages keep
+	# the original envelope sender. (optional)
+	SRS:
+
+		# If true, rewrite the envelope sender of forwarded messages using SRS, and
+		# accept/relay bounces to SRS addresses at Domain.
+		Enabled: false
+
+		# File containing the HMAC secret used to sign and verify rewritten addresses.
+		# Keep this stable: rotating it invalidates outstanding rewritten senders, so
+		# in-flight bounces can no longer be decoded. Must be the same across any mox
+		# instances sharing the SRS Domain.
+		SecretFile:
+
+		# Domain that rewritten envelope senders are anchored at, e.g. the mail hostname.
+		# It must publish an SPF record authorising this server and have DKIM configured
+		# so forwarded mail is signed. If empty, the global hostname is used. (optional)
+		Domain:
+
+		# How long a rewritten sender remains valid for bounce reversal. Bounces to older
+		# SRS addresses are rejected. Default 21 days. (optional)
+		MaxAge: 0s
+
 # domains.conf
 
 	# NOTE: This config file is in 'sconf' format. Indent with tabs. Comments must be
@@ -1790,6 +1818,58 @@ config example <name>". Below are all examples included in mox.
 	Routes:
 		-
 			Transport: Example
+
+# Example srs
+
+	# Snippet for mox.conf, enabling SRS (Sender Rewriting Scheme).
+	#
+	# SRS is used when mox forwards a message to a third party, e.g. through a Sieve
+	# "redirect" action. Without SRS, the forwarded message keeps the original
+	# envelope sender, so the receiving server's SPF check fails (mox's IP is not in
+	# the original sender domain's SPF record). With SRS, mox rewrites the envelope
+	# sender to a local address at the SRS domain (which lists mox in its SPF record),
+	# and decodes bounces (DSNs) back to the original sender. Only the SMTP envelope
+	# is rewritten; the message's From header and DKIM signatures are untouched, so
+	# DMARC of the original message is unaffected.
+	#
+	# Operator prerequisites:
+	#   - The SRS Domain must publish an SPF record authorising this host to send,
+	#     so the forwarding hop passes SPF at the destination. For example, if mox
+	#     also sends for the domain directly:
+	#       mail.mox.example.  TXT  "v=spf1 a mx -all"
+	#     or to authorise just this host's address:
+	#       mail.mox.example.  TXT  "v=spf1 a:mail.mox.example -all"
+	#   - The SRS Domain should have DKIM configured (see the domain's DKIM settings)
+	#     so forwarded mail carries a valid signature from the forwarding host. Note
+	#     SRS does not touch the original message's From/DKIM; this DKIM is the
+	#     forwarding host's own signature, which helps at destinations doing ARC or
+	#     strict alignment on the envelope.
+	#   - Set a correct PTR/reverse-DNS record for this host's sending IP; many
+	#     destinations check it for forwarded mail.
+	#   - Senders already at a domain this server hosts are NOT rewritten: our own
+	#     SPF authorises us for them, so their bounces flow back natively. SRS only
+	#     rewrites foreign senders (the same behaviour as postsrsd).
+	#   - Create the secret file with a long random value, readable by mox, e.g.:
+	#       head -c 32 /dev/urandom | base64 > /path/to/srs-secret
+	#     Keep it stable: rotating it invalidates outstanding rewritten senders, so
+	#     in-flight bounces can no longer be decoded.
+
+	SRS:
+		# Rewrite forwarded envelope senders and accept/relay bounces at Domain.
+		Enabled: true
+
+		# File with the HMAC secret used to sign and verify rewritten addresses.
+		# Relative paths are interpreted from the directory of mox.conf.
+		SecretFile: srs-secret
+
+		# Domain rewritten senders are anchored at. Should be a domain (or subdomain)
+		# whose SPF record authorises this host and which has DKIM configured. If
+		# empty, the global hostname is used. (optional)
+		Domain: mail.mox.example
+
+		# How long a rewritten sender stays valid for bounce reversal; bounces to older
+		# SRS addresses are rejected. Default 21 days. (optional)
+		MaxAge: 504h0m0s
 */
 package config
 

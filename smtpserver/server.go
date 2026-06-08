@@ -58,6 +58,7 @@ import (
 	"github.com/mjl-/mox/scram"
 	"github.com/mjl-/mox/smtp"
 	"github.com/mjl-/mox/spf"
+	"github.com/mjl-/mox/srs"
 	"github.com/mjl-/mox/store"
 	"github.com/mjl-/mox/tlsrpt"
 	"github.com/mjl-/mox/tlsrptdb"
@@ -390,14 +391,25 @@ type rcptAlias struct {
 	CanonicalAddress string // Optional catchall part stripped and/or lowercased.
 }
 
+// rcptSRS marks a recipient that is an inbound SRS bounce: an authenticated
+// (HMAC-verified at RCPT time) DSN addressed to an SRS address mox previously
+// generated when forwarding a message. Such recipients are not delivered to a
+// local mailbox; instead the message is relayed onward to Target (the decoded
+// original sender, or the upstream forwarder for SRS1) with the null envelope
+// sender preserved.
+type rcptSRS struct {
+	Target smtp.Path
+}
+
 type recipient struct {
 	Addr smtp.Path
 
-	// If account and alias are both not set, this is not for a local address. This is
-	// normal for submission, where messages are added to the queue. For incoming
-	// deliveries, this will result in an error.
+	// If account, alias and srs are all unset, this is not for a local address.
+	// This is normal for submission, where messages are added to the queue. For
+	// incoming deliveries, this will result in an error.
 	Account *rcptAccount // If set, recipient address is for this local account.
 	Alias   *rcptAlias   // If set, for a local alias.
+	SRS     *rcptSRS     // If set, an inbound SRS bounce to relay onward.
 }
 
 func isClosed(err error) bool {
@@ -2012,15 +2024,21 @@ func (c *conn) cmdRcpt(p *parser) {
 		if !c.submission {
 			xsmtpUserErrorf(smtp.C550MailboxUnavail, smtp.SeAddr1UnknownDestMailbox1, "not accepting email for ip")
 		}
-		c.recipients = append(c.recipients, recipient{fpath, nil, nil})
+		c.recipients = append(c.recipients, recipient{Addr: fpath})
+	} else if target, ok := c.srsReverse(fpath); ok {
+		// Inbound SRS bounce: an authenticated DSN to an SRS address we minted.
+		// Checked before LookupAddress because the SRS domain is itself a local
+		// domain, so the SRS localpart would otherwise be an unknown user. The
+		// message is relayed onward (not stored) at delivery time.
+		c.recipients = append(c.recipients, recipient{Addr: fpath, SRS: &rcptSRS{Target: target}})
 	} else if accountName, alias, canonical, dest, err := mox.LookupAddress(fpath.Localpart, fpath.IPDomain.Domain, true, true, true); err == nil {
 		// note: a bare postmaster, without domain, is handled by LookupAddress. ../rfc/5321:735
 		if alias != nil {
-			c.recipients = append(c.recipients, recipient{fpath, nil, &rcptAlias{*alias, canonical}})
+			c.recipients = append(c.recipients, recipient{Addr: fpath, Alias: &rcptAlias{*alias, canonical}})
 		} else if dest.SMTPError != "" {
 			xsmtpServerErrorf(codes{dest.SMTPErrorCode, dest.SMTPErrorSecode}, "%s", dest.SMTPErrorMsg)
 		} else {
-			c.recipients = append(c.recipients, recipient{fpath, &rcptAccount{accountName, dest, canonical}, nil})
+			c.recipients = append(c.recipients, recipient{Addr: fpath, Account: &rcptAccount{accountName, dest, canonical}})
 		}
 
 	} else if Localserve {
@@ -2030,7 +2048,7 @@ func (c *conn) cmdRcpt(p *parser) {
 		// which is typically the mox user.
 		acc, _ := mox.Conf.Account("mox")
 		dest := acc.Destinations["mox@localhost"]
-		c.recipients = append(c.recipients, recipient{fpath, &rcptAccount{"mox", dest, "mox@localhost"}, nil})
+		c.recipients = append(c.recipients, recipient{Addr: fpath, Account: &rcptAccount{"mox", dest, "mox@localhost"}})
 	} else if errors.Is(err, mox.ErrDomainDisabled) {
 		c.log.Info("smtp recipient for temporarily disabled domain", slog.Any("domain", fpath.IPDomain.Domain))
 		xsmtpUserErrorf(smtp.C450MailboxUnavail, smtp.SeMailbox2Disabled1, "recipient domain temporarily disabled")
@@ -2039,7 +2057,7 @@ func (c *conn) cmdRcpt(p *parser) {
 			xsmtpUserErrorf(smtp.C550MailboxUnavail, smtp.SeAddr1UnknownDestMailbox1, "not accepting email for domain")
 		}
 		// We'll be delivering this email.
-		c.recipients = append(c.recipients, recipient{fpath, nil, nil})
+		c.recipients = append(c.recipients, recipient{Addr: fpath})
 	} else if errors.Is(err, mox.ErrAddressNotFound) {
 		if c.submission {
 			// For submission, we're transparent about which user exists. Should be fine for the typical small-scale deploy.
@@ -2049,12 +2067,79 @@ func (c *conn) cmdRcpt(p *parser) {
 		// We pretend to accept. We don't want to let remote know the user does not exist
 		// until after DATA. Because then remote has committed to sending a message.
 		// note: not local for !c.submission is the signal this address is in error.
-		c.recipients = append(c.recipients, recipient{fpath, nil, nil})
+		c.recipients = append(c.recipients, recipient{Addr: fpath})
 	} else {
 		c.log.Errorx("looking up account for delivery", err, slog.Any("rcptto", fpath))
 		xsmtpServerErrorf(codes{smtp.C451LocalErr, smtp.SeSys3Other0}, "error processing")
 	}
 	c.xbwritecodeline(smtp.C250Completed, smtp.SeAddr1Other0, "now on the list", nil)
+}
+
+// srsReverse reports whether fpath is an inbound SRS bounce address at the
+// configured SRS domain, returning the decoded address the bounce must be
+// relayed to. It is consulted during RCPT TO, before normal address lookup,
+// because the SRS rewrite domain is itself a local domain whose SRS localparts
+// have no account.
+//
+// A normal (non-SRS) address returns ok=false so the caller falls through to
+// regular delivery. A syntactically-SRS address that fails HMAC verification or
+// is past its validity window is rejected here with a permanent SMTP error: such
+// an address was forged or is stale, and relaying it would turn mox into an open
+// relay for backscatter. Only addresses mox itself minted verify, so relaying a
+// verified address is safe regardless of the envelope sender.
+func (c *conn) srsReverse(fpath smtp.Path) (smtp.Path, bool) {
+	s := mox.Conf.Static.SRS
+	if s == nil || !s.Enabled || len(s.Secret) == 0 || s.DNSDomain.IsZero() {
+		return smtp.Path{}, false
+	}
+	if fpath.IPDomain.Domain.IsZero() || fpath.IPDomain.Domain.Name() != s.DNSDomain.Name() {
+		return smtp.Path{}, false
+	}
+	if !srs.IsSRS(fpath.Localpart) {
+		return smtp.Path{}, false
+	}
+	cfg := srs.Config{Secret: s.Secret, Domain: s.DNSDomain, MaxAge: s.MaxAge}
+	target, err := srs.Reverse(smtp.Address{Localpart: fpath.Localpart, Domain: fpath.IPDomain.Domain}, cfg)
+	if err != nil {
+		if errors.Is(err, srs.ErrNotSRS) {
+			return smtp.Path{}, false
+		}
+		c.log.Infox("rejecting invalid srs bounce address", err, slog.Any("rcptto", fpath))
+		xsmtpUserErrorf(smtp.C550MailboxUnavail, smtp.SeAddr1UnknownDestMailbox1, "invalid or expired SRS address")
+	}
+	return smtp.Path{Localpart: target.Localpart, IPDomain: dns.IPDomain{Domain: target.Domain}}, true
+}
+
+// relaySRSBounces relays any inbound SRS-bounce recipients onward to their
+// decoded targets via the outgoing queue, preserving the null envelope sender of
+// a DSN, and removes them from c.recipients so the remainder of delivery only
+// handles ordinary local recipients. It returns the number of bounces relayed.
+//
+// The bounces are already authenticated (HMAC-verified during RCPT TO), so there
+// is no further policy check here. A queue failure aborts the transaction with a
+// temporary error so the upstream retries rather than losing the DSN.
+func (c *conn) relaySRSBounces(ctx context.Context, recvHdrFor func(string) string, msgWriter *message.Writer, dataFile *os.File) int {
+	kept := c.recipients[:0:0]
+	var relayed int
+	now := time.Now()
+	for _, rcpt := range c.recipients {
+		if rcpt.SRS == nil {
+			kept = append(kept, rcpt)
+			continue
+		}
+		prefix := []byte(recvHdrFor(rcpt.SRS.Target.String()))
+		size := int64(len(prefix)) + msgWriter.Size
+		// Null sender: a relayed DSN keeps its empty MAIL FROM.
+		qm := queue.MakeMsg(smtp.Path{}, rcpt.SRS.Target, msgWriter.Has8bit, c.msgsmtputf8, size, "", prefix, c.requireTLS, now, "")
+		if err := queue.Add(ctx, c.log, mox.Conf.Static.Postmaster.Account, dataFile, qm); err != nil {
+			c.log.Errorx("relaying srs bounce", err, slog.Any("target", rcpt.SRS.Target))
+			xsmtpServerErrorf(codes{smtp.C451LocalErr, smtp.SeSys3Other0}, "error relaying bounce, try again later")
+		}
+		c.log.Info("relayed srs bounce", slog.Any("target", rcpt.SRS.Target))
+		relayed++
+	}
+	c.recipients = kept
+	return relayed
 }
 
 func hasNonASCII(s string) bool {
@@ -2608,6 +2693,18 @@ func (c *conn) xlocalserveError(lp smtp.Localpart) {
 // sources. i.e. not submitted by authenticated users.
 func (c *conn) deliver(ctx context.Context, recvHdrFor func(string) string, msgWriter *message.Writer, iprevStatus iprev.Status, iprevAuthentic bool, dataFile *os.File) {
 	// todo: in decision making process, if we run into (some) temporary errors, attempt to continue. if we decide to accept, all good. if we decide to reject, we'll make it a temporary reject.
+
+	// Relay any inbound SRS bounces to their decoded original senders and drop
+	// them from the recipient set. If the transaction was nothing but SRS
+	// bounces, we're done: skip the local-delivery machinery (DKIM/SPF analysis,
+	// mailbox storage) entirely.
+	if c.relaySRSBounces(ctx, recvHdrFor, msgWriter, dataFile) > 0 && len(c.recipients) == 0 {
+		c.transactionGood++
+		c.transactionBad-- // Compensate for early earlier pessimistic increase.
+		c.rset()
+		c.xwritecodeline(smtp.C250Completed, smtp.SeMailbox2Other0, "it is done", nil)
+		return
+	}
 
 	var msgFrom smtp.Address
 	var envelope *message.Envelope
