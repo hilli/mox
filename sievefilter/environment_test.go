@@ -14,10 +14,10 @@ type fakeHandler struct {
 	env       map[string]string
 }
 
-func (h *fakeHandler) Keep() error               { h.delivered = "INBOX"; return nil }
-func (h *fakeHandler) Discard() error            { h.delivered = "/dev/null"; return nil }
+func (h *fakeHandler) Keep() error                { h.delivered = "INBOX"; return nil }
+func (h *fakeHandler) Discard() error             { h.delivered = "/dev/null"; return nil }
 func (h *fakeHandler) Redirect(addr string) error { return nil }
-func (h *fakeHandler) FileInto(mb string) error  { h.delivered = mb; return nil }
+func (h *fakeHandler) FileInto(mb string) error   { h.delivered = mb; return nil }
 func (h *fakeHandler) SieveEnvironment(name string) (string, bool) {
 	v, ok := h.env[name]
 	return v, ok

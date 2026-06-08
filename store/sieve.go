@@ -14,13 +14,13 @@ import (
 // Sieve script-related errors. Tested for by managesieveserver to map to
 // ManageSieve protocol response codes.
 var (
-	ErrSieveScriptNotFound       = errors.New("sieve: script not found")
-	ErrSieveScriptExists         = errors.New("sieve: script already exists")
-	ErrSieveScriptNameInvalid    = errors.New("sieve: script name invalid")
-	ErrSieveScriptTooLarge       = errors.New("sieve: script too large")
-	ErrSieveTooManyScripts       = errors.New("sieve: too many scripts")
-	ErrSieveTotalTooLarge        = errors.New("sieve: total scripts too large")
-	ErrSieveScriptActive         = errors.New("sieve: script is active")
+	ErrSieveScriptNotFound    = errors.New("sieve: script not found")
+	ErrSieveScriptExists      = errors.New("sieve: script already exists")
+	ErrSieveScriptNameInvalid = errors.New("sieve: script name invalid")
+	ErrSieveScriptTooLarge    = errors.New("sieve: script too large")
+	ErrSieveTooManyScripts    = errors.New("sieve: too many scripts")
+	ErrSieveTotalTooLarge     = errors.New("sieve: total scripts too large")
+	ErrSieveScriptActive      = errors.New("sieve: script is active")
 )
 
 // SieveScript is a per-account Sieve script stored by ManageSieve PUTSCRIPT.

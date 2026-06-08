@@ -162,12 +162,12 @@ func ExecuteIMAPEvent(ctx context.Context, in IMAPEventInput) (IMAPEventDecision
 		return d, fmt.Errorf("compile: %w", err)
 	}
 	env := EnvironmentValues{
-		"location":         "MS",
-		"phase":            "post",
-		"imap.cause":       in.Cause,
-		"imap.mailbox":     in.Mailbox,
-		"imap.user":        in.User,
-		"imap.email":       in.Email,
+		"location":          "MS",
+		"phase":             "post",
+		"imap.cause":        in.Cause,
+		"imap.mailbox":      in.Mailbox,
+		"imap.user":         in.User,
+		"imap.email":        in.Email,
 		"imap.changedflags": strings.Join(in.ChangedFlags, " "),
 	}
 	h := &imapEventHandler{

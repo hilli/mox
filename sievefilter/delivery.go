@@ -63,23 +63,23 @@ type VacationParams struct {
 
 // HeaderEdit captures an editheader add/delete request.
 type HeaderEdit struct {
-	Name    string
-	Value   string
-	AtTop   bool     // for add
-	Pattern []string // for delete
-	Index   int      // for delete; 0 means all
-	FromLast bool    // for delete
+	Name     string
+	Value    string
+	AtTop    bool     // for add
+	Pattern  []string // for delete
+	Index    int      // for delete; 0 means all
+	FromLast bool     // for delete
 }
 
 // DeliveryInput is the input to a delivery-time Sieve evaluation.
 type DeliveryInput struct {
-	Policy           Policy
-	Script           []byte         // Active script for the account.
-	Message          *MoxMessage    // The message being delivered.
-	DefaultMailbox   string         // Mailbox chosen by Mox before Sieve runs.
-	Environment      EnvironmentValues
-	CurrentFlags     []string // Current IMAP flags/keywords (usually empty at delivery).
-	Log              mlog.Log
+	Policy         Policy
+	Script         []byte      // Active script for the account.
+	Message        *MoxMessage // The message being delivered.
+	DefaultMailbox string      // Mailbox chosen by Mox before Sieve runs.
+	Environment    EnvironmentValues
+	CurrentFlags   []string // Current IMAP flags/keywords (usually empty at delivery).
+	Log            mlog.Log
 }
 
 // EnvironmentValues snapshot for a single Sieve evaluation. Implements
