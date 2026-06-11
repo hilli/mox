@@ -130,6 +130,8 @@ type Static struct {
 
 	SRS *SRS `sconf:"optional" sconf-doc:"Sender Rewriting Scheme. When forwarding a message to a third party (e.g. via a Sieve redirect), the envelope sender is rewritten to a local address at the configured domain so SPF passes on the forwarding hop, and bounces are decoded and relayed back to the original sender. Only the SMTP envelope is rewritten; message headers (including From) are left intact, so DKIM/DMARC of the original message are unaffected. If unset, SRS is disabled and forwarded messages keep the original envelope sender."`
 
+	ForwardEnvelope string `sconf:"optional" sconf-doc:"Envelope MAIL FROM strategy for Sieve redirect/forwarding. Empty means use SRS (the default behaviour). 'recipient' means use the local address the message was delivered to as the envelope sender (traceable, and required to be a registered sender when relaying via an authenticated smarthost such as Azure Communication Services). Any other non-empty value is parsed as a fixed envelope address to use for all forwards. The null sender (bounces being forwarded) is always preserved. Only the SMTP envelope is affected; the message From header and DKIM signatures are left intact."`
+
 	// All IPs that were explicitly listened on for external SMTP. Only set when there
 	// are no unspecified external SMTP listeners and there is at most one for IPv4 and
 	// at most one for IPv6. Used for setting the local address when making outgoing

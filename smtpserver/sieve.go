@@ -201,22 +201,41 @@ func submitRedirect(ctx context.Context, log mlog.Log, c *conn, a analysis, data
 		return errors.New("missing mail from for redirect")
 	}
 	sender := *c.mailFrom
-	// SRS: rewrite the envelope sender so the forwarding hop passes SPF at the
-	// destination, and so bounces (DSNs) come back to an address we can decode.
-	// Skip the null sender (a bounce being forwarded must keep its empty MAIL
-	// FROM). Skip senders already at a domain we host: our own SPF authorises
-	// this server for them, so rewriting is unnecessary and lets their bounces
-	// flow back natively (this also doubles as the per-domain opt-out). Only the
-	// envelope changes; the message's From header and DKIM signatures are
-	// untouched, preserving the original DMARC alignment. On any rewrite error we
-	// fall back to the original sender rather than dropping mail.
-	if srsCfg := moxSRSConfig(); srsCfg != nil && !sender.IsZero() && !senderIsLocal(sender) {
-		if rewritten, err := srs.Forward(senderAddress(sender), *srsCfg); err != nil {
-			log.Errorx("srs forward rewrite, using original sender", err, slog.String("sender", sender.String()))
+	// Envelope MAIL FROM strategy for forwards. The null sender (a bounce being
+	// forwarded) is always preserved. Otherwise ForwardEnvelope selects:
+	//   "recipient" - use the local address the message was delivered to. This is
+	//      traceable and, when relaying via an authenticated smarthost such as
+	//      ACS, is a registered sender so the relay accepts it.
+	//   non-empty   - a fixed envelope address used for all forwards.
+	//   empty       - SRS (default): rewrite non-local senders so the forwarding
+	//      hop passes SPF and bounces (DSNs) can be decoded back to the original
+	//      sender. Senders already at a domain we host are left untouched.
+	// In all cases only the SMTP envelope changes; the message From header and
+	// DKIM signatures are untouched, preserving original DMARC alignment. On any
+	// rewrite error we fall back to the original sender rather than dropping mail.
+	switch {
+	case sender.IsZero():
+		// keep the null sender
+	case mox.Conf.Static.ForwardEnvelope == "recipient":
+		if !a.d.smtpRcptTo.IsZero() {
+			sender = a.d.smtpRcptTo
+		}
+	case mox.Conf.Static.ForwardEnvelope != "":
+		if p, err := smtp.ParseAddress(mox.Conf.Static.ForwardEnvelope); err != nil {
+			log.Errorx("parse forwardenvelope address, using original sender", err, slog.String("forwardenvelope", mox.Conf.Static.ForwardEnvelope))
 		} else {
-			sender = rewritten.Path()
+			sender = p.Path()
+		}
+	default:
+		if srsCfg := moxSRSConfig(); srsCfg != nil && !senderIsLocal(sender) {
+			if rewritten, err := srs.Forward(senderAddress(sender), *srsCfg); err != nil {
+				log.Errorx("srs forward rewrite, using original sender", err, slog.String("sender", sender.String()))
+			} else {
+				sender = rewritten.Path()
+			}
 		}
 	}
+
 	subject := ""
 	now := time.Now()
 	prefix := a.d.m.MsgPrefix

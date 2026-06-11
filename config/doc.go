@@ -868,6 +868,16 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 		# SRS addresses are rejected. Default 21 days. (optional)
 		MaxAge: 0s
 
+	# Envelope MAIL FROM strategy for Sieve redirect/forwarding. Empty means use SRS
+	# (the default behaviour). 'recipient' means use the local address the message was
+	# delivered to as the envelope sender (traceable, and required to be a registered
+	# sender when relaying via an authenticated smarthost such as Azure Communication
+	# Services). Any other non-empty value is parsed as a fixed envelope address to
+	# use for all forwards. The null sender (bounces being forwarded) is always
+	# preserved. Only the SMTP envelope is affected; the message From header and DKIM
+	# signatures are left intact. (optional)
+	ForwardEnvelope:
+
 # domains.conf
 
 	# NOTE: This config file is in 'sconf' format. Indent with tabs. Comments must be
