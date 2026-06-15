@@ -107,7 +107,7 @@ func sieveScriptForMailbox(acc *store.Account, mailboxName string) (scriptName s
 
 // runIMAPSieve runs the active IMAPSIEVE script (if any) for the given event
 // and applies the resulting decision (file message into additional mailbox,
-// mark original deleted, set flags, etc.). Loop prevention: when c.inSieve is
+// mark original deleted, change flags, etc.). Loop prevention: when c.inSieve is
 // already set we return immediately, satisfying RFC 6785 §2.2.3 — flag
 // changes (and similar mutations) caused by a Sieve-triggered action do not
 // trigger another script invocation.
@@ -176,7 +176,7 @@ func (c *conn) runIMAPSieve(cause, mailboxName string, msg *store.Message, dataF
 }
 
 // applyIMAPSieveDecision applies an IMAPEventDecision: fileinto copies,
-// redirects via queue, mark-deleted on the original, flag updates.
+// redirects via queue, mark-deleted on the original, flag changes.
 func (c *conn) applyIMAPSieveDecision(cause, mailboxName string, msg *store.Message, dataFile *os.File, dec sievefilter.IMAPEventDecision) {
 	if dec.Warning != "" {
 		c.log.Warn("imapsieve warning", slog.String("warning", dec.Warning))
@@ -203,8 +203,8 @@ func (c *conn) applyIMAPSieveDecision(cause, mailboxName string, msg *store.Mess
 		}
 	}
 
-	// Flag updates for FLAG-cause events.
-	if cause == sievefilter.IMAPCauseFlag && len(dec.Flags) > 0 && msg != nil {
+	// RFC 6785 §3.8: imap4flags actions apply to any IMAP event case.
+	if dec.FlagsChanged && msg != nil {
 		if err := imapSieveSetFlags(c, msg, dec.Flags); err != nil {
 			c.log.Errorx("imapsieve set flags", err, slog.Int64("messageid", msg.ID))
 		}
@@ -315,7 +315,7 @@ func imapSieveMarkDeleted(c *conn, msg *store.Message) error {
 	return nil
 }
 
-// imapSieveSetFlags applies the given flag list to msg. System flags
+// imapSieveSetFlags replaces msg's flags with the given final flag list. System flags
 // (starting with `\`) update Message.Flags fields; user keywords go into
 // Message.Keywords (and the mailbox-level keyword set, broadcast as
 // ChangeMailboxKeywords if new). The flag change is broadcast so other
@@ -337,6 +337,17 @@ func imapSieveSetFlags(c *conn, msg *store.Message, flags []string) error {
 		mb.Sub(fresh.MailboxCounts())
 		origFlags := fresh.Flags
 		origKwLen := len(mb.Keywords)
+		fresh.Seen = false
+		fresh.Answered = false
+		fresh.Flagged = false
+		fresh.Deleted = false
+		fresh.Draft = false
+		fresh.Forwarded = false
+		fresh.Junk = false
+		fresh.Notjunk = false
+		fresh.Phishing = false
+		fresh.MDNSent = false
+		fresh.Keywords = nil
 		var newKeywords []string
 		for _, f := range flags {
 			if !strings.HasPrefix(f, `\`) && !strings.HasPrefix(f, `$`) {
@@ -486,6 +497,9 @@ func msgFlagNames(m *store.Message) []string {
 	if m.Phishing {
 		out = append(out, `$Phishing`)
 	}
+	if m.MDNSent {
+		out = append(out, `$MDNSent`)
+	}
 	out = append(out, m.Keywords...)
 	return out
 }
@@ -504,6 +518,16 @@ func setStoreFlagKeyword(m *store.Message, flag string) {
 		m.Deleted = true
 	case `\Draft`:
 		m.Draft = true
+	case `$Forwarded`:
+		m.Forwarded = true
+	case `$Junk`:
+		m.Junk = true
+	case `$NotJunk`:
+		m.Notjunk = true
+	case `$Phishing`:
+		m.Phishing = true
+	case `$MDNSent`:
+		m.MDNSent = true
 	default:
 		// User keyword. Mox stores keywords lowercased in IMAP.
 		kw := strings.ToLower(flag)

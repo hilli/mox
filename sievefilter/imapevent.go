@@ -125,7 +125,7 @@ type IMAPEventInput struct {
 //     caller should set \Deleted on it (optionally expunging UID-only).
 //   - `FileInto` mailboxes get an *additional* copy of the message.
 //   - `RedirectTo` causes the message to be (re-)sent via SMTP submission.
-//   - `Flags` are applied to the original (e.g. for FLAG-cause scripts).
+//   - If `FlagsChanged`, `Flags` are the final flags for the original.
 //   - `HeaderAdds`/`HeaderDeletes` apply only to redirect/fileinto copies
 //     (transient per RFC 6785 §3.7).
 type IMAPEventDecision struct {
@@ -133,6 +133,7 @@ type IMAPEventDecision struct {
 	FileInto      []FileIntoTarget
 	RedirectTo    []string
 	Flags         []string
+	FlagsChanged  bool
 	HeaderAdds    []HeaderEdit
 	HeaderDeletes []HeaderEdit
 	Warning       string
@@ -243,22 +244,26 @@ func (h *imapEventHandler) FileIntoWithFlags(mailbox string, flags []string) err
 
 // imap4flags.Handler
 func (h *imapEventHandler) SetFlags(flags []string) error {
-	h.decision.Flags = append(h.decision.Flags[:0], flags...)
 	h.currentFlags = append(h.currentFlags[:0], flags...)
+	h.setDecisionFlags()
 	return nil
 }
 func (h *imapEventHandler) AddFlags(flags []string) error {
-	h.decision.Flags = appendUnique(h.decision.Flags, flags...)
 	h.currentFlags = appendUnique(h.currentFlags, flags...)
+	h.setDecisionFlags()
 	return nil
 }
 func (h *imapEventHandler) RemoveFlags(flags []string) error {
 	h.currentFlags = removeAll(h.currentFlags, flags)
-	h.decision.Flags = removeAll(h.decision.Flags, flags)
+	h.setDecisionFlags()
 	return nil
 }
 func (h *imapEventHandler) CurrentFlags() []string {
 	return append([]string(nil), h.currentFlags...)
+}
+func (h *imapEventHandler) setDecisionFlags() {
+	h.decision.FlagsChanged = true
+	h.decision.Flags = append(h.decision.Flags[:0], h.currentFlags...)
 }
 
 // editheader.Handler — transient per RFC 6785 §3.7; recorded in decision and
