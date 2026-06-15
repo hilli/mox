@@ -409,6 +409,39 @@ keep;
 	}
 }
 
+func TestIMAPSieveMoveRemoveSeen(t *testing.T) {
+	tc := start(t, false)
+	defer tc.close()
+	restoreSieve := enableIMAPSieve(t)
+	defer restoreSieve()
+	tc.login("mjl@mox.example", password0)
+
+	script := `require ["imap4flags"];
+removeflag "\\Seen";
+keep;
+`
+	tcheck(t, tc.account.SievePutScript("markunseen", []byte(script)), "put sieve script")
+	tc.transactf("ok", "create TODO")
+	tc.transactf("ok", `setmetadata TODO (/shared/imapsieve/script "markunseen")`)
+
+	tc.transactf("ok", "append Inbox (\\Seen) {%d+}\r\n%s", len(exampleMsg), exampleMsg)
+	tc.transactf("ok", "select Inbox")
+	tc.transactf("ok", "move 1 TODO")
+
+	waitForSieveEffect(t, func() bool {
+		msgs := messagesIn(t, tc.account, "TODO")
+		return len(msgs) == 1 && !msgs[0].Seen
+	})
+
+	msgs := messagesIn(t, tc.account, "TODO")
+	if len(msgs) != 1 {
+		t.Fatalf("TODO: got %d messages, want 1", len(msgs))
+	}
+	if msgs[0].Seen {
+		t.Fatalf("TODO move is still marked \\Seen")
+	}
+}
+
 // TestIMAPSieveStoreLoopPrevention verifies that a script which adds a flag
 // in response to a flag change does not infinitely recurse. The script
 // installs a flag if missing, but the second invocation (re-entered) is

@@ -123,6 +123,7 @@ func (c *conn) runIMAPSieve(cause, mailboxName string, msg *store.Message, dataF
 	}
 	if c.inSieve {
 		// Re-entrant call from a Sieve action; do not fire again.
+		c.log.Debug("imapsieve skipped during re-entrant sieve action", slog.String("cause", cause), slog.String("mailbox", mailboxName))
 		return
 	}
 	// Resolve effective policy.
@@ -133,6 +134,7 @@ func (c *conn) runIMAPSieve(cause, mailboxName string, msg *store.Message, dataF
 	server, dom, acc := mox.Conf.SievePolicy(c.account.Name, domain)
 	policy := sievefilter.Resolve(server, dom, acc)
 	if !policy.Enabled || !policy.RunOnIMAPEvents {
+		c.log.Debug("imapsieve skipped by policy", slog.String("cause", cause), slog.String("mailbox", mailboxName), slog.Bool("enabled", policy.Enabled), slog.Bool("runonimapevents", policy.RunOnIMAPEvents))
 		return
 	}
 
@@ -142,6 +144,11 @@ func (c *conn) runIMAPSieve(cause, mailboxName string, msg *store.Message, dataF
 		return
 	}
 	if len(scriptContent) == 0 {
+		if scriptName == "" {
+			c.log.Debug("imapsieve no script selected", slog.String("cause", cause), slog.String("mailbox", mailboxName))
+		} else {
+			c.log.Debug("imapsieve selected script not found", slog.String("script", scriptName), slog.String("cause", cause), slog.String("mailbox", mailboxName))
+		}
 		return
 	}
 
@@ -167,11 +174,17 @@ func (c *conn) runIMAPSieve(cause, mailboxName string, msg *store.Message, dataF
 	c.inSieve = true
 	defer func() { c.inSieve = false }()
 
+	var msgID int64
+	if msg != nil {
+		msgID = msg.ID
+	}
+	c.log.Debug("imapsieve executing", slog.String("script", scriptName), slog.String("cause", cause), slog.String("mailbox", mailboxName), slog.Int64("messageid", msgID))
 	dec, err := sievefilter.ExecuteIMAPEvent(context.Background(), in)
 	if err != nil {
 		c.log.Errorx("imapsieve execute", err, slog.String("script", scriptName), slog.String("cause", cause), slog.String("mailbox", mailboxName))
 		return
 	}
+	c.log.Debug("imapsieve executed", slog.String("script", scriptName), slog.String("cause", cause), slog.String("mailbox", mailboxName), slog.Int64("messageid", msgID), slog.Bool("markdeleted", dec.MarkDeleted), slog.Int("fileinto", len(dec.FileInto)), slog.Int("redirect", len(dec.RedirectTo)), slog.Bool("flagschanged", dec.FlagsChanged))
 	c.applyIMAPSieveDecision(cause, mailboxName, msg, dataFile, dec)
 }
 
