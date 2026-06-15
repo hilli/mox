@@ -836,12 +836,14 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 		# (optional)
 		AutoCreateMailboxes: false
 
-		# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
-		# (optional)
+		# If set, execute the ManageSieve active script on incoming SMTP delivery. Default
+		# true. (optional)
 		RunOnDelivery: false
 
-		# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
-		# false. (optional)
+		# If set, execute Sieve scripts selected by IMAP METADATA
+		# (/shared/imapsieve/script) on IMAP events (RFC 6785 IMAPSIEVE). Scripts are
+		# uploaded with ManageSieve; SETACTIVE is not used for IMAPSIEVE selection.
+		# Default false. (optional)
 		RunOnIMAPEvents: false
 
 		# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return
@@ -1160,12 +1162,14 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 				# (optional)
 				AutoCreateMailboxes: false
 
-				# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
-				# (optional)
+				# If set, execute the ManageSieve active script on incoming SMTP delivery. Default
+				# true. (optional)
 				RunOnDelivery: false
 
-				# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
-				# false. (optional)
+				# If set, execute Sieve scripts selected by IMAP METADATA
+				# (/shared/imapsieve/script) on IMAP events (RFC 6785 IMAPSIEVE). Scripts are
+				# uploaded with ManageSieve; SETACTIVE is not used for IMAPSIEVE selection.
+				# Default false. (optional)
 				RunOnIMAPEvents: false
 
 				# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return
@@ -1523,12 +1527,14 @@ See https://pkg.go.dev/github.com/mjl-/sconf for details.
 				# (optional)
 				AutoCreateMailboxes: false
 
-				# If set, execute the active Sieve script on incoming SMTP delivery. Default true.
-				# (optional)
+				# If set, execute the ManageSieve active script on incoming SMTP delivery. Default
+				# true. (optional)
 				RunOnDelivery: false
 
-				# If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default
-				# false. (optional)
+				# If set, execute Sieve scripts selected by IMAP METADATA
+				# (/shared/imapsieve/script) on IMAP events (RFC 6785 IMAPSIEVE). Scripts are
+				# uploaded with ManageSieve; SETACTIVE is not used for IMAPSIEVE selection.
+				# Default false. (optional)
 				RunOnIMAPEvents: false
 
 				# Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return

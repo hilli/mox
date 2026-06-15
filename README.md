@@ -9,6 +9,8 @@ See Quickstart below to get started.
 - Quick and easy to start/maintain mail server, for your own domain(s).
 - SMTP (with extensions) for receiving, submitting and delivering email.
 - IMAP4 (with extensions) for giving email clients access to email.
+- Sieve filtering, managed through ManageSieve, for incoming delivery and IMAP
+  events.
 - Webmail for reading/sending email from the browser.
 - SPF/DKIM/DMARC for authenticating messages/delivery, also DMARC aggregate
   reports.
@@ -51,6 +53,24 @@ interoperate with popular cloud providers: gmail.com, outlook.com, yahoo.com,
 proton.me.
 
 The code is heavily cross-referenced with the RFCs for readability/maintainability.
+
+## Sieve and IMAPSIEVE
+
+Mox can run Sieve scripts for incoming SMTP delivery and for IMAP events, if
+Sieve is enabled in configuration.
+
+Delivery-time Sieve follows the usual ManageSieve model: users can upload
+multiple scripts with ManageSieve (RFC 5804), and `SETACTIVE` selects the single
+active script used for incoming message delivery.
+
+IMAP-event Sieve uses IMAPSIEVE (RFC 6785) and is managed differently. Users
+still upload scripts through ManageSieve, but a script is attached to a mailbox
+with IMAP METADATA by setting `/shared/imapsieve/script` to the uploaded script
+name. The script name does not need to match the mailbox name, and the script
+does not need to be active with `SETACTIVE`. A server-level metadata entry can
+provide a fallback script for mailboxes without their own entry. Alternatively,
+one server-level script can branch on environment values such as `imap.mailbox`
+and `imap.cause`.
 
 # Quickstart
 
@@ -164,12 +184,9 @@ support:
 - Privilege separation, isolating parts of the application to more restricted
   sandbox (e.g. new unauthenticated connections)
 - Using mox as backup MX
-- Sieve for filtering (for now see Rulesets in the account config)
 - ARC, with forwarded email from trusted source
 - Milter support, for integration with external tools
 - SMTP DSN extension
-- IMAP Sieve extension, to run Sieve scripts after message changes (not only
-  new deliveries)
 - OAUTH2 support, for single sign on
 - Forwarding (to an external address)
 

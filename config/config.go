@@ -59,8 +59,8 @@ type Sieve struct {
 	ExecutionTimeout    time.Duration `sconf:"optional" sconf-doc:"Maximum time a single Sieve script may run on one message. Default 10s."`
 	MaxRedirects        int           `sconf:"optional" sconf-doc:"Maximum number of redirect actions per script execution. Default 4."`
 	AutoCreateMailboxes *bool         `sconf:"optional" sconf-doc:"If set, fileinto to a non-existent mailbox creates the mailbox. Default true."`
-	RunOnDelivery       *bool         `sconf:"optional" sconf-doc:"If set, execute the active Sieve script on incoming SMTP delivery. Default true."`
-	RunOnIMAPEvents     *bool         `sconf:"optional" sconf-doc:"If set, execute Sieve scripts on IMAP events (RFC 6785 IMAPSIEVE). Default false."`
+	RunOnDelivery       *bool         `sconf:"optional" sconf-doc:"If set, execute the ManageSieve active script on incoming SMTP delivery. Default true."`
+	RunOnIMAPEvents     *bool         `sconf:"optional" sconf-doc:"If set, execute Sieve scripts selected by IMAP METADATA (/shared/imapsieve/script) on IMAP events (RFC 6785 IMAPSIEVE). Scripts are uploaded with ManageSieve; SETACTIVE is not used for IMAPSIEVE selection. Default false."`
 	FailureMode         string        `sconf:"optional" sconf-doc:"Behaviour when Sieve fails at runtime during delivery: 'tempfail' (return temporary SMTP error, the default) or 'keep' (deliver to the default mailbox)."`
 }
 

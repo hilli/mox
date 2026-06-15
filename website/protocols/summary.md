@@ -19,7 +19,7 @@ RFC.
 <tr><td><a href="#topic-tls-reporting">TLS Reporting</a></td> <td style="text-align: center"><span class="implemented">Yes</span></td> <td>Reporting about TLS interoperability issues</td></tr>
 <tr><td><a href="#topic-arf">ARF</a></td> <td style="text-align: center"><span class="roadmap">Roadmap</span></td> <td>Abuse reporting format</td></tr>
 <tr><td><a href="#topic-imap">IMAP</a></td> <td style="text-align: center"><span class="implemented">Yes</span></td> <td>Email access protocol</td></tr>
-<tr><td><a href="#topic-sieve">Sieve</a></td> <td style="text-align: center"><span class="roadmap">Roadmap</span></td> <td>Scripts to run on incoming messages</td></tr>
+<tr><td><a href="#topic-sieve">Sieve</a></td> <td style="text-align: center"><span class="implemented">Yes</span></td> <td>Scripts to run on incoming messages and IMAP events</td></tr>
 <tr><td><a href="#topic-jmap">JMAP</a></td> <td style="text-align: center"><span class="roadmap">Roadmap</span></td> <td>HTTP/JSON-based email access protocol</td></tr>
 <tr><td><a href="#topic-caldav-ical">CalDAV/iCal</a></td> <td style="text-align: center"><span class="roadmap">Roadmap</span></td> <td>Calendaring</td></tr>
 <tr><td><a href="#topic-carddav-vcard">CardDAV/vCard</a></td> <td style="text-align: center"><span class="roadmap">Roadmap</span></td> <td>Contacts</td></tr>
