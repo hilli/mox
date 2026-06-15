@@ -1821,6 +1821,26 @@
 			"Returns": []
 		},
 		{
+			"Name": "DomainSieveSave",
+			"Docs": "DomainSieveSave saves the domain-level Sieve policy. A nil policy clears the\ndomain override so the server/account policy applies.",
+			"Params": [
+				{
+					"Name": "domainName",
+					"Typewords": [
+						"string"
+					]
+				},
+				{
+					"Name": "sieve",
+					"Typewords": [
+						"nullable",
+						"Sieve"
+					]
+				}
+			],
+			"Returns": []
+		},
+		{
 			"Name": "RoutesSave",
 			"Docs": "RoutesSave saves global routes.",
 			"Params": [

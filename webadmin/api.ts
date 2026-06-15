@@ -2281,6 +2281,16 @@ export class Client {
 		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
 	}
 
+	// DomainSieveSave saves the domain-level Sieve policy. A nil policy clears the
+	// domain override so the server/account policy applies.
+	async DomainSieveSave(domainName: string, sieve: Sieve | null): Promise<void> {
+		const fn: string = "DomainSieveSave"
+		const paramTypes: string[][] = [["string"],["nullable","Sieve"]]
+		const returnTypes: string[][] = []
+		const params: any[] = [domainName, sieve]
+		return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params) as void
+	}
+
 	// RoutesSave saves global routes.
 	async RoutesSave(routes: Route[] | null): Promise<void> {
 		const fn: string = "RoutesSave"

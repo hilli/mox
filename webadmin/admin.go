@@ -2680,6 +2680,16 @@ func (Admin) DomainRoutesSave(ctx context.Context, domainName string, routes []c
 	xcheckf(ctx, err, "saving domain routes")
 }
 
+// DomainSieveSave saves the domain-level Sieve policy. A nil policy clears the
+// domain override so the server/account policy applies.
+func (Admin) DomainSieveSave(ctx context.Context, domainName string, sieve *config.Sieve) {
+	err := admin.DomainSave(ctx, domainName, func(domain *config.Domain) error {
+		domain.Sieve = sieve
+		return nil
+	})
+	xcheckf(ctx, err, "saving domain sieve policy")
+}
+
 // RoutesSave saves global routes.
 func (Admin) RoutesSave(ctx context.Context, routes []config.Route) {
 	err := admin.ConfigSave(ctx, func(config *config.Dynamic) {
