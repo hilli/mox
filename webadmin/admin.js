@@ -1262,6 +1262,15 @@ var api;
 			const params = [domainName, routes];
 			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
 		}
+		// DomainSieveSave saves the domain-level Sieve policy. A nil policy clears the
+		// domain override so the server/account policy applies.
+		async DomainSieveSave(domainName, sieve) {
+			const fn = "DomainSieveSave";
+			const paramTypes = [["string"], ["nullable", "Sieve"]];
+			const returnTypes = [];
+			const params = [domainName, sieve];
+			return await _sherpaCall(this.baseURL, this.authState, { ...this.options }, paramTypes, returnTypes, fn, params);
+		}
 		// RoutesSave saves global routes.
 		async RoutesSave(routes) {
 			const fn = "RoutesSave";
