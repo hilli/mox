@@ -76,7 +76,7 @@ func TestValidateBad(t *testing.T) {
 	tests := []string{
 		``,
 		`not_a_command;`,
-		`if header { keep; }`, // missing args
+		`if header :mime :contains "content-type" "text" { keep; }`, // :mime tag without require "mime"
 		`require ["nonexistent-cap-xyz"];`,
 	}
 	for _, src := range tests {

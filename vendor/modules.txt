@@ -4,7 +4,7 @@ github.com/beorn7/perks/quantile
 # github.com/cespare/xxhash/v2 v2.2.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
-# github.com/hilli/sieve-go v0.0.0-20260521132353-c01be2fe8ea2
+# github.com/hilli/sieve-go v0.0.0-20260618152839-cc747295995c
 ## explicit; go 1.24
 github.com/hilli/sieve-go
 github.com/hilli/sieve-go/ast

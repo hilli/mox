@@ -43,9 +43,15 @@ const Capability = "mime"
 
 func Register(i *sieve.Interpreter) {
 	r := i.Registry()
-	r.RegisterTest("header", testHeader, Capability)
-	r.RegisterTest("address", testAddress, Capability)
-	r.RegisterTest("exists", testExists, Capability)
+	// The base header/address/exists tests do not themselves require the
+	// "mime" capability (RFC 5703 §5): only the :mime and :anychild tagged
+	// arguments do. Register them capability-free but route through the
+	// MIME-aware implementations, and require "mime" for the tags.
+	r.RegisterTest("header", testHeader, "")
+	r.RegisterTest("address", testAddress, "")
+	r.RegisterTest("exists", testExists, "")
+	r.RegisterTag(":mime", Capability)
+	r.RegisterTag(":anychild", Capability)
 	r.RegisterCommand("foreverypart", commandForeverypart, Capability)
 	r.RegisterAction("break", actionBreak, Capability)
 	r.RegisterAction("extracttext", actionExtractText, Capability)

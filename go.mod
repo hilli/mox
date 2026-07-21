@@ -3,7 +3,7 @@ module github.com/mjl-/mox
 go 1.25.0
 
 require (
-	github.com/hilli/sieve-go v0.0.0-20260521132353-c01be2fe8ea2
+	github.com/hilli/sieve-go v0.0.0-20260618152839-cc747295995c
 	github.com/mjl-/adns v0.0.0-20250321173553-ab04b05bdfea
 	github.com/mjl-/autocert v0.0.0-20250321204043-abab2b936e31
 	github.com/mjl-/bstore v0.0.10

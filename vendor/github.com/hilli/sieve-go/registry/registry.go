@@ -11,6 +11,7 @@ package registry
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/hilli/sieve-go/ast"
@@ -128,6 +129,11 @@ type Registry struct {
 	comparators  map[string]comparatorEntry
 	addressParts map[string]addressPartEntry
 	commands     map[string]commandEntry
+	// tags maps an extension-defined tagged argument (e.g. ":mime") to the
+	// capability a script must `require` to use it. Used for tags that
+	// extend existing tests/commands without being match-types, address
+	// parts or comparators (RFC 5703 ":mime"/":anychild", for example).
+	tags map[string]string
 	// caps is the set of capabilities considered "available" by this
 	// registry. Core capabilities (none for RFC 5228 base) plus anything
 	// registered with a non-empty Requires.
@@ -176,6 +182,7 @@ func New() *Registry {
 		comparators:  map[string]comparatorEntry{},
 		addressParts: map[string]addressPartEntry{},
 		commands:     map[string]commandEntry{},
+		tags:         map[string]string{},
 		caps:         map[string]bool{},
 	}
 }
@@ -299,6 +306,30 @@ func (r *Registry) LookupMatchType(name string) (MatchTypeFunc, string, bool) {
 		return nil, "", false
 	}
 	return e.fn, e.requires, true
+}
+
+// RegisterTag records that an extension-defined tagged argument (e.g.
+// ":mime") requires a capability. This lets an extension add tags to an
+// existing test or command without making the base test/command itself
+// require the capability. The tag name is matched case-insensitively and
+// should include the leading colon (e.g. ":mime").
+func (r *Registry) RegisterTag(name, requires string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tags[strings.ToLower(name)] = requires
+	if requires != "" {
+		r.caps[requires] = true
+	}
+}
+
+// LookupTag returns the capability an extension-defined tag requires. ok is
+// false for unknown tags (e.g. core match-types or address parts, which are
+// resolved through their own registries).
+func (r *Registry) LookupTag(name string) (requires string, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	req, ok := r.tags[strings.ToLower(name)]
+	return req, ok
 }
 
 // RegisterComparator adds a comparator (RFC 5228 §2.7.3) under its IANA

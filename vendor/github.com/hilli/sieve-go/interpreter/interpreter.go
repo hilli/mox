@@ -11,6 +11,7 @@ import (
 	"github.com/hilli/sieve-go/message"
 	"github.com/hilli/sieve-go/registry"
 )
+
 // Interpreter holds a registry and can compile/run scripts against it.
 // One Interpreter is safe for concurrent use by multiple goroutines as
 // long as no further registration happens after first use.
@@ -182,6 +183,14 @@ func (i *Interpreter) validateTest(t *ast.Test, caps map[string]bool) error {
 			if _, mreq, ok := i.reg.LookupMatchType(strings.ToLower(tg.Name)); ok {
 				if mreq != "" && !caps[mreq] {
 					return fmt.Errorf("match type %q at %d:%d requires capability %q (add to `require`)", tg.Name, tg.Pos.Line, tg.Pos.Col, mreq)
+				}
+			}
+			// Extension-defined tags (e.g. RFC 5703 :mime / :anychild) that
+			// extend an existing test require their capability even though
+			// the base test does not.
+			if treq, ok := i.reg.LookupTag(tg.Name); ok {
+				if treq != "" && !caps[treq] {
+					return fmt.Errorf("tag %q at %d:%d requires capability %q (add to `require`)", tg.Name, tg.Pos.Line, tg.Pos.Col, treq)
 				}
 			}
 		}
