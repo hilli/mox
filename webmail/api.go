@@ -163,6 +163,24 @@ func (Webmail) Request(ctx context.Context, req Request) {
 	sse.Request <- req
 }
 
+// MessageItem returns a MessageItem for a message.
+func (Webmail) MessageItem(ctx context.Context, msgID int64) (mi MessageItem) {
+	reqInfo := ctx.Value(requestInfoCtxKey).(requestInfo)
+	log := reqInfo.Log
+	acc := reqInfo.Account
+
+	xdbread(ctx, acc, func(tx *bstore.Tx) {
+		m := xmessageID(ctx, tx, msgID)
+
+		state := msgState{acc: acc}
+		defer state.clear()
+		var err error
+		mi, err = messageItem(log, m, &state, nil)
+		xcheckf(ctx, err, "parsing message")
+	})
+	return
+}
+
 // ParsedMessage returns enough to render the textual body of a message. It is
 // assumed the client already has other fields through MessageItem.
 func (Webmail) ParsedMessage(ctx context.Context, msgID int64) (pm ParsedMessage) {
@@ -1213,7 +1231,7 @@ func (Webmail) MailboxCreate(ctx context.Context, name string) {
 	acc := reqInfo.Account
 
 	var err error
-	name, _, err = store.CheckMailboxName(name, false)
+	name, _, err = config.CheckMailboxName(name, false)
 	xcheckuserf(ctx, err, "checking mailbox name")
 
 	acc.WithWLock(func() {
@@ -1309,7 +1327,7 @@ func (Webmail) MailboxRename(ctx context.Context, mailboxID int64, newName strin
 	// Renaming Inbox is special for IMAP. For IMAP we have to implement it per the
 	// standard. We can just say no.
 	var err error
-	newName, _, err = store.CheckMailboxName(newName, false)
+	newName, _, err = config.CheckMailboxName(newName, false)
 	xcheckuserf(ctx, err, "checking new mailbox name")
 
 	acc.WithWLock(func() {

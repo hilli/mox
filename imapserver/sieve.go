@@ -245,7 +245,7 @@ func imapSieveFileInto(c *conn, msg *store.Message, dataFile *os.File, target si
 		setStoreFlagKeyword(&cp, f)
 	}
 	c.account.WithWLock(func() {
-		err := c.account.DeliverMailbox(c.log, target.Mailbox, &cp, dataFile)
+		err := c.account.DeliverMailbox(c.log, target.Mailbox, "", &cp, dataFile)
 		if err != nil {
 			c.log.Errorx("imapsieve deliver fileinto", err, slog.String("mailbox", target.Mailbox))
 			return
